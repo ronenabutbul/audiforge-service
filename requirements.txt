@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+pdf2image>=1.17
+homr @ git+https://github.com/liebharc/homr.git
