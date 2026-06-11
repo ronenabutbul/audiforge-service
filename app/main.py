@@ -12,6 +12,7 @@ import queue
 import shutil
 import subprocess
 import uuid
+import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -91,6 +92,37 @@ def _run_homr(page: Path) -> Path:
     return produced[0]
 
 
+def _merge_musicxml(outputs: list[Path], result_path: Path) -> Path:
+    """Merge per-page score-partwise documents into one, appending measures.
+
+    Each page's first measure keeps its own <attributes> (divisions, clef,
+    time), which MusicXML allows mid-score, so durations stay consistent.
+    """
+    base_tree = ET.parse(outputs[0])
+    base_root = base_tree.getroot()
+    if base_root.tag != "score-partwise":
+        raise RuntimeError(f"Unexpected root element: {base_root.tag}")
+    base_parts = base_root.findall("part")
+
+    for output in outputs[1:]:
+        page_parts = ET.parse(output).getroot().findall("part")
+        if len(page_parts) != len(base_parts):
+            logger.warning(
+                "%s: part count %d != %d, merging first %d part(s)",
+                output.name, len(page_parts), len(base_parts),
+                min(len(page_parts), len(base_parts)),
+            )
+        for base_part, page_part in zip(base_parts, page_parts):
+            base_part.extend(page_part.findall("measure"))
+
+    for part in base_parts:
+        for number, measure in enumerate(part.findall("measure"), start=1):
+            measure.set("number", str(number))
+
+    base_tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    return result_path
+
+
 def _process_job(job_id: str, source: Path):
     job_dir = source.parent
     try:
@@ -104,14 +136,18 @@ def _process_job(job_id: str, source: Path):
             outputs.append(_run_homr(page))
             _update_job(job_id, progress=0.1 + 0.85 * (i / len(pages)))
 
+        result_path = job_dir / "result.musicxml"
         if len(outputs) == 1:
-            result_path = job_dir / "result.musicxml"
             shutil.copy(outputs[0], result_path)
         else:
-            result_path = job_dir / "result.zip"
-            with zipfile.ZipFile(result_path, "w") as zf:
-                for i, output in enumerate(outputs, start=1):
-                    zf.write(output, arcname=f"page_{i:03d}.musicxml")
+            try:
+                _merge_musicxml(outputs, result_path)
+            except Exception:
+                logger.exception("job %s: merge failed, falling back to zip", job_id)
+                result_path = job_dir / "result.zip"
+                with zipfile.ZipFile(result_path, "w") as zf:
+                    for i, output in enumerate(outputs, start=1):
+                        zf.write(output, arcname=f"page_{i:03d}.musicxml")
 
         _update_job(
             job_id,
