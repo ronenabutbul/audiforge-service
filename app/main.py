@@ -8,6 +8,7 @@ Mirrors the audiforge/syncsheet conversion contract:
 """
 
 import logging
+import queue
 import shutil
 import subprocess
 import uuid
@@ -34,6 +35,22 @@ app = FastAPI(title="SyncSheets OMR Service", version="0.1.0")
 
 jobs: dict[str, dict] = {}
 jobs_lock = Lock()
+
+# homr inference saturates CPU/RAM; concurrent jobs starve each other
+# (page timeouts, pthread_create failures). Process one job at a time.
+job_queue: "queue.Queue[tuple[str, Path]]" = queue.Queue()
+
+
+def _worker():
+    while True:
+        job_id, source = job_queue.get()
+        try:
+            _process_job(job_id, source)
+        finally:
+            job_queue.task_done()
+
+
+Thread(target=_worker, daemon=True).start()
 
 
 def _update_job(job_id: str, **fields):
@@ -134,8 +151,13 @@ async def upload(file: UploadFile = File(...)):
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    Thread(target=_process_job, args=(job_id, source), daemon=True).start()
-    return {"id": job_id, "status": "pending", "message": "Conversion started using homr"}
+    job_queue.put((job_id, source))
+    return {
+        "id": job_id,
+        "status": "pending",
+        "queue_position": job_queue.qsize(),
+        "message": "Conversion queued (homr)",
+    }
 
 
 @app.get("/status/{job_id}")
