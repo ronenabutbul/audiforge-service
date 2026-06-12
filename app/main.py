@@ -123,6 +123,43 @@ def _merge_musicxml(outputs: list[Path], result_path: Path) -> Path:
     return result_path
 
 
+def _apply_metadata(result_path: Path, piece_title: str):
+    """Set work/movement title and part name from the uploaded filename.
+
+    homr only transcribes notation; titles default to its own guess and the
+    part name to "Voice". Filenames like "Abba Gold - Clarinet 1.pdf" carry
+    both the piece title and the part name.
+    """
+    title, part_name = piece_title, None
+    if " - " in piece_title:
+        title, part_name = (s.strip() for s in piece_title.rsplit(" - ", 1))
+
+    tree = ET.parse(result_path)
+    root = tree.getroot()
+    if root.tag != "score-partwise":
+        return
+
+    for tag in ("work/work-title", "movement-title"):
+        el = root.find(tag)
+        if el is None:
+            parent = root
+            leaf = tag
+            if "/" in tag:
+                parent_tag, leaf = tag.split("/")
+                parent = root.find(parent_tag)
+                if parent is None:
+                    parent = ET.Element(parent_tag)
+                    root.insert(0, parent)
+            el = ET.SubElement(parent, leaf)
+        el.text = title
+
+    if part_name:
+        for name_el in root.findall("part-list/score-part/part-name"):
+            name_el.text = part_name
+
+    tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+
+
 def _process_job(job_id: str, source: Path):
     job_dir = source.parent
     try:
@@ -148,6 +185,14 @@ def _process_job(job_id: str, source: Path):
                 with zipfile.ZipFile(result_path, "w") as zf:
                     for i, output in enumerate(outputs, start=1):
                         zf.write(output, arcname=f"page_{i:03d}.musicxml")
+
+        with jobs_lock:
+            piece_title = jobs[job_id].get("piece_title")
+        if piece_title and result_path.suffix == ".musicxml":
+            try:
+                _apply_metadata(result_path, piece_title)
+            except Exception:
+                logger.exception("job %s: metadata patch failed", job_id)
 
         _update_job(
             job_id,
@@ -178,12 +223,14 @@ async def upload(file: UploadFile = File(...)):
     source = job_dir / f"input{suffix}"
     source.write_bytes(await file.read())
 
+    piece_title = Path(file.filename or "").stem.strip() or "Untitled"
     with jobs_lock:
         jobs[job_id] = {
             "id": job_id,
             "status": "pending",
             "progress": 0.0,
             "error": None,
+            "piece_title": piece_title,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -219,4 +266,5 @@ def download(job_id: str):
         if result_path.suffix == ".zip"
         else "application/vnd.recordare.musicxml+xml"
     )
-    return FileResponse(result_path, media_type=media_type, filename=result_path.name)
+    filename = f"{job.get('piece_title') or result_path.stem}{result_path.suffix}"
+    return FileResponse(result_path, media_type=media_type, filename=filename)
