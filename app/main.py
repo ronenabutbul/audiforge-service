@@ -160,6 +160,63 @@ def _apply_metadata(result_path: Path, piece_title: str):
     tree.write(result_path, encoding="UTF-8", xml_declaration=True)
 
 
+def _fix_rhythm(result_path: Path) -> dict:
+    """Validate each measure's duration against the time signature.
+
+    OMR engines miss rests; an underfull measure makes playback drift from
+    that bar onward. Pad underfull measures with a trailing rest so the bar
+    keeps its notated length, and report suspect bars for review.
+    """
+    tree = ET.parse(result_path)
+    root = tree.getroot()
+    if root.tag != "score-partwise":
+        return {}
+
+    underfull_fixed: list[int] = []
+    overfull: list[int] = []
+
+    for part in root.findall("part"):
+        divisions, beats, beat_type = 1, 4, 4
+        for measure in part.findall("measure"):
+            attrs = measure.find("attributes")
+            if attrs is not None:
+                if (d := attrs.findtext("divisions")) is not None:
+                    divisions = int(d)
+                time_el = attrs.find("time")
+                if time_el is not None:
+                    beats = int(time_el.findtext("beats") or beats)
+                    beat_type = int(time_el.findtext("beat-type") or beat_type)
+
+            expected = divisions * beats * 4 // beat_type
+            cursor = maxpos = 0
+            for el in measure:
+                if el.tag == "note":
+                    if el.find("chord") is not None or el.find("grace") is not None:
+                        continue
+                    cursor += int(el.findtext("duration") or 0)
+                elif el.tag == "backup":
+                    cursor -= int(el.findtext("duration") or 0)
+                elif el.tag == "forward":
+                    cursor += int(el.findtext("duration") or 0)
+                maxpos = max(maxpos, cursor)
+
+            number = int(measure.get("number") or 0)
+            if maxpos == 0:
+                continue  # multirest / intentionally empty
+            if maxpos < expected:
+                pad = ET.SubElement(measure, "note")
+                ET.SubElement(pad, "rest")
+                ET.SubElement(pad, "duration").text = str(expected - maxpos)
+                ET.SubElement(pad, "voice").text = "1"
+                underfull_fixed.append(number)
+            elif maxpos > expected:
+                overfull.append(number)
+
+    if underfull_fixed:
+        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    return {"underfull_fixed": underfull_fixed, "overfull": overfull}
+
+
 def _process_job(job_id: str, source: Path):
     job_dir = source.parent
     try:
@@ -188,11 +245,17 @@ def _process_job(job_id: str, source: Path):
 
         with jobs_lock:
             piece_title = jobs[job_id].get("piece_title")
-        if piece_title and result_path.suffix == ".musicxml":
+        if result_path.suffix == ".musicxml":
+            if piece_title:
+                try:
+                    _apply_metadata(result_path, piece_title)
+                except Exception:
+                    logger.exception("job %s: metadata patch failed", job_id)
             try:
-                _apply_metadata(result_path, piece_title)
+                rhythm_report = _fix_rhythm(result_path)
+                _update_job(job_id, rhythm=rhythm_report)
             except Exception:
-                logger.exception("job %s: metadata patch failed", job_id)
+                logger.exception("job %s: rhythm validation failed", job_id)
 
         _update_job(
             job_id,
