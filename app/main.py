@@ -22,6 +22,8 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pdf2image import convert_from_path
 
+from app.transpose import apply_transpose
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("omr-service")
 
@@ -256,6 +258,13 @@ def _process_job(job_id: str, source: Path):
                 _update_job(job_id, rhythm=rhythm_report)
             except Exception:
                 logger.exception("job %s: rhythm validation failed", job_id)
+            if piece_title:
+                try:
+                    part_name = piece_title.rsplit(" - ", 1)[-1]
+                    if apply_transpose(result_path, part_name):
+                        _update_job(job_id, transposed=True)
+                except Exception:
+                    logger.exception("job %s: transpose failed", job_id)
 
         _update_job(
             job_id,
