@@ -7,6 +7,8 @@ Mirrors the audiforge/syncsheet conversion contract:
   GET  /health          -> {"status": "ok"}
 """
 
+from __future__ import annotations
+
 import logging
 import queue
 import shutil
@@ -22,6 +24,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pdf2image import convert_from_path
 
+from app import audiveris_client
 from app.transpose import apply_transpose
 
 logging.basicConfig(level=logging.INFO)
@@ -219,52 +222,125 @@ def _fix_rhythm(result_path: Path) -> dict:
     return {"underfull_fixed": underfull_fixed, "overfull": overfull}
 
 
+def _run_homr_pipeline(job_id: str, job_dir: Path, source: Path) -> Path:
+    """Render pages, run homr per page, merge to one MusicXML. Raises on failure."""
+    pages = _render_pages(job_dir, source)
+    _update_job(job_id, total_pages=len(pages))
+    outputs: list[Path] = []
+    for i, page in enumerate(pages, start=1):
+        logger.info("job %s: homr page %d/%d", job_id, i, len(pages))
+        outputs.append(_run_homr(page))
+        _update_job(job_id, progress=0.1 + 0.6 * (i / len(pages)))
+    result = job_dir / "homr.musicxml"
+    if len(outputs) == 1:
+        shutil.copy(outputs[0], result)
+    else:
+        _merge_musicxml(outputs, result)
+    return result
+
+
+def _rhythm_score(path: Path) -> float:
+    """Fraction of measures whose durations match the time signature (0..1).
+
+    Used as a no-ground-truth quality proxy to pick the better engine —
+    higher rhythm validity correlates with a cleaner transcription.
+    """
+    try:
+        root = ET.parse(path).getroot()
+    except Exception:
+        return 0.0
+    if root.tag != "score-partwise":
+        return 0.0
+    valid = total = 0
+    for part in root.findall("part"):
+        divisions, beats, beat_type = 1, 4, 4
+        for measure in part.findall("measure"):
+            attrs = measure.find("attributes")
+            if attrs is not None:
+                if (d := attrs.findtext("divisions")) is not None:
+                    divisions = int(d)
+                time_el = attrs.find("time")
+                if time_el is not None:
+                    beats = int(time_el.findtext("beats") or beats)
+                    beat_type = int(time_el.findtext("beat-type") or beat_type)
+            expected = divisions * beats * 4 // beat_type
+            cursor = maxpos = 0
+            for el in measure:
+                if el.tag == "note":
+                    if el.find("chord") is not None or el.find("grace") is not None:
+                        continue
+                    cursor += int(el.findtext("duration") or 0)
+                elif el.tag == "backup":
+                    cursor -= int(el.findtext("duration") or 0)
+                elif el.tag == "forward":
+                    cursor += int(el.findtext("duration") or 0)
+                maxpos = max(maxpos, cursor)
+            total += 1
+            if maxpos == 0 or maxpos == expected:
+                valid += 1
+    return valid / total if total else 0.0
+
+
+def _select_engine(candidates: dict[str, Path | None]) -> tuple[str, Path | None, dict]:
+    """Pick the engine whose output has the highest rhythm validity.
+
+    candidates: {engine_name: path_or_None}. A None means that engine
+    crashed/failed. Returns (winner_name, winner_path, scores).
+    """
+    scores = {name: (_rhythm_score(p) if p else None) for name, p in candidates.items()}
+    ranked = sorted(
+        ((name, p) for name, p in candidates.items() if p is not None),
+        key=lambda np: scores[np[0]] or 0.0,
+        reverse=True,
+    )
+    if not ranked:
+        return "none", None, scores
+    return ranked[0][0], ranked[0][1], scores
+
+
 def _process_job(job_id: str, source: Path):
     job_dir = source.parent
     try:
         _update_job(job_id, status="processing", progress=0.05)
-        pages = _render_pages(job_dir, source)
-        _update_job(job_id, total_pages=len(pages), progress=0.1)
 
-        outputs: list[Path] = []
-        for i, page in enumerate(pages, start=1):
-            logger.info("job %s: page %d/%d", job_id, i, len(pages))
-            outputs.append(_run_homr(page))
-            _update_job(job_id, progress=0.1 + 0.85 * (i / len(pages)))
+        # Run both engines; neither failure is fatal on its own.
+        homr_path: Path | None = None
+        try:
+            homr_path = _run_homr_pipeline(job_id, job_dir, source)
+        except Exception as exc:
+            logger.warning("job %s: homr failed (%s)", job_id, exc)
+
+        aud_path: Path | None = None
+        if source.suffix.lower() == ".pdf":
+            _update_job(job_id, progress=0.75)
+            aud_path = audiveris_client.convert(source, job_dir / "audiveris.musicxml")
+
+        engine, winner, scores = _select_engine({"homr": homr_path, "audiveris": aud_path})
+        _update_job(job_id, engine=engine, engine_scores=scores)
+        if winner is None:
+            raise RuntimeError("both engines failed to produce MusicXML")
 
         result_path = job_dir / "result.musicxml"
-        if len(outputs) == 1:
-            shutil.copy(outputs[0], result_path)
-        else:
-            try:
-                _merge_musicxml(outputs, result_path)
-            except Exception:
-                logger.exception("job %s: merge failed, falling back to zip", job_id)
-                result_path = job_dir / "result.zip"
-                with zipfile.ZipFile(result_path, "w") as zf:
-                    for i, output in enumerate(outputs, start=1):
-                        zf.write(output, arcname=f"page_{i:03d}.musicxml")
+        shutil.copy(winner, result_path)
 
         with jobs_lock:
             piece_title = jobs[job_id].get("piece_title")
-        if result_path.suffix == ".musicxml":
-            if piece_title:
-                try:
-                    _apply_metadata(result_path, piece_title)
-                except Exception:
-                    logger.exception("job %s: metadata patch failed", job_id)
+        if piece_title:
             try:
-                rhythm_report = _fix_rhythm(result_path)
-                _update_job(job_id, rhythm=rhythm_report)
+                _apply_metadata(result_path, piece_title)
             except Exception:
-                logger.exception("job %s: rhythm validation failed", job_id)
-            if piece_title:
-                try:
-                    part_name = piece_title.rsplit(" - ", 1)[-1]
-                    if apply_transpose(result_path, part_name):
-                        _update_job(job_id, transposed=True)
-                except Exception:
-                    logger.exception("job %s: transpose failed", job_id)
+                logger.exception("job %s: metadata patch failed", job_id)
+        try:
+            _update_job(job_id, rhythm=_fix_rhythm(result_path))
+        except Exception:
+            logger.exception("job %s: rhythm validation failed", job_id)
+        if piece_title:
+            try:
+                part_name = piece_title.rsplit(" - ", 1)[-1]
+                if apply_transpose(result_path, part_name):
+                    _update_job(job_id, transposed=True)
+            except Exception:
+                logger.exception("job %s: transpose failed", job_id)
 
         _update_job(
             job_id,
@@ -280,7 +356,7 @@ def _process_job(job_id: str, source: Path):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "engine": "homr"}
+    return {"status": "ok", "engine": "ensemble (homr + audiveris)"}
 
 
 @app.post("/upload")
