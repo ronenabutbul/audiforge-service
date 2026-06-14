@@ -21,9 +21,11 @@ _TRANSPOSITIONS: list[tuple[tuple[str, ...], tuple[int, int, int]]] = [
     (("a clarinet", "clarinet in a"), (-2, -3, 0)),
     (("clarinet",), (-1, -2, 0)),                 # Bb clarinet (default)
     (("soprano sax", "soprano saxophone"), (-1, -2, 0)),
-    (("alto sax", "alto saxophone"), (-5, -9, 0)),
+    # Alto/bari sax: Newzik's convention is "up a minor 3rd, down an octave"
+    # (enharmonically a major 6th / octave+major 6th down — same sounding pitch).
+    (("alto sax", "alto saxophone"), (2, 3, -1)),
     (("tenor sax", "tenor saxophone"), (-1, -2, -1)),
-    (("baritone sax", "bari sax", "baritone saxophone"), (-5, -9, -1)),
+    (("baritone sax", "bari sax", "baritone saxophone"), (2, 3, -2)),
     (("trumpet", "cornet", "flugelhorn"), (-1, -2, 0)),   # Bb
     (("english horn", "cor anglais"), (-4, -7, 0)),       # F
     (("french horn", "horn in f"), (-4, -7, 0)),          # F
