@@ -117,7 +117,12 @@ def main():
     ref = ET.parse(sys.argv[2]).getroot()
 
     e_seq, r_seq = note_sequence(engine), note_sequence(ref)
-    sim = SequenceMatcher(None, e_seq, r_seq).ratio()
+    # Headline similarity uses the PITCH line only (drop rests + durations):
+    # the two engines disagree on rests/durations often enough that including
+    # them collapses the ratio and hides real pitch agreement.
+    e_pitch = [k for k, _ in [(n[0], None) for n in e_seq] if k != "R"]
+    r_pitch = [k for k, _ in [(n[0], None) for n in r_seq] if k != "R"]
+    sim = SequenceMatcher(None, e_pitch, r_pitch).ratio()
 
     e_valid, e_tot = rhythm_validity(engine)
     r_valid, r_tot = rhythm_validity(ref)
