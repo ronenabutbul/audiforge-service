@@ -3,4 +3,7 @@ uvicorn[standard]>=0.29
 python-multipart>=0.0.9
 httpx>=0.27
 pdf2image>=1.17
-homr @ git+https://github.com/liebharc/homr.git
+# Pinned: main@f6feedb (2026-06-13, "improve slurs") regressed the ONNX
+# decoder with a slur-embedding/checkpoint mismatch -> Gather out-of-bounds
+# crash on most inputs. v0.6.2 predates it and ships matching checkpoints.
+homr @ git+https://github.com/liebharc/homr.git@v0.6.2
