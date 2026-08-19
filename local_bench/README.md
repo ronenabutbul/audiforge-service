@@ -53,6 +53,12 @@ python3.11 -m venv .venv-homr
   requirements.txt: later main regressed the slur embedding). Engine `homr070`
   is upstream v0.7.0 in `.venv-homr-070/` — testing whether the regression is
   gone and what a year of upstream work is worth.
+- Engine `fusion` doesn't run anything: it grafts Audiveris `<direction>`
+  features (dynamics, wedges, words, tempo, rehearsal marks) onto the cached
+  homr070 notes, aligning measures by pitch signature. Run `homr070` and
+  `audiveris` first. Only measures whose pitch content matches exactly get
+  grafts (60–90% of measures on this corpus) — the rest is the headroom a
+  smarter reconciler would claim.
 - Adding an engine = one function `run_<name>(pdf, work_dir) -> Path` plus an
   entry in `ENGINES`.
 - Measured on M1 Max: homr ≈ 33 s/piece, Audiveris ≈ 25 s/piece

@@ -106,10 +106,71 @@ def run_audiveris(pdf: Path, work_dir: Path) -> Path:
     return out
 
 
+# Direction-type children worth grafting from Audiveris onto homr's notes.
+FUSION_DIRECTION_TAGS = ("dynamics", "wedge", "words", "metronome", "rehearsal")
+
+
+def measure_signature(measure) -> tuple:
+    sig = []
+    for note in measure.findall("note"):
+        p = note.find("pitch")
+        if p is not None:
+            sig.append((p.findtext("step"), p.findtext("alter"),
+                        p.findtext("octave")))
+    return tuple(sig)
+
+
+def run_fusion(pdf: Path, work_dir: Path) -> Path:
+    """homr notes + Audiveris text: align measures by pitch signature, then
+    copy Audiveris <direction> features into the matching homr measures.
+
+    Consumes the cached homr070 and audiveris results (run those first)."""
+    piece = pdf.stem
+    homr_path = BENCH_DIR / "results" / "homr070" / f"{piece}.musicxml"
+    aud_path = BENCH_DIR / "results" / "audiveris" / f"{piece}.musicxml"
+    for p in (homr_path, aud_path):
+        if not p.exists():
+            raise RuntimeError(f"fusion needs cached result: {p.name} missing")
+
+    base = ET.parse(homr_path)
+    base_measures = base.getroot().find("part").findall("measure")
+    aud_measures = ET.parse(aud_path).getroot().find("part").findall("measure")
+
+    matcher = SequenceMatcher(
+        None,
+        [measure_signature(m) for m in base_measures],
+        [measure_signature(m) for m in aud_measures],
+        autojunk=False,
+    )
+    aligned = grafted = 0
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        if op != "equal":
+            continue
+        for bi, ai in zip(range(i1, i2), range(j1, j2)):
+            aligned += 1
+            insert_at = 0
+            for el in aud_measures[ai]:
+                if el.tag != "direction":
+                    continue
+                if any(dt.find(tag) is not None
+                       for dt in el.findall("direction-type")
+                       for tag in FUSION_DIRECTION_TAGS):
+                    base_measures[bi].insert(insert_at, el)
+                    insert_at += 1
+                    grafted += 1
+    print(f"  fusion: {aligned}/{len(base_measures)} measures aligned, "
+          f"{grafted} directions grafted", flush=True)
+
+    out = work_dir / "fusion.musicxml"
+    base.write(out, encoding="UTF-8", xml_declaration=True)
+    return out
+
+
 ENGINES = {
-    "homr": run_homr,  # v0.6.2, same pin as production
-    "homr070": lambda pdf, wd: run_homr(pdf, wd, HOMR_070_BIN),
+    "homr": run_homr,  # v0.6.2, the old production pin
+    "homr070": lambda pdf, wd: run_homr(pdf, wd, HOMR_070_BIN),  # current pin
     "audiveris": run_audiveris,  # 5.11.0 local (Railway container is older)
+    "fusion": run_fusion,  # homr070 notes + audiveris text, from cache
 }
 
 
