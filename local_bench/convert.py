@@ -31,6 +31,8 @@ from run_bench import (  # noqa: E402
 sys.path.insert(0, str(BENCH_DIR.parent / "benchmark"))
 sys.path.insert(0, str(BENCH_DIR.parent / "app"))
 import score as scorer  # noqa: E402
+from fix_hbars import detect_hbars, place_rehearsals, stack_numbers  # noqa: E402
+from fix_hbars import fix as fix_hbars  # noqa: E402
 from fix_multirests import fix as fix_multirest_counts  # noqa: E402
 from fix_structure import fix as fix_structure  # noqa: E402
 from fix_tempo import fix as fix_tempo  # noqa: E402
@@ -98,11 +100,26 @@ def convert(pdf: Path) -> Path:
             print(f"  {fixed} multirest counts repaired via crop-OCR",
                   flush=True)
         fix_structure(work, result)
+        updated, inserted = fix_hbars(work, result)
+        if updated or inserted:
+            print(f"  H-bar reconciliation: {updated} counts corrected, "
+                  f"{inserted} missed multirests inserted", flush=True)
         if result.read_bytes() != aud_out.read_bytes():
-            n = graft_numbered(result, aud_out)
+            sec_numbers = None
+            omr = next(work.rglob("*.omr"), None)
+            if omr is not None:
+                hbars = detect_hbars(omr)
+                if hbars:
+                    sec_numbers = stack_numbers(omr, hbars)
+            n = graft_numbered(result, aud_out, sec_numbers)
             if n:
                 print(f"  {n} rehearsal/lyric elements placed by printed "
                       f"number", flush=True)
+            if omr is not None and hbars:
+                p = place_rehearsals(omr, result, hbars)
+                if p:
+                    print(f"  {p} rehearsal letters re-placed by pixel "
+                          f"position", flush=True)
     # Metadata first: fix_titles strips movement-title when it builds a
     # credit header, and apply_metadata must not re-create it afterwards.
     apply_metadata(result, name)

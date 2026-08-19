@@ -244,12 +244,14 @@ def _printed_numbers(measures) -> list[int]:
     return numbers
 
 
-def graft_rehearsals_by_number(base_measures, sec_measures) -> int:
+def graft_rehearsals_by_number(base_measures, sec_measures,
+                               sec_numbers=None) -> int:
     """Rehearsal marks sit at section starts — usually right after
     multirests, where pitch alignment has nothing to align. Place them by
     printed measure number instead."""
     base_numbers = _printed_numbers(base_measures)
-    sec_numbers = _printed_numbers(sec_measures)
+    if sec_numbers is None:
+        sec_numbers = _printed_numbers(sec_measures)
     base_by_number = {}
     for i, n in enumerate(base_numbers):
         base_by_number.setdefault(n, i)
@@ -272,12 +274,14 @@ def graft_rehearsals_by_number(base_measures, sec_measures) -> int:
     return grafted
 
 
-def graft_lyrics_by_number(base_measures, sec_measures) -> int:
+def graft_lyrics_by_number(base_measures, sec_measures,
+                           sec_numbers=None) -> int:
     """Vocal charts route to homr for note quality, but homr never reads
     lyrics. Copy each measure's syllables from the secondary engine onto the
     base measure's notes in order, keyed by printed measure number."""
     base_numbers = _printed_numbers(base_measures)
-    sec_numbers = _printed_numbers(sec_measures)
+    if sec_numbers is None:
+        sec_numbers = _printed_numbers(sec_measures)
     base_by_number = {}
     for i, n in enumerate(base_numbers):
         base_by_number.setdefault(n, i)
@@ -302,7 +306,8 @@ def graft_lyrics_by_number(base_measures, sec_measures) -> int:
     return grafted
 
 
-def graft_numbered(base_path: Path, secondary_path: Path) -> int:
+def graft_numbered(base_path: Path, secondary_path: Path,
+                   sec_numbers=None) -> int:
     """The printed-number-keyed grafts: rehearsal letters and lyrics. Run
     AFTER multirest-count repair — the numbering these are keyed by depends
     on correct counts."""
@@ -310,8 +315,10 @@ def graft_numbered(base_path: Path, secondary_path: Path) -> int:
     base_measures = base.getroot().find("part").findall("measure")
     sec_measures = ET.parse(secondary_path).getroot().find("part").findall(
         "measure")
-    grafted = graft_rehearsals_by_number(base_measures, sec_measures)
-    grafted += graft_lyrics_by_number(base_measures, sec_measures)
+    grafted = graft_rehearsals_by_number(base_measures, sec_measures,
+                                         sec_numbers)
+    grafted += graft_lyrics_by_number(base_measures, sec_measures,
+                                      sec_numbers)
     if grafted:
         base.write(base_path, encoding="UTF-8", xml_declaration=True)
     return grafted
