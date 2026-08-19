@@ -86,14 +86,21 @@ def _run_homr(page: Path) -> Path:
         text=True,
         timeout=PAGE_TIMEOUT_SECONDS,
     )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"homr failed on {page.name}: {result.stderr[-2000:] or result.stdout[-2000:]}"
-        )
     after = set(page.parent.glob("*.musicxml")) | set(page.parent.glob("*.xml"))
     produced = sorted(after - before)
+    # homr sometimes dies AFTER writing its output ("recursive_mutex lock
+    # failed" during process teardown) — the MusicXML is complete, so only a
+    # missing output file counts as failure.
     if not produced:
-        raise RuntimeError(f"homr produced no MusicXML for {page.name}")
+        raise RuntimeError(
+            f"homr produced no MusicXML for {page.name} (exit {result.returncode}): "
+            f"{result.stderr[-2000:] or result.stdout[-2000:]}"
+        )
+    if result.returncode != 0:
+        logger.warning(
+            "homr exited %d on %s but wrote output; using it",
+            result.returncode, page.name,
+        )
     return produced[0]
 
 
