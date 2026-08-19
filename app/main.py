@@ -24,7 +24,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pdf2image import convert_from_path
 
-from app import audiveris_client
+from app import audiveris_client, postprocess
 from app.transpose import apply_transpose
 
 logging.basicConfig(level=logging.INFO)
@@ -243,6 +243,9 @@ def _run_homr_pipeline(job_id: str, job_dir: Path, source: Path) -> Path:
         shutil.copy(outputs[0], result)
     else:
         _merge_musicxml(outputs, result)
+    ties, chords, rests = postprocess.normalize_homr(result)
+    logger.info("job %s: normalized homr output (%d ties, %d chord orders, "
+                "%d multirest measures)", job_id, ties, chords, rests)
     return result
 
 
@@ -329,6 +332,20 @@ def _process_job(job_id: str, source: Path):
 
         result_path = job_dir / "result.musicxml"
         shutil.copy(winner, result_path)
+
+        # homr wins on notes; Audiveris reads text, dynamics and volta
+        # brackets homr can't. Graft those in rather than discarding them.
+        if engine == "homr" and aud_path is not None:
+            try:
+                aligned, grafted = postprocess.graft_features(result_path, aud_path)
+                if grafted:
+                    engine = "fusion"
+                    _update_job(job_id, engine=engine)
+                logger.info("job %s: fusion grafted %d features over %d "
+                            "aligned measures", job_id, grafted, aligned)
+            except Exception:
+                logger.exception("job %s: fusion graft failed; keeping homr",
+                                 job_id)
 
         with jobs_lock:
             piece_title = jobs[job_id].get("piece_title")

@@ -35,6 +35,11 @@ sys.path.insert(0, str(REPO_DIR / "app"))
 
 import score as scorer  # benchmark/score.py
 from transpose import apply_transpose  # app/transpose.py
+from postprocess import (  # app/postprocess.py — shared with production
+    graft_features,
+    measure_signature,
+    normalize_homr,
+)
 
 RENDER_DPI = 300  # same as the production service
 PAGE_TIMEOUT_SECONDS = 900
@@ -124,20 +129,6 @@ def run_audiveris(pdf: Path, work_dir: Path) -> Path:
     return out
 
 
-# Direction-type children worth grafting from Audiveris onto homr's notes.
-FUSION_DIRECTION_TAGS = ("dynamics", "wedge", "words", "metronome", "rehearsal")
-
-
-def measure_signature(measure) -> tuple:
-    sig = []
-    for note in measure.findall("note"):
-        p = note.find("pitch")
-        if p is not None:
-            sig.append((p.findtext("step"), p.findtext("alter"),
-                        p.findtext("octave")))
-    return tuple(sig)
-
-
 def run_fusion(pdf: Path, work_dir: Path) -> Path:
     """homr notes + Audiveris text: align measures by pitch signature, then
     copy Audiveris <direction> features into the matching homr measures.
@@ -150,42 +141,11 @@ def run_fusion(pdf: Path, work_dir: Path) -> Path:
         if not p.exists():
             raise RuntimeError(f"fusion needs cached result: {p.name} missing")
 
-    base = ET.parse(homr_path)
-    base_measures = base.getroot().find("part").findall("measure")
-    aud_measures = ET.parse(aud_path).getroot().find("part").findall("measure")
-
-    matcher = SequenceMatcher(
-        None,
-        [measure_signature(m) for m in base_measures],
-        [measure_signature(m) for m in aud_measures],
-        autojunk=False,
-    )
-    aligned = grafted = 0
-    for op, i1, i2, j1, j2 in matcher.get_opcodes():
-        # Same-length "replace" runs are the same measures with small engine
-        # disagreements — map them positionally; anchored on both sides by
-        # equal blocks, so positions correspond.
-        if op == "equal" or (op == "replace" and i2 - i1 == j2 - j1):
-            pass
-        else:
-            continue
-        for bi, ai in zip(range(i1, i2), range(j1, j2)):
-            aligned += 1
-            insert_at = 0
-            for el in aud_measures[ai]:
-                if el.tag != "direction":
-                    continue
-                if any(dt.find(tag) is not None
-                       for dt in el.findall("direction-type")
-                       for tag in FUSION_DIRECTION_TAGS):
-                    base_measures[bi].insert(insert_at, el)
-                    insert_at += 1
-                    grafted += 1
-    print(f"  fusion: {aligned}/{len(base_measures)} measures aligned, "
-          f"{grafted} directions grafted", flush=True)
-
     out = work_dir / "fusion.musicxml"
-    base.write(out, encoding="UTF-8", xml_declaration=True)
+    shutil.copy(homr_path, out)
+    aligned, grafted = graft_features(out, aud_path)
+    print(f"  fusion: {aligned} measures aligned, {grafted} grafted",
+          flush=True)
     return out
 
 
@@ -218,148 +178,6 @@ def merge_musicxml(outputs: list[Path], result_path: Path) -> Path:
             measure.set("number", str(number))
     base_tree.write(result_path, encoding="UTF-8", xml_declaration=True)
     return result_path
-
-
-def _pitch_key(note) -> str | None:
-    p = note.find("pitch")
-    if p is None:
-        return None
-    return (f"{p.findtext('step')}{p.findtext('alter') or ''}"
-            f"{p.findtext('octave')}")
-
-
-def slurs_to_ties(result_path: Path) -> int:
-    """homr writes ties as slurs (visually identical). A slur whose start and
-    stop are adjacent same-pitch notes is a tie — rewrite it as one.
-    Returns the number of conversions."""
-    tree = ET.parse(result_path)
-    converted = 0
-    for part in tree.getroot().findall("part"):
-        notes = [n for m in part.findall("measure") for n in m.findall("note")
-                 if n.find("grace") is None]
-        open_slurs = {}
-        for idx, note in enumerate(notes):
-            notations = note.find("notations")
-            if notations is None:
-                continue
-            for slur in list(notations.findall("slur")):
-                typ, num = slur.get("type"), slur.get("number", "1")
-                if typ == "start":
-                    open_slurs[num] = (idx, note, notations, slur)
-                elif typ == "stop" and num in open_slurs:
-                    s_idx, s_note, s_notations, s_slur = open_slurs.pop(num)
-                    key = _pitch_key(s_note)
-                    if idx != s_idx + 1 or key is None or key != _pitch_key(note):
-                        continue
-                    for n, nots, sl, t in ((s_note, s_notations, s_slur, "start"),
-                                           (note, notations, slur, "stop")):
-                        nots.remove(sl)
-                        tie = ET.Element("tie", type=t)
-                        # <tie> must directly follow <duration> per the schema.
-                        children = list(n)
-                        dur_at = next(i for i, c in enumerate(children)
-                                      if c.tag == "duration")
-                        n.insert(dur_at + 1, tie)
-                        ET.SubElement(nots, "tied", type=t)
-                    converted += 1
-    if converted:
-        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
-    return converted
-
-
-_STEP_SEMITONES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
-
-
-def _semitone(note) -> int:
-    p = note.find("pitch")
-    return (int(p.findtext("octave")) * 12
-            + _STEP_SEMITONES[p.findtext("step")]
-            + int(p.findtext("alter") or 0))
-
-
-def sort_chords(result_path: Path) -> int:
-    """homr serializes ~1/3 of chords top-note-first; every publisher file
-    and other engine writes bottom-first. Reorder chord groups ascending,
-    moving the <chord/> marker so it stays on all notes but the first.
-    Returns the number of groups reordered."""
-    tree = ET.parse(result_path)
-    reordered = 0
-    for part in tree.getroot().findall("part"):
-        for measure in part.findall("measure"):
-            children = list(measure)
-            group = []  # indices into children of the current chord group
-            groups = []
-            for i, el in enumerate(children):
-                if el.tag != "note" or el.find("pitch") is None:
-                    group = []
-                    continue
-                if el.find("chord") is not None and group:
-                    group.append(i)
-                else:
-                    group = [i]
-                    groups.append(group)
-            for g in groups:
-                if len(g) < 2:
-                    continue
-                notes = [children[i] for i in g]
-                ordered = sorted(notes, key=_semitone)
-                if ordered == notes:
-                    continue
-                for note in ordered:
-                    for marker in note.findall("chord"):
-                        note.remove(marker)
-                for note in ordered[1:]:
-                    note.insert(0, ET.Element("chord"))
-                for note in notes:
-                    measure.remove(note)
-                for offset, note in enumerate(ordered):
-                    measure.insert(g[0] + offset, note)
-                reordered += 1
-    if reordered:
-        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
-    return reordered
-
-
-def expand_multirests(result_path: Path) -> int:
-    """homr writes a multirest as ONE empty measure carrying
-    <multiple-rest>N</multiple-rest>. Expand to Newzik's encoding: N rest
-    measures, the count kept on the first. Returns measures added."""
-    import copy
-
-    tree = ET.parse(result_path)
-    added = 0
-    for part in tree.getroot().findall("part"):
-        divisions, beats, beat_type = 1, 4, 4
-        for measure in list(part.findall("measure")):
-            attrs = measure.find("attributes")
-            if attrs is not None:
-                divisions = int(attrs.findtext("divisions") or divisions)
-                time = attrs.find("time")
-                if time is not None:
-                    beats = int(time.findtext("beats") or beats)
-                    beat_type = int(time.findtext("beat-type") or beat_type)
-            mr = measure.find(".//multiple-rest")
-            if mr is None or not (mr.text or "").strip().isdigit():
-                continue
-            count = int(mr.text)
-            measure_dur = divisions * beats * 4 // beat_type
-            if measure.find("note") is None:
-                note = ET.SubElement(measure, "note")
-                ET.SubElement(note, "rest", measure="yes")
-                ET.SubElement(note, "duration").text = str(measure_dur)
-            at = list(part).index(measure)
-            for k in range(count - 1):
-                extra = ET.Element("measure")
-                note = ET.SubElement(extra, "note")
-                ET.SubElement(note, "rest", measure="yes")
-                ET.SubElement(note, "duration").text = str(measure_dur)
-                part.insert(at + 1 + k, extra)
-                added += 1
-        for number, measure in enumerate(part.findall("measure"), start=1):
-            measure.set("number", str(number))
-    if added:
-        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
-    return added
 
 
 def apply_metadata(result_path: Path, piece_title: str):
@@ -569,8 +387,7 @@ def main():
                     apply_metadata(cached, piece)
                     apply_transpose(cached, piece.rsplit(" - ", 1)[-1])
                     if engine.startswith("homr"):
-                        fixes = (slurs_to_ties(cached), sort_chords(cached),
-                                 expand_multirests(cached))
+                        fixes = normalize_homr(cached)
                         if any(fixes):
                             print(f"  normalized: {fixes[0]} ties, "
                                   f"{fixes[1]} chord orders, "
