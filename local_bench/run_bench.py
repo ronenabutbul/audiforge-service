@@ -153,11 +153,19 @@ def run_fusion(pdf: Path, work_dir: Path) -> Path:
         valid, total = scorer.rhythm_validity(ET.parse(path).getroot())
         return valid / max(total, 1)
 
+    def measure_count(path):
+        return len(ET.parse(path).getroot().find("part").findall("measure"))
+
     def lyric_count(path):
         return sum(1 for _ in ET.parse(path).getroot().iter("lyric"))
 
     aud_is_vocal = lyric_count(aud_path) >= 10 > lyric_count(homr_path)
-    h_val, a_val = validity(homr_path), validity(aud_path)
+    # Validity alone rewards an engine that silently truncated the piece —
+    # the surviving fraction can be internally consistent while most of the
+    # music is gone. Weight by completeness.
+    most = max(measure_count(homr_path), measure_count(aud_path), 1)
+    h_val = validity(homr_path) * measure_count(homr_path) / most
+    a_val = validity(aud_path) * measure_count(aud_path) / most
     if aud_is_vocal and a_val >= h_val - 0.05:
         shutil.copy(aud_path, out)
         print("  fusion: audiveris base (vocal part with lyrics)", flush=True)
