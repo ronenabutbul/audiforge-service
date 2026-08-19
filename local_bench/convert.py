@@ -31,6 +31,7 @@ sys.path.insert(0, str(BENCH_DIR.parent / "benchmark"))
 sys.path.insert(0, str(BENCH_DIR.parent / "app"))
 import score as scorer  # noqa: E402
 from fix_multirests import fix as fix_multirest_counts  # noqa: E402
+from fix_structure import fix as fix_structure  # noqa: E402
 from fix_tempo import fix as fix_tempo  # noqa: E402
 from fix_titles import fix as fix_titles  # noqa: E402
 from postprocess import graft_features, normalize_homr  # noqa: E402
@@ -80,6 +81,7 @@ def convert(pdf: Path) -> Path:
         if fixed:
             print(f"  {fixed} multirest counts repaired via crop-OCR",
                   flush=True)
+        fix_structure(work, result)
     page1 = work / "page_001.png"
     if page1.exists():
         bpm = fix_tempo(page1, result)
