@@ -80,6 +80,18 @@
     {
       "name": "Schubert - Mein Piano (MS)",
       "group": "piano"
+    },
+    {
+      "name": "Schubert - Mein Voice (MS)",
+      "group": "synthetic"
+    },
+    {
+      "name": "Abba Gold - Viola (MS)",
+      "group": "synthetic"
+    },
+    {
+      "name": "Abba Gold - Timpani (MS)",
+      "group": "synthetic"
     }
   ]
 }

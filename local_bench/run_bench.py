@@ -147,12 +147,22 @@ def run_fusion(pdf: Path, work_dir: Path) -> Path:
     out = work_dir / "fusion.musicxml"
     # Mirror production routing: homr is the base only when its rhythm
     # validity holds up (it collapses on grand staff); otherwise the result
-    # is Audiveris as-is.
+    # is Audiveris as-is. Lyrics tip the scale: homr never reads them, so a
+    # vocal part goes to Audiveris unless its notes are clearly worse.
     def validity(path):
         valid, total = scorer.rhythm_validity(ET.parse(path).getroot())
         return valid / max(total, 1)
 
-    if validity(homr_path) >= validity(aud_path):
+    def lyric_count(path):
+        return sum(1 for _ in ET.parse(path).getroot().iter("lyric"))
+
+    aud_is_vocal = lyric_count(aud_path) >= 10 > lyric_count(homr_path)
+    h_val, a_val = validity(homr_path), validity(aud_path)
+    if aud_is_vocal and a_val >= h_val - 0.05:
+        shutil.copy(aud_path, out)
+        print("  fusion: audiveris base (vocal part with lyrics)", flush=True)
+        return out
+    if h_val >= a_val:
         shutil.copy(homr_path, out)
         aligned, grafted = graft_features(out, aud_path)
         print(f"  fusion: homr base, {aligned} measures aligned, "
