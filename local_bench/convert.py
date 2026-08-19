@@ -12,6 +12,7 @@ with a MuseScore-rendered PDF of the result alongside for eyeballing.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
