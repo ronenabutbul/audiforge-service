@@ -142,10 +142,22 @@ def run_fusion(pdf: Path, work_dir: Path) -> Path:
             raise RuntimeError(f"fusion needs cached result: {p.name} missing")
 
     out = work_dir / "fusion.musicxml"
-    shutil.copy(homr_path, out)
-    aligned, grafted = graft_features(out, aud_path)
-    print(f"  fusion: {aligned} measures aligned, {grafted} grafted",
-          flush=True)
+    # Mirror production routing: homr is the base only when its rhythm
+    # validity holds up (it collapses on grand staff); otherwise the result
+    # is Audiveris as-is.
+    def validity(path):
+        valid, total = scorer.rhythm_validity(ET.parse(path).getroot())
+        return valid / max(total, 1)
+
+    if validity(homr_path) >= validity(aud_path):
+        shutil.copy(homr_path, out)
+        aligned, grafted = graft_features(out, aud_path)
+        print(f"  fusion: homr base, {aligned} measures aligned, "
+              f"{grafted} grafted", flush=True)
+    else:
+        shutil.copy(aud_path, out)
+        print("  fusion: audiveris base (homr rhythm validity lost)",
+              flush=True)
     return out
 
 
