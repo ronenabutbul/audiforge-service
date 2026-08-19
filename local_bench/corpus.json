@@ -92,6 +92,22 @@
     {
       "name": "Abba Gold - Timpani (MS)",
       "group": "synthetic"
+    },
+    {
+      "name": "Beethoven Op18-1 - Violin 1 (OSQ)",
+      "group": "strings"
+    },
+    {
+      "name": "Beethoven Op18-1 - Violin 2 (OSQ)",
+      "group": "strings"
+    },
+    {
+      "name": "Beethoven Op18-1 - Viola (OSQ)",
+      "group": "strings"
+    },
+    {
+      "name": "Beethoven Op18-1 - Violoncello (OSQ)",
+      "group": "strings"
     }
   ]
 }
