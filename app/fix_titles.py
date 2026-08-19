@@ -199,16 +199,29 @@ def apply_titles(result_path: Path, lines: list[str]) -> int:
     # "arranged by"-style lines.
     by_re = re.compile(r"\b(by|arr\.?|arranged|transcribed)\b", re.IGNORECASE)
     title = re.sub(r"^[\W_]+|[\W_]+$", "", lines[0]) or lines[0]
+    title_words = [w for w in _WORD_RE.findall(title) if len(w) >= 4]
     others, by_lines = [], []
     for line in lines[1:]:
+        # A garbled re-read of the title must never reach the subtitle slot —
+        # it renders on top of the clean title.
+        if any(_near_word(w, kw) for w in title_words
+               for kw in _WORD_RE.findall(line) if len(kw) >= 4):
+            continue
         (by_lines if by_re.search(line) else others).append(line)
     slots = [(title, "center", width / 2, height - 45, "22")]
     if others:
-        slots.append((" — ".join(others), "center", width / 2,
-                      height - 110, "12"))
+        subtitle = " — ".join(others)
+        if len(subtitle) > 90:  # credits don't wrap; a long merge overflows
+            subtitle = subtitle[:87].rsplit(" ", 1)[0] + "…"
+        slots.append((subtitle, "center", width / 2, height - 110, "12"))
     if by_lines:
         slots.append((" — ".join(by_lines), "right", width - 90,
                       height - 150, "11"))
+
+    # MuseScore renders movement-title as a page header IN ADDITION to the
+    # credits — with a credit header in place it doubles the title.
+    for mt in root.findall("movement-title"):
+        root.remove(mt)
 
     part_list = root.find("part-list")
     at = list(root).index(part_list)

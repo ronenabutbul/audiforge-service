@@ -98,6 +98,11 @@ def convert(pdf: Path) -> Path:
             print(f"  {fixed} multirest counts repaired via crop-OCR",
                   flush=True)
         fix_structure(work, result)
+    # Metadata first: fix_titles strips movement-title when it builds a
+    # credit header, and apply_metadata must not re-create it afterwards.
+    apply_metadata(result, name)
+    apply_transpose(result, name.rsplit(" - ", 1)[-1])
+
     page1 = work / "page_001.png"
     if page1.exists():
         bpm = fix_tempo(page1, result)
@@ -116,8 +121,6 @@ def convert(pdf: Path) -> Path:
             print(f"  WARNING: engines disagree on measure count "
                   f"(homr {h} vs audiveris {a}) — bars may be missing",
                   flush=True)
-    apply_metadata(result, name)
-    apply_transpose(result, name.rsplit(" - ", 1)[-1])
 
     root = ET.parse(result).getroot()
     measures = len(root.find("part").findall("measure"))

@@ -227,6 +227,51 @@ def graft_barlines(base_measures: list, bi: int, source_measure) -> int:
     return grafted
 
 
+def _printed_numbers(measures) -> list[int]:
+    """Printed measure number at each XML measure, advancing multirests by
+    their count — the coordinate system rehearsal marks are anchored in."""
+    numbers, n, skip = [], 1, 0
+    for measure in measures:
+        numbers.append(n)
+        if skip:
+            skip -= 1
+            n += 1
+            continue
+        mr = measure.find(".//multiple-rest")
+        if mr is not None and (mr.text or "").strip().isdigit():
+            skip = int(mr.text) - 1
+        n += 1
+    return numbers
+
+
+def graft_rehearsals_by_number(base_measures, sec_measures) -> int:
+    """Rehearsal marks sit at section starts — usually right after
+    multirests, where pitch alignment has nothing to align. Place them by
+    printed measure number instead."""
+    base_numbers = _printed_numbers(base_measures)
+    sec_numbers = _printed_numbers(sec_measures)
+    base_by_number = {}
+    for i, n in enumerate(base_numbers):
+        base_by_number.setdefault(n, i)
+    grafted = 0
+    for si, measure in enumerate(sec_measures):
+        for el in measure.findall("direction"):
+            if not any(dt.find("rehearsal") is not None
+                       for dt in el.findall("direction-type")):
+                continue
+            bi = base_by_number.get(sec_numbers[si])
+            if bi is None:
+                continue
+            target = base_measures[bi]
+            if any(dt.find("rehearsal") is not None
+                   for d in target.findall("direction")
+                   for dt in d.findall("direction-type")):
+                continue  # already placed
+            target.insert(0, copy.deepcopy(el))
+            grafted += 1
+    return grafted
+
+
 def graft_features(base_path: Path, secondary_path: Path) -> tuple[int, int]:
     """Graft directions and repeat/ending barlines from the secondary engine
     into the base file in place. Measures align by pitch signature; equal
@@ -252,6 +297,9 @@ def graft_features(base_path: Path, secondary_path: Path) -> tuple[int, int]:
             for el in sec_measures[ai]:
                 if el.tag != "direction":
                     continue
+                if any(dt.find("rehearsal") is not None
+                       for dt in el.findall("direction-type")):
+                    continue  # placed by printed number below
                 if any(dt.find(tag) is not None
                        for dt in el.findall("direction-type")
                        for tag in FUSION_DIRECTION_TAGS):
@@ -259,6 +307,7 @@ def graft_features(base_path: Path, secondary_path: Path) -> tuple[int, int]:
                     insert_at += 1
                     grafted += 1
             grafted += graft_barlines(base_measures, bi, sec_measures[ai])
+    grafted += graft_rehearsals_by_number(base_measures, sec_measures)
     if grafted:
         base.write(base_path, encoding="UTF-8", xml_declaration=True)
     return aligned, grafted
