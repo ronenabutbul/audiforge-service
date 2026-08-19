@@ -120,6 +120,44 @@ def convert(pdf: Path) -> Path:
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
+    if sys.argv[1] == "--dir":
+        # Folder mode: convert every PDF in the folder, deliver results to
+        # ~/Downloads/converted/, print a summary. Already-converted files
+        # (result newer than the PDF) are skipped.
+        folder = Path(sys.argv[2] if len(sys.argv) > 2
+                      else "~/Downloads/to-convert").expanduser()
+        pdfs = sorted(folder.glob("*.pdf")) + sorted(folder.glob("*.PDF"))
+        if not pdfs:
+            sys.exit(f"no PDFs in {folder}")
+        deliver = Path("~/Downloads/converted").expanduser()
+        deliver.mkdir(exist_ok=True)
+        summary = []
+        for pdf in pdfs:
+            name = pdf.stem
+            result = BENCH_DIR / "results" / "convert" / name / f"{name}.musicxml"
+            print(f"== {pdf.name}", flush=True)
+            try:
+                if not (result.exists()
+                        and result.stat().st_mtime > pdf.stat().st_mtime):
+                    convert(pdf)
+                for suffix in (".musicxml", " (converted).pdf"):
+                    src = result.parent / f"{name}{suffix}"
+                    if src.exists():
+                        shutil.copy(src, deliver)
+                root = ET.parse(result).getroot()
+                notes = sum(1 for n in root.iter("note")
+                            if n.find("rest") is None)
+                summary.append((name, validity(result), notes))
+            except Exception as exc:
+                print(f"  CONVERSION FAILED: {exc}", flush=True)
+                summary.append((name, None, 0))
+        print("\n== SUMMARY " + "=" * 40)
+        for name, val, notes in summary:
+            status = f"{val:.0%} rhythm-consistent, {notes} notes" \
+                if val is not None else "FAILED"
+            print(f"  {name:45} {status}")
+        print(f"\nresults in {deliver}")
+        return
     for arg in sys.argv[1:]:
         pdf = Path(arg).expanduser()
         print(f"== {pdf.name}", flush=True)
