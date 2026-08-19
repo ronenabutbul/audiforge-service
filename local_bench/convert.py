@@ -65,8 +65,23 @@ def convert(pdf: Path) -> Path:
         raise RuntimeError(f"both engines failed on {name}")
 
     result = work / f"{name}.musicxml"
-    h_val = validity(homr_out) if homr_out else -1.0
-    a_val = validity(aud_out) if aud_out else -1.0
+
+    def measures_of(path):
+        return len(ET.parse(path).getroot().find("part").findall("measure"))
+
+    def lyrics_of(path):
+        return sum(1 for _ in ET.parse(path).getroot().iter("lyric"))
+
+    # Completeness-weighted validity: a truncated engine cannot outrank a
+    # complete one. Lyrics force the Audiveris base for vocal parts.
+    most = max((measures_of(p) for p in (homr_out, aud_out) if p), default=1)
+    h_val = (validity(homr_out) * measures_of(homr_out) / most
+             if homr_out else -1.0)
+    a_val = (validity(aud_out) * measures_of(aud_out) / most
+             if aud_out else -1.0)
+    if (homr_out and aud_out and lyrics_of(aud_out) >= 10 > lyrics_of(homr_out)
+            and a_val >= h_val - 0.05):
+        h_val = -1.0  # vocal part: the engine that read the words wins
     if homr_out and h_val >= a_val:
         result.write_bytes(homr_out.read_bytes())
         role = f"homr base (validity {h_val:.0%} vs audiveris {a_val:.0%})"
