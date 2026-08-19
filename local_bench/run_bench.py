@@ -115,10 +115,10 @@ def run_audiveris(pdf: Path, work_dir: Path) -> Path:
             )
     mxl_files = sorted(work_dir.rglob("*.mxl"))
     if not mxl_files:
-        raise RuntimeError(
-            f"Audiveris produced no .mxl (exit {result.returncode}): "
-            f"{result.stderr[-2000:] or result.stdout[-2000:]}"
-        )
+        # One unreadable sheet makes Audiveris refuse to export the whole
+        # book ("No system found"). Salvage: transcribe page by page and
+        # merge the pages that work.
+        return _run_audiveris_paged(pdf, work_dir, env)
     # A multi-movement book may export several .mxl; take the largest.
     mxl = max(mxl_files, key=lambda p: p.stat().st_size)
     out = work_dir / "audiveris.musicxml"
@@ -147,6 +147,37 @@ def run_fusion(pdf: Path, work_dir: Path) -> Path:
     print(f"  fusion: {aligned} measures aligned, {grafted} grafted",
           flush=True)
     return out
+
+
+def _run_audiveris_paged(pdf: Path, work_dir: Path, env: dict) -> Path:
+    from pdf2image import convert_from_path
+
+    paged_dir = work_dir / "paged"
+    paged_dir.mkdir(exist_ok=True)
+    page_outputs = []
+    for i, image in enumerate(convert_from_path(str(pdf), dpi=RENDER_DPI),
+                              start=1):
+        page = paged_dir / f"page_{i:03d}.png"
+        image.save(page, "PNG")
+        subprocess.run(
+            [str(AUDIVERIS_BIN), "-batch", "-export", "-output",
+             str(paged_dir), str(page)],
+            capture_output=True, text=True, timeout=PAGE_TIMEOUT_SECONDS,
+            env=env,
+        )
+        mxls = sorted(paged_dir.rglob(f"page_{i:03d}*.mxl"))
+        if not mxls:
+            print(f"  audiveris: page {i} unreadable, skipped", flush=True)
+            continue
+        out = paged_dir / f"page_{i:03d}.musicxml"
+        with zipfile.ZipFile(mxls[0]) as z:
+            inner = [n for n in z.namelist() if n.endswith((".xml", ".musicxml"))
+                     and not n.startswith("META-INF")]
+            out.write_bytes(z.read(inner[0]))
+        page_outputs.append(out)
+    if not page_outputs:
+        raise RuntimeError("Audiveris failed on every page")
+    return merge_musicxml(page_outputs, work_dir / "audiveris.musicxml")
 
 
 ENGINES = {
