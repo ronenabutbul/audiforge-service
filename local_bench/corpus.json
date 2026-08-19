@@ -1,12 +1,69 @@
 {
   "comment": "Local bake-off corpus. PDFs + Newzik (Maestria) references live in corpus/, copied from ~/Downloads. Paths are relative to local_bench/.",
   "pieces": [
-    {"name": "Abba Gold - Alto Sax 1,2", "group": "melodic"},
-    {"name": "Abba Gold - Clarinet 1", "group": "melodic"},
-    {"name": "Abba Gold - Flugelhorn 1", "group": "melodic"},
-    {"name": "Abba Gold - Trombone 1", "group": "melodic"},
-    {"name": "Adele - Alto Sax 1", "group": "melodic"},
-    {"name": "Adele - Trombone 1", "group": "melodic"},
-    {"name": "Adele - Trumpet 1", "group": "melodic"}
+    {
+      "name": "Abba Gold - Alto Sax 1,2",
+      "group": "melodic"
+    },
+    {
+      "name": "Abba Gold - Clarinet 1",
+      "group": "melodic"
+    },
+    {
+      "name": "Abba Gold - Flugelhorn 1",
+      "group": "melodic"
+    },
+    {
+      "name": "Abba Gold - Trombone 1",
+      "group": "melodic"
+    },
+    {
+      "name": "Adele - Alto Sax 1",
+      "group": "melodic"
+    },
+    {
+      "name": "Adele - Trombone 1",
+      "group": "melodic"
+    },
+    {
+      "name": "Adele - Trumpet 1",
+      "group": "melodic"
+    },
+    {
+      "name": "Abba Gold - Alto Sax 1,2 (MS)",
+      "group": "synthetic"
+    },
+    {
+      "name": "Abba Gold - Clarinet 1 (MS)",
+      "group": "synthetic"
+    },
+    {
+      "name": "Abba Gold - Flugelhorn 1 (MS)",
+      "group": "synthetic"
+    },
+    {
+      "name": "Abba Gold - Trombone 1 (MS)",
+      "group": "synthetic"
+    },
+    {
+      "name": "Adele - Alto Sax 1 (MS)",
+      "group": "synthetic"
+    },
+    {
+      "name": "Adele - Trombone 1 (MS)",
+      "group": "synthetic"
+    },
+    {
+      "name": "Adele - Trumpet 1 (MS)",
+      "group": "synthetic"
+    },
+    {
+      "name": "Brit Olam - Piccolo (MS)",
+      "group": "synthetic"
+    },
+    {
+      "name": "Unknown - Clarinet 1 (MS)",
+      "group": "synthetic"
+    }
   ]
 }
