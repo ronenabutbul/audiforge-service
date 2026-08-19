@@ -37,7 +37,7 @@ from fix_multirests import fix as fix_multirest_counts  # noqa: E402
 from fix_structure import fix as fix_structure  # noqa: E402
 from fix_tempo import fix as fix_tempo  # noqa: E402
 from fix_titles import fix as fix_titles  # noqa: E402
-from postprocess import graft_features, graft_numbered, normalize_homr  # noqa: E402
+from postprocess import app_compat, graft_features, graft_numbered, normalize_homr  # noqa: E402
 from transpose import apply_transpose  # noqa: E402
 
 MSCORE = Path("/Applications/MuseScore 4.app/Contents/MacOS/mscore")
@@ -143,6 +143,8 @@ def convert(pdf: Path) -> Path:
             print(f"  WARNING: engines disagree on measure count "
                   f"(homr {h} vs audiveris {a}) — bars may be missing",
                   flush=True)
+
+    app_compat(result)
 
     root = ET.parse(result).getroot()
     measures = len(root.find("part").findall("measure"))

@@ -362,3 +362,24 @@ def graft_features(base_path: Path, secondary_path: Path) -> tuple[int, int]:
     if grafted:
         base.write(base_path, encoding="UTF-8", xml_declaration=True)
     return aligned, grafted
+
+
+def app_compat(result_path: Path) -> int:
+    """Match the encoding the SyncSheets app digests best (Newzik-style):
+    plain expanded rest measures with NO <multiple-rest> markers — the
+    app's renderer miscounts condensed-multirest markup. The expansion
+    itself already happened earlier in the pipeline; this strips only the
+    marker. Returns markers removed."""
+    tree = ET.parse(result_path)
+    removed = 0
+    for measure in tree.getroot().iter("measure"):
+        for attrs in measure.findall("attributes"):
+            for style in list(attrs.findall("measure-style")):
+                if style.find("multiple-rest") is not None:
+                    attrs.remove(style)
+                    removed += 1
+            if len(attrs) == 0:
+                measure.remove(attrs)
+    if removed:
+        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    return removed

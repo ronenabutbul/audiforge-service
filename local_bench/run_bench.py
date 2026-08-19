@@ -267,7 +267,9 @@ def apply_metadata(result_path: Path, piece_title: str):
                     root.insert(0, parent)
             el = ET.SubElement(parent, leaf)
         el.text = title
-    if part_name:
+    # Only a single-part file takes its part name from the filename; a
+    # multi-part score keeps the names the engine read.
+    if part_name and len(root.findall("part")) == 1:
         for name_el in root.findall("part-list/score-part/part-name"):
             name_el.text = part_name
     tree.write(result_path, encoding="UTF-8", xml_declaration=True)
