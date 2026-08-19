@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -325,6 +326,39 @@ def timed_sequence(root) -> list:
     return seq
 
 
+def collapse_multirests(root):
+    """Rewrite a reference in homr's encoding: a multirest becomes ONE
+    measure (drop the N-1 expanded copies). Lets note_sim measure
+    recognition quality separately from multirest-count structure."""
+    for part in root.findall("part"):
+        measures = part.findall("measure")
+        skip = 0
+        for measure in measures:
+            if skip:
+                part.remove(measure)
+                skip -= 1
+                continue
+            mr = measure.find(".//multiple-rest")
+            if mr is not None and (mr.text or "").strip().isdigit():
+                skip = int(mr.text) - 1
+    return root
+
+
+# Newzik reference <words> are partly its own OCR junk ("Est cive to", broken
+# email text). Placement only counts ref words that look like real markings.
+_MEANINGFUL_WORDS = re.compile(
+    r"[\"“'‘].+[\"”'’]"          # quoted song/section titles
+    r"|\b(rit|rall|fine|coda|segno|solo|soli|tacet|cresc|dim|div|unis|tutti"
+    r"|swing|shuffle|ballad|latin|rock|funk|moderato|allegro|andante|adagio"
+    r"|lento|vivo|presto|tempo|play|open|mute)\b",
+    re.IGNORECASE)
+
+
+def _measure_has_meaningful_words(measure) -> bool:
+    return any(_MEANINGFUL_WORDS.search(w.text or "")
+               for w in measure.iter("words"))
+
+
 PLACEMENT_FEATURES = ("dynamics", "wedge", "words", "metronome",
                       "tie", "slur", "fermata")
 
@@ -351,6 +385,9 @@ def feature_placement(engine_root, ref_root) -> tuple:
                   if next(e_measures[ei].iter(t), None) is not None}
         for tag in PLACEMENT_FEATURES:
             if next(r_measures[ri].iter(tag), None) is not None:
+                if tag == "words" and not _measure_has_meaningful_words(
+                        r_measures[ri]):
+                    continue
                 total += 1
                 hit += tag in e_tags
     return hit, total, len(pairs), len(r_measures)
@@ -366,6 +403,10 @@ def score_pair(engine_path: Path, ref_path: Path) -> dict:
     sim = SequenceMatcher(None, e_pitch, r_pitch, autojunk=False).ratio()
     note_sim = SequenceMatcher(None, timed_sequence(engine),
                                timed_sequence(ref), autojunk=False).ratio()
+    ref_collapsed = collapse_multirests(ET.parse(ref_path).getroot())
+    note_sim_mr = SequenceMatcher(None, timed_sequence(engine),
+                                  timed_sequence(ref_collapsed),
+                                  autojunk=False).ratio()
     place_hit, place_tot, aligned, r_count = feature_placement(engine, ref)
     e_valid, e_tot = scorer.rhythm_validity(engine)
     e_feat, r_feat = scorer.feature_counts(engine), scorer.feature_counts(ref)
@@ -376,6 +417,7 @@ def score_pair(engine_path: Path, ref_path: Path) -> dict:
     return {
         "pitch_sim": sim,
         "note_sim": note_sim,
+        "note_sim_mr": note_sim_mr,
         "rhythm_valid": e_valid / max(e_tot, 1),
         "features": f"{covered}/{wanted}",
         "feat_place": f"{place_hit}/{place_tot}",
@@ -450,8 +492,9 @@ def main():
                   f"rhythm {metrics['rhythm_valid']:.0%}  "
                   f"measures {metrics['measures']}  ({status})", flush=True)
 
-    header = ["piece", "engine", "pitch_sim", "note_sim", "rhythm_valid",
-              "features", "feat_place", "aligned", "measures", "status"]
+    header = ["piece", "engine", "pitch_sim", "note_sim", "note_sim_mr",
+              "rhythm_valid", "features", "feat_place", "aligned", "measures",
+              "status"]
     lines = ["| " + " | ".join(header) + " |",
              "|" + "---|" * len(header)]
     for r in rows:
