@@ -122,7 +122,10 @@ def main():
     # them collapses the ratio and hides real pitch agreement.
     e_pitch = [k for k, _ in [(n[0], None) for n in e_seq] if k != "R"]
     r_pitch = [k for k, _ in [(n[0], None) for n in r_seq] if k != "R"]
-    sim = SequenceMatcher(None, e_pitch, r_pitch).ratio()
+    # autojunk must be off: with sequences >200 elements it discards any
+    # element appearing in >1% of positions — i.e. every common pitch —
+    # which tanked similarity scores on full-length pieces.
+    sim = SequenceMatcher(None, e_pitch, r_pitch, autojunk=False).ratio()
 
     e_valid, e_tot = rhythm_validity(engine)
     r_valid, r_tot = rhythm_validity(ref)
