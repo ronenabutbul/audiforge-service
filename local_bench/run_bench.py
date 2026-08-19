@@ -86,10 +86,27 @@ def run_homr(pdf: Path, work_dir: Path, homr_bin: Path = None) -> Path:
 
 
 def run_audiveris(pdf: Path, work_dir: Path) -> Path:
+    import os
+
+    # The bundled app has no tessdata; without it OCR is SILENTLY skipped and
+    # all text output (words, tempo, rehearsal marks) vanishes. Audiveris
+    # runs Tesseract in legacy mode, so brew's LSTM-only traineddata won't
+    # do — tools/tessdata holds the full file from tesseract-ocr/tessdata.
+    env = {**os.environ,
+           "TESSDATA_PREFIX": str(BENCH_DIR / "tools" / "tessdata")}
     result = subprocess.run(
         [str(AUDIVERIS_BIN), "-batch", "-export", "-output", str(work_dir), str(pdf)],
         capture_output=True, text=True, timeout=PAGE_TIMEOUT_SECONDS * 2,
+        env=env,
     )
+    for log in work_dir.rglob("*.log"):
+        text = log.read_text(errors="replace")
+        if ("Missing support for 'eng'" in text
+                or "Could not initialize TessBaseAPI" in text):
+            raise RuntimeError(
+                "Audiveris ran without OCR (tessdata missing or unusable) — "
+                "refusing the silently text-less result"
+            )
     mxl_files = sorted(work_dir.rglob("*.mxl"))
     if not mxl_files:
         raise RuntimeError(

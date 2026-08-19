@@ -36,6 +36,11 @@ python3.11 -m venv .venv-homr
 .venv-homr/bin/pip install "homr @ git+https://github.com/liebharc/homr.git@v0.6.2" pdf2image
 # Audiveris: download the macOS dmg from github.com/Audiveris/audiveris/releases,
 # copy Audiveris.app into tools/
+# OCR: Audiveris needs LEGACY-mode tessdata (brew's LSTM-only file fails with
+# "Could not initialize TessBaseAPI"); without any tessdata OCR is skipped
+# SILENTLY and all text output vanishes. run_bench refuses such runs.
+curl -L -o tools/tessdata/eng.traineddata \
+  https://github.com/tesseract-ocr/tessdata/raw/main/eng.traineddata
 # Corpus: copy PDF+ref pairs into corpus/pdf and corpus/ref (same basename).
 ```
 
