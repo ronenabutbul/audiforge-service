@@ -100,6 +100,9 @@ def run_audiveris(pdf: Path, work_dir: Path) -> Path:
     # do — tools/tessdata holds the full file from tesseract-ocr/tessdata.
     env = {**os.environ,
            "TESSDATA_PREFIX": str(BENCH_DIR / "tools" / "tessdata")}
+    # NOTE: do NOT add heb to the language spec — Audiveris 5.11's
+    # WordScanner throws IndexOutOfBounds on RTL text and the whole TEXTS
+    # step dies for the page, losing the English words too.
     result = subprocess.run(
         [str(AUDIVERIS_BIN), "-batch", "-export", "-output", str(work_dir), str(pdf)],
         capture_output=True, text=True, timeout=PAGE_TIMEOUT_SECONDS * 2,

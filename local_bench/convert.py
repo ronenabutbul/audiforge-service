@@ -30,6 +30,7 @@ from run_bench import (  # noqa: E402
 sys.path.insert(0, str(BENCH_DIR.parent / "benchmark"))
 sys.path.insert(0, str(BENCH_DIR.parent / "app"))
 import score as scorer  # noqa: E402
+from fix_multirests import fix as fix_multirest_counts  # noqa: E402
 from postprocess import graft_features, normalize_homr  # noqa: E402
 from transpose import apply_transpose  # noqa: E402
 
@@ -72,6 +73,11 @@ def convert(pdf: Path) -> Path:
         result.write_bytes(aud_out.read_bytes())
         role = f"audiveris base (validity {a_val:.0%} vs homr {h_val:.0%})"
 
+    if aud_out is not None:
+        fixed = fix_multirest_counts(work, result)
+        if fixed:
+            print(f"  {fixed} multirest counts repaired via crop-OCR",
+                  flush=True)
     apply_metadata(result, name)
     apply_transpose(result, name.rsplit(" - ", 1)[-1])
 
