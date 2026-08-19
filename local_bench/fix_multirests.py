@@ -114,6 +114,9 @@ def _read_number(image, cx, cy, cw, ch) -> int | None:
         elif not d and start is not None:
             runs.append((start, i))
             start = None
+    # Runs far wider than a digit are page-margin black or barline blocks —
+    # never part of the number, and never to be chained across.
+    runs = [(a, b) for a, b in runs if b - a <= 2.5 * cw]
     if not runs:
         return None
     glyph_c = cx - x0 + cw / 2

@@ -128,9 +128,10 @@ def _read_anchor(image, left: float, top: float, predicted: int):
     from fix_multirests import _ocr_digits, _read_number
 
     candidates = []
-    for dx in (-105, -75, -45):
-        candidates.append(_read_number(image, int(left + dx),
-                                       int(top - 105), 25, 45))
+    for dy in (-125, -105, -85, -65):
+        for dx in (-105, -75, -45, -15):
+            candidates.append(_read_number(image, int(left + dx),
+                                           int(top + dy), 25, 42))
     crop = image.crop((int(left - 230), int(top - 120),
                        int(left + 70), int(top - 45)))
     crop = crop.resize((crop.width * 4, crop.height * 4), Image.LANCZOS)
@@ -138,10 +139,13 @@ def _read_anchor(image, left: float, top: float, predicted: int):
     plausible = [c for c in candidates if c and abs(c - predicted) <= 3]
     if not plausible:
         return None
-    return min(plausible, key=lambda c: abs(c - predicted))
+    # majority vote among plausible reads, ties broken toward the prediction
+    return max(set(plausible),
+               key=lambda c: (plausible.count(c), -abs(c - predicted)))
 
 
-def anchor_repair(work_dir: Path, result_path: Path) -> int:
+def anchor_repair(work_dir: Path, result_path: Path,
+                  deficit: int | None = None) -> int:
     """Walk the printed-bar stack stream against the XML, predict each
     system's starting measure number, OCR the printed number, and insert
     whole-rest measures where the print proves bars are missing."""
@@ -158,30 +162,23 @@ def anchor_repair(work_dir: Path, result_path: Path) -> int:
             return int(mr.text)
         return None
 
-    inserts = []  # (xml_index, missing_count)
+    # Pass 1: walk the stack stream, OCR anchors, record drift events.
+    events = []  # (prev_span_start, drift)
     xml_i = 0
     predicted = 1
     prev_span_start = 0
     with zipfile.ZipFile(omr_files[0]) as z:
         for image, systems in _sheet_systems(z):
-            for si, system in enumerate(systems):
-                # OCR anchor (systems after the very first overall)
+            for system in systems:
                 if (xml_i > 0 and system["left"] is not None
                         and system["top"] is not None):
                     anchor = _read_anchor(image, system["left"],
                                           system["top"], predicted)
-                    if anchor and 0 < anchor - predicted <= 2:
-                        # Bars missing within the PREVIOUS system; engines
-                        # drop them at the system start, so restore there.
-                        inserts.append((prev_span_start, anchor - predicted))
+                    if anchor and anchor != predicted:
+                        events.append((prev_span_start, anchor - predicted))
                         print(f"  anchor {anchor} vs predicted {predicted}: "
-                              f"{anchor - predicted} bar(s) restored at the "
-                              f"previous system start", flush=True)
+                              f"drift {anchor - predicted:+d}", flush=True)
                         predicted = anchor
-                    elif anchor and anchor < predicted:
-                        print(f"  anchor {anchor} vs predicted {predicted}: "
-                              f"invented bars suspected — not deleting",
-                              flush=True)
                 prev_span_start = xml_i
                 # consume this system's stacks against the XML
                 j = 0
@@ -199,8 +196,42 @@ def anchor_repair(work_dir: Path, result_path: Path) -> int:
                         xml_i += 1
                         predicted += 1
                         j += 1
+
+    # Pass 2: reconcile. A later negative drift usually means an earlier
+    # positive was a misread anchor, not real missing bars — cancel the most
+    # recent inserts first rather than trusting both directions blindly.
+    # When the anchor drifts sum exactly to the stack-count deficit, the two
+    # independent measurements confirm each other — repair even larger gaps.
+    total_positive = sum(d for _, d in events if d > 0)
+    confirmed = (deficit is not None and total_positive == deficit
+                 and not any(d < 0 for _, d in events))
+    limit = 4 if confirmed else 2
+    inserts = []
+    for span_start, drift in events:
+        if drift > 0:
+            if drift <= limit:
+                inserts.append([span_start, drift])
+            else:
+                print(f"  drift +{drift} too large to auto-repair", flush=True)
+        else:
+            debt = -drift
+            while debt and inserts:
+                take = min(debt, inserts[-1][1])
+                inserts[-1][1] -= take
+                debt -= take
+                if inserts[-1][1] == 0:
+                    inserts.pop()
+                print("  negative drift cancels an earlier uncertain "
+                      "insert", flush=True)
+            if debt:
+                print(f"  {debt} invented bar(s) suspected — not deleting",
+                      flush=True)
+    inserts = [(s, c) for s, c in inserts if c > 0]
     if not inserts:
         return 0
+    for span_start, count in inserts:
+        print(f"  restoring {count} bar(s) at measure {span_start + 1}",
+              flush=True)
 
     divisions, beats, beat_type = 1, 4, 4
     durations = []
@@ -262,7 +293,8 @@ def fix(work_dir: Path, result_path: Path) -> int:
     print(f"  bar-count drift {deficit:+d} (engine saw {stacks} printed "
           f"bars, export represents {bars}) — running anchor repair",
           flush=True)
-    return anchor_repair(work_dir, result_path)
+    return anchor_repair(work_dir, result_path,
+                         deficit if deficit > 0 else None)
 
 
 if __name__ == "__main__":
