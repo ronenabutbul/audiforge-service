@@ -131,7 +131,7 @@ def _read_anchor(image, left: float, top: float, predicted: int):
     for dy in (-125, -105, -85, -65):
         for dx in (-105, -75, -45, -15):
             candidates.append(_read_number(image, int(left + dx),
-                                           int(top + dy), 25, 42))
+                                           int(top + dy), 25, 42, upper=1000))
     crop = image.crop((int(left - 230), int(top - 120),
                        int(left + 70), int(top - 45)))
     crop = crop.resize((crop.width * 4, crop.height * 4), Image.LANCZOS)

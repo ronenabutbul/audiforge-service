@@ -93,7 +93,7 @@ def read_counts_from_omr(omr_path: Path) -> list[tuple[int, int]]:
     return results
 
 
-def _read_number(image, cx, cy, cw, ch) -> int | None:
+def _read_number(image, cx, cy, cw, ch, upper: int = 100) -> int | None:
     """OCR the full printed number whose (single) classified digit glyph
     occupies (cx, cy, cw, ch). Neighboring digits of the same number sit in
     the same vertical band; rehearsal boxes and barlines do not — segment
@@ -141,10 +141,10 @@ def _read_number(image, cx, cy, cw, ch) -> int | None:
     number = number.resize((number.width * 3, number.height * 3),
                            Image.LANCZOS)
     number = ImageOps.expand(number, border=16, fill=255)
-    return _ocr_digits(number)
+    return _ocr_digits(number, upper)
 
 
-def _ocr_digits(image) -> int | None:
+def _ocr_digits(image, upper: int = 100) -> int | None:
     png = _png_bytes(image)
     for psm in ("8", "7", "13"):  # single word first — most reliable here
         proc = subprocess.run(
@@ -153,7 +153,7 @@ def _ocr_digits(image) -> int | None:
             input=png, capture_output=True, timeout=60,
         )
         digits = re.sub(r"\D", "", proc.stdout.decode("utf-8", "replace"))
-        if digits and 0 < int(digits) < 100:
+        if digits and 0 < int(digits) < upper:
             return int(digits)
     return None
 
