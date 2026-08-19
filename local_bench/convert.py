@@ -32,6 +32,7 @@ sys.path.insert(0, str(BENCH_DIR.parent / "app"))
 import score as scorer  # noqa: E402
 from fix_multirests import fix as fix_multirest_counts  # noqa: E402
 from fix_tempo import fix as fix_tempo  # noqa: E402
+from fix_titles import fix as fix_titles  # noqa: E402
 from postprocess import graft_features, normalize_homr  # noqa: E402
 from transpose import apply_transpose  # noqa: E402
 
@@ -84,6 +85,19 @@ def convert(pdf: Path) -> Path:
         bpm = fix_tempo(page1, result)
         if bpm:
             print(f"  tempo recovered: {bpm} BPM", flush=True)
+        for line in fix_titles(page1, result):
+            print(f"  title text recovered: {line}", flush=True)
+
+    # Engines disagreeing on the bar count means one of them dropped or
+    # invented measures (Audiveris is known to lose bar 1 sometimes).
+    # Surfaced for now; structure voting is the planned fix.
+    if homr_out is not None and aud_out is not None:
+        h = len(ET.parse(homr_out).getroot().find("part").findall("measure"))
+        a = len(ET.parse(aud_out).getroot().find("part").findall("measure"))
+        if h != a:
+            print(f"  WARNING: engines disagree on measure count "
+                  f"(homr {h} vs audiveris {a}) — bars may be missing",
+                  flush=True)
     apply_metadata(result, name)
     apply_transpose(result, name.rsplit(" - ", 1)[-1])
 
