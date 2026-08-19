@@ -183,6 +183,9 @@ def _run_audiveris_paged(pdf: Path, work_dir: Path, env: dict) -> Path:
         mxls = sorted(paged_dir.rglob(f"page_{i:03d}*.mxl"))
         if not mxls:
             print(f"  audiveris: page {i} unreadable, skipped", flush=True)
+            if i >= 3 and not page_outputs:
+                raise RuntimeError(
+                    "first pages have no readable music — not a score?")
             continue
         out = paged_dir / f"page_{i:03d}.musicxml"
         with zipfile.ZipFile(mxls[0]) as z:

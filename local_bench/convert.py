@@ -123,7 +123,10 @@ def main():
     for arg in sys.argv[1:]:
         pdf = Path(arg).expanduser()
         print(f"== {pdf.name}", flush=True)
-        convert(pdf)
+        try:
+            convert(pdf)
+        except Exception as exc:  # keep the batch going
+            print(f"  CONVERSION FAILED: {exc}", flush=True)
 
 
 if __name__ == "__main__":
