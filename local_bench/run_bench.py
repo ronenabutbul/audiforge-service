@@ -260,13 +260,18 @@ def timed_sequence(root) -> list:
                 dur = int(el.findtext("duration") or 0)
                 beats = Fraction(dur, divisions)
                 pitch = el.find("pitch")
-                if el.find("rest") is not None or pitch is None:
-                    seq.append(("R", beats))
-                else:
+                unpitched = el.find("unpitched")
+                if pitch is not None:
                     key = (f"{pitch.findtext('step')}"
                            f"{pitch.findtext('alter') or ''}"
                            f"{pitch.findtext('octave')}")
                     seq.append((key, beats))
+                elif unpitched is not None:
+                    seq.append((f"U{unpitched.findtext('display-step')}"
+                                f"{unpitched.findtext('display-octave')}",
+                                beats))
+                else:
+                    seq.append(("R", beats))
     return seq
 
 
@@ -336,10 +341,55 @@ def feature_placement(engine_root, ref_root) -> tuple:
                 hit += tag in e_tags
     return hit, total, len(pairs), len(r_measures)
 
+def _part_roots(root):
+    """Views of a multi-part score, one single-part root per part."""
+    views = []
+    for part in root.findall("part"):
+        view = ET.Element(root.tag)
+        view.append(part)
+        views.append(view)
+    return views
+
+
+def score_multipart(engine_path: Path, ref_path: Path) -> dict:
+    """Conductor scores: pair engine parts to reference parts greedily by
+    pitch-line similarity, report the mean over reference parts."""
+    engine_parts = _part_roots(ET.parse(engine_path).getroot())
+    ref_parts = _part_roots(ET.parse(ref_path).getroot())
+    e_lines = [[t[0] for t in timed_sequence(p) if t[0] != "R"]
+               for p in engine_parts]
+    sims = []
+    for rp in ref_parts:
+        r_line = [t[0] for t in timed_sequence(rp) if t[0] != "R"]
+        best = max((SequenceMatcher(None, e, r_line, autojunk=False).ratio()
+                    for e in e_lines if e), default=0.0)
+        sims.append(best)
+    mean = sum(sims) / len(sims) if sims else 0.0
+    worst = min(sims) if sims else 0.0
+    return {
+        "pitch_sim": mean,     # mean over reference parts
+        "note_sim": worst,     # worst-matched reference part
+        "note_sim_mr": 0.0,
+        "rhythm_valid": 0.0,
+        "features": "-",
+        "feat_place": "-",
+        "aligned": "-",
+        "measures": f"parts {len(engine_parts)}/{len(ref_parts)}",
+    }
+
+
 def score_pair(engine_path: Path, ref_path: Path) -> dict:
     engine = ET.parse(engine_path).getroot()
     ref = ET.parse(ref_path).getroot()
-    e_seq, r_seq = scorer.note_sequence(engine), scorer.note_sequence(ref)
+    if len(ref.findall("part")) > 1:
+        return score_multipart(engine_path, ref_path)
+    if next(ref.iter("unpitched"), None) is not None:
+        # Percussion: scorer.note_sequence only reads <pitch>; use the
+        # unpitched-aware timed sequence for the pitch line instead.
+        e_seq = [(t[0], None) for t in timed_sequence(engine)]
+        r_seq = [(t[0], None) for t in timed_sequence(ref)]
+    else:
+        e_seq, r_seq = scorer.note_sequence(engine), scorer.note_sequence(ref)
     e_pitch = [n[0] for n in e_seq if n[0] != "R"]
     r_pitch = [n[0] for n in r_seq if n[0] != "R"]
     # autojunk=False: the default discards frequent elements (common pitches)

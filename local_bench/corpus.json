@@ -60,6 +60,26 @@
     {
       "name": "Brit Olam - Piccolo (MS)",
       "group": "synthetic"
+    },
+    {
+      "name": "Adele - Drum Set",
+      "group": "percussion"
+    },
+    {
+      "name": "Charles Aznavour - Percussion 1",
+      "group": "percussion"
+    },
+    {
+      "name": "Aladdin - Percussion 1",
+      "group": "percussion"
+    },
+    {
+      "name": "Abba Gold - Conductor",
+      "group": "conductor"
+    },
+    {
+      "name": "Schubert - Mein Piano (MS)",
+      "group": "piano"
     }
   ]
 }

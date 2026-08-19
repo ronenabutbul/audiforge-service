@@ -52,6 +52,11 @@ def measure_signature(measure) -> tuple:
         if p is not None:
             sig.append((p.findtext("step"), p.findtext("alter"),
                         p.findtext("octave")))
+            continue
+        u = note.find("unpitched")
+        if u is not None:
+            sig.append(("U" + (u.findtext("display-step") or ""), None,
+                        u.findtext("display-octave")))
     return tuple(sig)
 
 
