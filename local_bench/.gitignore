@@ -1,0 +1,4 @@
+corpus/
+results/
+tools/
+.venv*/
