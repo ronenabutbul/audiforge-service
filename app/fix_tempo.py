@@ -14,13 +14,14 @@ Used by convert.py; also runnable alone:
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-TESSERACT = "/opt/homebrew/bin/tesseract"
+TESSERACT = os.environ.get("TESSERACT_BIN", "/opt/homebrew/bin/tesseract")
 
 
 def detect_bpm(page_png: Path) -> int | None:

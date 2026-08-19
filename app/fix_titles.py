@@ -20,8 +20,10 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-TESSERACT = "/opt/homebrew/bin/tesseract"
-TESSDATA = Path(__file__).resolve().parent / "tools" / "tessdata"
+TESSERACT = os.environ.get("TESSERACT_BIN", "/opt/homebrew/bin/tesseract")
+TESSDATA = Path(os.environ.get(
+    "TESSDATA_DIR",
+    Path(__file__).resolve().parent.parent / "local_bench" / "tools" / "tessdata"))
 
 _WORD_RE = re.compile(r"[A-Za-z֐-׿]{2,}")
 _SKIP_RE = re.compile(

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import io
+import os
 import re
 import subprocess
 import sys
@@ -25,7 +26,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
-TESSERACT = "/opt/homebrew/bin/tesseract"
+TESSERACT = os.environ.get("TESSERACT_BIN", "/opt/homebrew/bin/tesseract")
 
 
 def read_counts_from_omr(omr_path: Path) -> list[tuple[int, int]]:
