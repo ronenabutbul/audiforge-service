@@ -267,6 +267,101 @@ def slurs_to_ties(result_path: Path) -> int:
     return converted
 
 
+_STEP_SEMITONES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+
+
+def _semitone(note) -> int:
+    p = note.find("pitch")
+    return (int(p.findtext("octave")) * 12
+            + _STEP_SEMITONES[p.findtext("step")]
+            + int(p.findtext("alter") or 0))
+
+
+def sort_chords(result_path: Path) -> int:
+    """homr serializes ~1/3 of chords top-note-first; every publisher file
+    and other engine writes bottom-first. Reorder chord groups ascending,
+    moving the <chord/> marker so it stays on all notes but the first.
+    Returns the number of groups reordered."""
+    tree = ET.parse(result_path)
+    reordered = 0
+    for part in tree.getroot().findall("part"):
+        for measure in part.findall("measure"):
+            children = list(measure)
+            group = []  # indices into children of the current chord group
+            groups = []
+            for i, el in enumerate(children):
+                if el.tag != "note" or el.find("pitch") is None:
+                    group = []
+                    continue
+                if el.find("chord") is not None and group:
+                    group.append(i)
+                else:
+                    group = [i]
+                    groups.append(group)
+            for g in groups:
+                if len(g) < 2:
+                    continue
+                notes = [children[i] for i in g]
+                ordered = sorted(notes, key=_semitone)
+                if ordered == notes:
+                    continue
+                for note in ordered:
+                    for marker in note.findall("chord"):
+                        note.remove(marker)
+                for note in ordered[1:]:
+                    note.insert(0, ET.Element("chord"))
+                for note in notes:
+                    measure.remove(note)
+                for offset, note in enumerate(ordered):
+                    measure.insert(g[0] + offset, note)
+                reordered += 1
+    if reordered:
+        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    return reordered
+
+
+def expand_multirests(result_path: Path) -> int:
+    """homr writes a multirest as ONE empty measure carrying
+    <multiple-rest>N</multiple-rest>. Expand to Newzik's encoding: N rest
+    measures, the count kept on the first. Returns measures added."""
+    import copy
+
+    tree = ET.parse(result_path)
+    added = 0
+    for part in tree.getroot().findall("part"):
+        divisions, beats, beat_type = 1, 4, 4
+        for measure in list(part.findall("measure")):
+            attrs = measure.find("attributes")
+            if attrs is not None:
+                divisions = int(attrs.findtext("divisions") or divisions)
+                time = attrs.find("time")
+                if time is not None:
+                    beats = int(time.findtext("beats") or beats)
+                    beat_type = int(time.findtext("beat-type") or beat_type)
+            mr = measure.find(".//multiple-rest")
+            if mr is None or not (mr.text or "").strip().isdigit():
+                continue
+            count = int(mr.text)
+            measure_dur = divisions * beats * 4 // beat_type
+            if measure.find("note") is None:
+                note = ET.SubElement(measure, "note")
+                ET.SubElement(note, "rest", measure="yes")
+                ET.SubElement(note, "duration").text = str(measure_dur)
+            at = list(part).index(measure)
+            for k in range(count - 1):
+                extra = ET.Element("measure")
+                note = ET.SubElement(extra, "note")
+                ET.SubElement(note, "rest", measure="yes")
+                ET.SubElement(note, "duration").text = str(measure_dur)
+                part.insert(at + 1 + k, extra)
+                added += 1
+        for number, measure in enumerate(part.findall("measure"), start=1):
+            measure.set("number", str(number))
+    if added:
+        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    return added
+
+
 def apply_metadata(result_path: Path, piece_title: str):
     title, part_name = piece_title, None
     if " - " in piece_title:
@@ -474,9 +569,12 @@ def main():
                     apply_metadata(cached, piece)
                     apply_transpose(cached, piece.rsplit(" - ", 1)[-1])
                     if engine.startswith("homr"):
-                        n = slurs_to_ties(cached)
-                        if n:
-                            print(f"  {n} tie-slurs converted to ties",
+                        fixes = (slurs_to_ties(cached), sort_chords(cached),
+                                 expand_multirests(cached))
+                        if any(fixes):
+                            print(f"  normalized: {fixes[0]} ties, "
+                                  f"{fixes[1]} chord orders, "
+                                  f"{fixes[2]} multirest measures",
                                   flush=True)
                     status = f"{elapsed:.0f}s"
                 except Exception as exc:  # keep the bake-off going
