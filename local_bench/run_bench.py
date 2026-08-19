@@ -144,7 +144,12 @@ def run_fusion(pdf: Path, work_dir: Path) -> Path:
     )
     aligned = grafted = 0
     for op, i1, i2, j1, j2 in matcher.get_opcodes():
-        if op != "equal":
+        # Same-length "replace" runs are the same measures with small engine
+        # disagreements — map them positionally; anchored on both sides by
+        # equal blocks, so positions correspond.
+        if op == "equal" or (op == "replace" and i2 - i1 == j2 - j1):
+            pass
+        else:
             continue
         for bi, ai in zip(range(i1, i2), range(j1, j2)):
             aligned += 1
@@ -197,6 +202,53 @@ def merge_musicxml(outputs: list[Path], result_path: Path) -> Path:
     return result_path
 
 
+def _pitch_key(note) -> str | None:
+    p = note.find("pitch")
+    if p is None:
+        return None
+    return (f"{p.findtext('step')}{p.findtext('alter') or ''}"
+            f"{p.findtext('octave')}")
+
+
+def slurs_to_ties(result_path: Path) -> int:
+    """homr writes ties as slurs (visually identical). A slur whose start and
+    stop are adjacent same-pitch notes is a tie — rewrite it as one.
+    Returns the number of conversions."""
+    tree = ET.parse(result_path)
+    converted = 0
+    for part in tree.getroot().findall("part"):
+        notes = [n for m in part.findall("measure") for n in m.findall("note")
+                 if n.find("grace") is None]
+        open_slurs = {}
+        for idx, note in enumerate(notes):
+            notations = note.find("notations")
+            if notations is None:
+                continue
+            for slur in list(notations.findall("slur")):
+                typ, num = slur.get("type"), slur.get("number", "1")
+                if typ == "start":
+                    open_slurs[num] = (idx, note, notations, slur)
+                elif typ == "stop" and num in open_slurs:
+                    s_idx, s_note, s_notations, s_slur = open_slurs.pop(num)
+                    key = _pitch_key(s_note)
+                    if idx != s_idx + 1 or key is None or key != _pitch_key(note):
+                        continue
+                    for n, nots, sl, t in ((s_note, s_notations, s_slur, "start"),
+                                           (note, notations, slur, "stop")):
+                        nots.remove(sl)
+                        tie = ET.Element("tie", type=t)
+                        # <tie> must directly follow <duration> per the schema.
+                        children = list(n)
+                        dur_at = next(i for i, c in enumerate(children)
+                                      if c.tag == "duration")
+                        n.insert(dur_at + 1, tie)
+                        ET.SubElement(nots, "tied", type=t)
+                    converted += 1
+    if converted:
+        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    return converted
+
+
 def apply_metadata(result_path: Path, piece_title: str):
     title, part_name = piece_title, None
     if " - " in piece_title:
@@ -227,6 +279,65 @@ def apply_metadata(result_path: Path, piece_title: str):
 # Scoring (reuses benchmark/score.py internals).
 # --------------------------------------------------------------------------- #
 
+def timed_sequence(root) -> list:
+    """(pitch-or-R, duration-in-quarters) per note, divisions-normalized so
+    sequences compare across engines. Grace notes are skipped."""
+    from fractions import Fraction
+
+    part = root.find("part")
+    if part is None:
+        return []
+    seq, divisions = [], 1
+    for measure in part.findall("measure"):
+        for el in measure:
+            if el.tag == "attributes":
+                divisions = int(el.findtext("divisions") or divisions)
+            elif el.tag == "note":
+                if el.find("grace") is not None:
+                    continue
+                dur = int(el.findtext("duration") or 0)
+                beats = Fraction(dur, divisions)
+                pitch = el.find("pitch")
+                if el.find("rest") is not None or pitch is None:
+                    seq.append(("R", beats))
+                else:
+                    key = (f"{pitch.findtext('step')}"
+                           f"{pitch.findtext('alter') or ''}"
+                           f"{pitch.findtext('octave')}")
+                    seq.append((key, beats))
+    return seq
+
+
+PLACEMENT_FEATURES = ("dynamics", "wedge", "words", "metronome",
+                      "tie", "slur", "fermata")
+
+
+def feature_placement(engine_root, ref_root) -> tuple:
+    """Recall of reference feature occurrences: the fraction found in the
+    engine measure that pitch-aligns with the reference measure carrying it.
+    Only aligned measures count toward the denominator, so this measures
+    placement, not alignment coverage."""
+    e_measures = engine_root.find("part").findall("measure")
+    r_measures = ref_root.find("part").findall("measure")
+    matcher = SequenceMatcher(
+        None,
+        [measure_signature(m) for m in e_measures],
+        [measure_signature(m) for m in r_measures],
+        autojunk=False,
+    )
+    pairs = [(ei, ri)
+             for op, i1, i2, j1, j2 in matcher.get_opcodes() if op == "equal"
+             for ei, ri in zip(range(i1, i2), range(j1, j2))]
+    hit = total = 0
+    for ei, ri in pairs:
+        e_tags = {t for t in PLACEMENT_FEATURES
+                  if next(e_measures[ei].iter(t), None) is not None}
+        for tag in PLACEMENT_FEATURES:
+            if next(r_measures[ri].iter(tag), None) is not None:
+                total += 1
+                hit += tag in e_tags
+    return hit, total, len(pairs), len(r_measures)
+
 def score_pair(engine_path: Path, ref_path: Path) -> dict:
     engine = ET.parse(engine_path).getroot()
     ref = ET.parse(ref_path).getroot()
@@ -236,6 +347,9 @@ def score_pair(engine_path: Path, ref_path: Path) -> dict:
     # autojunk=False: the default discards frequent elements (common pitches)
     # on long sequences, corrupting the ratio. See benchmark/score.py.
     sim = SequenceMatcher(None, e_pitch, r_pitch, autojunk=False).ratio()
+    note_sim = SequenceMatcher(None, timed_sequence(engine),
+                               timed_sequence(ref), autojunk=False).ratio()
+    place_hit, place_tot, aligned, r_count = feature_placement(engine, ref)
     e_valid, e_tot = scorer.rhythm_validity(engine)
     e_feat, r_feat = scorer.feature_counts(engine), scorer.feature_counts(ref)
     covered = sum(1 for f in scorer.FEATURES if r_feat.get(f) and e_feat.get(f))
@@ -244,8 +358,11 @@ def score_pair(engine_path: Path, ref_path: Path) -> dict:
     r_measures = len(ET.parse(ref_path).getroot().findall("part/measure"))
     return {
         "pitch_sim": sim,
+        "note_sim": note_sim,
         "rhythm_valid": e_valid / max(e_tot, 1),
         "features": f"{covered}/{wanted}",
+        "feat_place": f"{place_hit}/{place_tot}",
+        "aligned": f"{aligned}/{r_measures}",
         "measures": f"{e_measures}/{r_measures}",
     }
 
@@ -297,6 +414,11 @@ def main():
                     shutil.copy(produced, cached)
                     apply_metadata(cached, piece)
                     apply_transpose(cached, piece.rsplit(" - ", 1)[-1])
+                    if engine.startswith("homr"):
+                        n = slurs_to_ties(cached)
+                        if n:
+                            print(f"  {n} tie-slurs converted to ties",
+                                  flush=True)
                     status = f"{elapsed:.0f}s"
                 except Exception as exc:  # keep the bake-off going
                     elapsed = time.monotonic() - start
@@ -311,8 +433,8 @@ def main():
                   f"rhythm {metrics['rhythm_valid']:.0%}  "
                   f"measures {metrics['measures']}  ({status})", flush=True)
 
-    header = ["piece", "engine", "pitch_sim", "rhythm_valid",
-              "features", "measures", "status"]
+    header = ["piece", "engine", "pitch_sim", "note_sim", "rhythm_valid",
+              "features", "feat_place", "aligned", "measures", "status"]
     lines = ["| " + " | ".join(header) + " |",
              "|" + "---|" * len(header)]
     for r in rows:
