@@ -35,7 +35,7 @@ from fix_multirests import fix as fix_multirest_counts  # noqa: E402
 from fix_structure import fix as fix_structure  # noqa: E402
 from fix_tempo import fix as fix_tempo  # noqa: E402
 from fix_titles import fix as fix_titles  # noqa: E402
-from postprocess import graft_features, normalize_homr  # noqa: E402
+from postprocess import graft_features, graft_numbered, normalize_homr  # noqa: E402
 from transpose import apply_transpose  # noqa: E402
 
 MSCORE = Path("/Applications/MuseScore 4.app/Contents/MacOS/mscore")
@@ -98,6 +98,11 @@ def convert(pdf: Path) -> Path:
             print(f"  {fixed} multirest counts repaired via crop-OCR",
                   flush=True)
         fix_structure(work, result)
+        if result.read_bytes() != aud_out.read_bytes():
+            n = graft_numbered(result, aud_out)
+            if n:
+                print(f"  {n} rehearsal/lyric elements placed by printed "
+                      f"number", flush=True)
     # Metadata first: fix_titles strips movement-title when it builds a
     # credit header, and apply_metadata must not re-create it afterwards.
     apply_metadata(result, name)

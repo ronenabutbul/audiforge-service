@@ -272,6 +272,51 @@ def graft_rehearsals_by_number(base_measures, sec_measures) -> int:
     return grafted
 
 
+def graft_lyrics_by_number(base_measures, sec_measures) -> int:
+    """Vocal charts route to homr for note quality, but homr never reads
+    lyrics. Copy each measure's syllables from the secondary engine onto the
+    base measure's notes in order, keyed by printed measure number."""
+    base_numbers = _printed_numbers(base_measures)
+    sec_numbers = _printed_numbers(sec_measures)
+    base_by_number = {}
+    for i, n in enumerate(base_numbers):
+        base_by_number.setdefault(n, i)
+    grafted = 0
+    for si, measure in enumerate(sec_measures):
+        syllables = [note.findall("lyric") for note in measure.findall("note")
+                     if note.findall("lyric")]
+        if not syllables:
+            continue
+        bi = base_by_number.get(sec_numbers[si])
+        if bi is None:
+            continue
+        targets = [n for n in base_measures[bi].findall("note")
+                   if n.find("rest") is None and n.find("grace") is None
+                   and n.find("chord") is None]
+        if any(t.find("lyric") is not None for t in targets):
+            continue
+        for target, lyrics in zip(targets, syllables):
+            for lyric in lyrics:
+                target.append(copy.deepcopy(lyric))
+                grafted += 1
+    return grafted
+
+
+def graft_numbered(base_path: Path, secondary_path: Path) -> int:
+    """The printed-number-keyed grafts: rehearsal letters and lyrics. Run
+    AFTER multirest-count repair — the numbering these are keyed by depends
+    on correct counts."""
+    base = ET.parse(base_path)
+    base_measures = base.getroot().find("part").findall("measure")
+    sec_measures = ET.parse(secondary_path).getroot().find("part").findall(
+        "measure")
+    grafted = graft_rehearsals_by_number(base_measures, sec_measures)
+    grafted += graft_lyrics_by_number(base_measures, sec_measures)
+    if grafted:
+        base.write(base_path, encoding="UTF-8", xml_declaration=True)
+    return grafted
+
+
 def graft_features(base_path: Path, secondary_path: Path) -> tuple[int, int]:
     """Graft directions and repeat/ending barlines from the secondary engine
     into the base file in place. Measures align by pitch signature; equal
@@ -307,7 +352,6 @@ def graft_features(base_path: Path, secondary_path: Path) -> tuple[int, int]:
                     insert_at += 1
                     grafted += 1
             grafted += graft_barlines(base_measures, bi, sec_measures[ai])
-    grafted += graft_rehearsals_by_number(base_measures, sec_measures)
     if grafted:
         base.write(base_path, encoding="UTF-8", xml_declaration=True)
     return aligned, grafted

@@ -181,12 +181,16 @@ def apply_counts(result_path: Path, pairs: list[tuple[int, int]]) -> int:
             old = int(mr.text)
             audiveris_count, ocr_count = pairs[idx]
             idx += 1
-            # Only trust the OCR when Audiveris's own value matches what the
-            # MusicXML says (alignment check). audiveris_count == 0 means no
-            # count glyph existed at all — there the OCR is all we have.
+            # Alignment check: trust the OCR when Audiveris's own value
+            # matches the XML (audiveris-based result), when no count glyph
+            # existed (fallback read), or — for homr-based results whose
+            # counts Audiveris never saw — when the XML's digit survives
+            # inside the OCR reading (a truncated read of the same number).
             if ocr_count == old or ocr_count <= 0:
                 continue
-            if audiveris_count != old and audiveris_count != 0:
+            aligned_ok = (audiveris_count == old or audiveris_count == 0
+                          or str(old) in str(ocr_count))
+            if not aligned_ok:
                 continue
             # A larger OCR count must END with the single digit Audiveris
             # saw (16 ends in 6) — a cheap sanity check against misreads.
