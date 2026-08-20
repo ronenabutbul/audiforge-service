@@ -205,10 +205,22 @@ def transcribe_gemini(crops: list[dict], beats: int = 4, beat_type: int = 4,
         }).encode()
         req = urllib.request.Request(
             url, data=body, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=120) as r:
-            payload = json.load(r)
-        text = payload["candidates"][0]["content"]["parts"][0]["text"]
-        grid = BarGrid.model_validate_json(text)
+        grid = None
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    payload = json.load(r)
+                text = payload["candidates"][0]["content"]["parts"][0]["text"]
+                grid = BarGrid.model_validate_json(text)
+                break
+            except Exception as exc:
+                if attempt == 3:
+                    print(f"  bar {i + 1}: giving up ({exc}); empty bar",
+                          flush=True)
+                    grid = BarGrid()
+                else:
+                    import time
+                    time.sleep(5 * (attempt + 1))
         if grid.is_repeat_of_previous and grids:
             grid = grids[-1]
         grids.append(grid)
@@ -245,6 +257,85 @@ def transcribe(crops: list[dict], beats: int = 4, beat_type: int = 4,
         print(f"  bar {i + 1}: "
               f"{'repeat' if grid is grids[-1] and not grid.hits else ''}"
               f"{len(grid.hits)} hit slots", flush=True)
+    return grids
+
+
+# slot count -> (MusicXML type, dots) at 4 slots per quarter
+_DUR_TYPES = {
+    16: ("whole", 0), 12: ("half", 1), 8: ("half", 0), 6: ("quarter", 1),
+    4: ("quarter", 0), 3: ("eighth", 1), 2: ("eighth", 0), 1: ("16th", 0),
+}
+
+
+def _split(slots: int) -> list[tuple[str, int, int]]:
+    """Greedy decomposition into notatable (type, dots, slots) pieces."""
+    pieces = []
+    for value in (16, 12, 8, 6, 4, 3, 2, 1):
+        while slots >= value:
+            name, dots = _DUR_TYPES[value]
+            pieces.append((name, dots, value))
+            slots -= value
+    return pieces
+
+
+def _strike_slots(gap: int, cap: int = 4) -> int:
+    """A drum strike is short: the largest notatable value within the gap,
+    never longer than a quarter — the rest of the gap becomes rests."""
+    for value in (4, 3, 2, 1):
+        if value <= min(gap, cap):
+            return value
+    return 1
+
+
+def _add_rest(measure, slots: int, voice: int):
+    for name, dots, value in _split(slots):
+        rest = ET.SubElement(measure, "note")
+        ET.SubElement(rest, "rest")
+        ET.SubElement(rest, "duration").text = str(value)
+        ET.SubElement(rest, "voice").text = str(voice)
+        ET.SubElement(rest, "type").text = name
+        for _ in range(dots):
+            ET.SubElement(rest, "dot")
+
+
+def grids_from_musicxml(path: Path) -> list[BarGrid]:
+    """Reconstruct the grids from a drum MusicXML we wrote — the note's
+    <instrument> id names the kit piece exactly, so a re-write with an
+    improved writer costs nothing."""
+    root = ET.parse(path).getroot()
+    grids = []
+    for measure in root.find("part").findall("measure"):
+        hits: dict[int, list[tuple[str, bool]]] = {}
+        dyn_el = measure.find(".//dynamics")
+        dynamic = dyn_el[0].tag if dyn_el is not None and len(dyn_el) else None
+        cursor = 0
+        onset = 0
+        for el in measure:
+            if el.tag == "backup":
+                cursor -= int(el.findtext("duration") or 0)
+                continue
+            if el.tag == "forward":
+                cursor += int(el.findtext("duration") or 0)
+                continue
+            if el.tag != "note":
+                continue
+            duration = int(el.findtext("duration") or 0)
+            is_chord = el.find("chord") is not None
+            slot = onset if is_chord else cursor
+            inst_el = el.find("instrument")
+            if el.find("rest") is None and inst_el is not None:
+                name = (inst_el.get("id") or "").split("-", 1)[-1]
+                if name in KIT:
+                    accent = el.find(".//accent") is not None
+                    hits.setdefault(slot, []).append((name, accent))
+            if not is_chord:
+                onset = cursor
+                cursor += duration
+        grids.append(BarGrid(
+            hits=[Hit(slot=s, instruments=[n for n, _ in v],
+                      accent=any(a for _, a in v))
+                  for s, v in sorted(hits.items())],
+            dynamic=dynamic))
     return grids
 
 
@@ -307,13 +398,11 @@ def write_musicxml(grids: list[BarGrid], out: Path,
             onsets = sorted(events)
             for k, slot in enumerate(onsets):
                 if slot > cursor:
-                    rest = ET.SubElement(measure, "note")
-                    ET.SubElement(rest, "rest")
-                    ET.SubElement(rest, "duration").text = str(slot - cursor)
-                    ET.SubElement(rest, "voice").text = str(voice)
+                    _add_rest(measure, slot - cursor, voice)
                     cursor = slot
                 nxt = onsets[k + 1] if k + 1 < len(onsets) else slots
-                duration = max(nxt - slot, 1)
+                duration = _strike_slots(max(nxt - slot, 1))
+                name, dots = _DUR_TYPES[duration]
                 for j, (inst, accent) in enumerate(events[slot]):
                     step, octave, head, midi, _ = KIT[inst]
                     note = ET.SubElement(measure, "note")
@@ -325,6 +414,9 @@ def write_musicxml(grids: list[BarGrid], out: Path,
                     ET.SubElement(note, "duration").text = str(duration)
                     ET.SubElement(note, "instrument", id=f"P1-{inst}")
                     ET.SubElement(note, "voice").text = str(voice)
+                    ET.SubElement(note, "type").text = name
+                    for _ in range(dots):
+                        ET.SubElement(note, "dot")
                     ET.SubElement(note, "stem").text = \
                         "up" if voice == 1 else "down"
                     if head:
@@ -335,10 +427,7 @@ def write_musicxml(grids: list[BarGrid], out: Path,
                         ET.SubElement(artic, "accent")
                 cursor = slot + duration
             if cursor < slots:
-                rest = ET.SubElement(measure, "note")
-                ET.SubElement(rest, "rest")
-                ET.SubElement(rest, "duration").text = str(slots - cursor)
-                ET.SubElement(rest, "voice").text = str(voice)
+                _add_rest(measure, slots - cursor, voice)
     ET.ElementTree(score).write(out, encoding="UTF-8", xml_declaration=True)
 
 
@@ -354,12 +443,27 @@ def main():
     print(f"{len(crops)} printed bars found", flush=True)
     if limit:
         crops = crops[:limit]
-    if "--local" in sys.argv:
-        grids = transcribe_local(crops)
-    elif "--gemini" in sys.argv:
-        grids = transcribe_gemini(crops)
+    cache = out.with_suffix(".grids.json")
+    if "--rewrite" in sys.argv:
+        # Re-render from what we already read: cached grids, or the
+        # MusicXML from an earlier run.
+        import json
+        if cache.exists():
+            grids = [BarGrid.model_validate(g)
+                     for g in json.loads(cache.read_text())]
+        else:
+            grids = grids_from_musicxml(out)
+        print(f"re-writing {len(grids)} bars from saved reading", flush=True)
     else:
-        grids = transcribe(crops)
+        if "--local" in sys.argv:
+            grids = transcribe_local(crops)
+        elif "--gemini" in sys.argv:
+            grids = transcribe_gemini(crops)
+        else:
+            grids = transcribe(crops)
+        import json
+        cache.write_text(json.dumps([g.model_dump() for g in grids],
+                                    indent=1))
     write_musicxml(grids, out, title=out.stem)
     print(f"wrote {out}")
 
