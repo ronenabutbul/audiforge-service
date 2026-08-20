@@ -114,6 +114,13 @@ downbeat, each slot = one {unit} note). Report every strike: its slot, its
 step, its head, and accent=true if it carries an accent (>). Report the
 printed dynamic in this bar (p, mp, mf, f, ff) or null.
 
+If a measure number is printed for this bar — often in a small box above
+the barline — report it as measure_number; otherwise null. Do not confuse
+it with the "+" and "o" articulation marks above the staff.
+If this bar is a MULTI-BAR REST (a thick horizontal bar across the staff
+with a number above it), report that number as multirest_count and no
+strikes.
+
 Count the beam groups and note spacing carefully. Do not invent strikes in
 empty parts of the bar.{context}"""
 
@@ -130,6 +137,8 @@ class BarReading(BaseModel):
     is_repeat_of_previous: bool = False
     strikes: list[Strike] = []
     dynamic: str | None = None
+    measure_number: int | None = None
+    multirest_count: int | None = None
 
 
 class Hit(BaseModel):
@@ -253,7 +262,7 @@ def bar_crops(omr_path: Path) -> list[dict]:
                     x1 = int(float(stack.get("right")))
                     # Tight vertical framing: the staff should dominate the
                     # crop, so vertical position is easy to judge.
-                    y0 = max(int(top - interline * 2.6), 0)
+                    y0 = max(int(top - interline * 4.2), 0)
                     y1 = int(bottom + interline * 2.6)
                     crop = image.crop((max(x0 - 6, 0), y0, x1 + 6, y1))
                     scale = 3.0
@@ -618,44 +627,44 @@ def write_musicxml(grids: list[BarGrid], out: Path,
 
 
 def anchor_spans(omr_path: Path, n_stacks_total: int) -> dict[int, int]:
-    """How many MEASURES each printed bar really stands for, from the
-    printed measure numbers at system starts.
+    """How many MEASURES each printed bar really stands for, read from the
+    measure numbers printed on the chart.
 
     Counting printed bars undercounts a piece wherever a bar carries a
     multi-bar rest, and the little number above such a bar is often
-    unreadable. The number printed at the start of each system is far more
-    legible and is an exact checksum: the gap between two consecutive
-    system numbers is how many measures that system covered. Any surplus
-    over its printed bars belongs to the multirest bars inside it.
+    unreadable. The measure numbers are the checksum — but publishers put
+    them in different places: some at the start of every system, others in
+    a box above every fifth bar. So look above EVERY bar, and keep only a
+    physically consistent chain: numbers must increase, and the gap between
+    two of them can never be smaller than the bars printed between them.
+    Any surplus is a multirest hiding in that span.
     """
     import io
+    from collections import Counter
+
     from PIL import Image
     sys.path.insert(0, str(BENCH_DIR.parent / "app"))
     from fix_multirests import _read_number
 
-    def read_anchor(image, left, top):
-        """The printed number at a system start, read without assuming
-        where the piece has got to — a chart with long rests drifts far
-        from any prediction, which is exactly when we need this most."""
-        from collections import Counter
+    def read_number_above(image, x, top):
         votes = Counter()
-        for dy in (-125, -105, -85, -65):
-            for dx in (-105, -75, -45, -15):
-                value = _read_number(image, int(left + dx), int(top + dy),
-                                     25, 42, upper=1000)
+        for dy in (-96, -74, -54):
+            for dx in (-14, 6, 26):
+                value = _read_number(image, int(x + dx), int(top + dy),
+                                     24, 40, upper=1000)
                 if value:
                     votes[value] += 1
         if not votes:
             return None
-        return votes.most_common(1)[0][0]
+        value, hits = votes.most_common(1)[0]
+        return value if hits >= 2 else None
 
-    systems = []          # (first_stack, n_stacks, anchor or None)
+    bars = []          # (stack_ordinal, number or None)
     ordinal = 0
     with zipfile.ZipFile(omr_path) as z:
         sheets = sorted(
             {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
             key=lambda s: int(s.split("#")[1]))
-        predicted = 1
         for sheet in sheets:
             root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml")
                                  .decode("utf-8", "replace"))
@@ -663,41 +672,84 @@ def anchor_spans(omr_path: Path, n_stacks_total: int) -> dict[int, int]:
                 .convert("L")
             for system in root.iter("system"):
                 staff = system.find(".//staff")
-                stacks = system.findall("stack")
-                anchor = None
-                if staff is not None and stacks:
-                    line = staff.find("lines/line/point")
-                    if line is not None:
-                        anchor = read_anchor(image, float(staff.get("left")),
-                                             float(line.get("y")))
-                systems.append((ordinal, len(stacks), anchor))
-                ordinal += len(stacks)
-                predicted += len(stacks)
+                line = (staff.find("lines/line/point")
+                        if staff is not None else None)
+                top = float(line.get("y")) if line is not None else None
+                for stack in system.findall("stack"):
+                    number = None
+                    if top is not None:
+                        number = read_number_above(
+                            image, float(stack.get("left")), top)
+                    bars.append((ordinal, number))
+                    ordinal += 1
 
-    # Keep only a physically consistent chain: numbers must increase, and a
-    # system can never cover fewer measures than it printed bars. Junk reads
-    # break one of those rules and drop out.
     chain = []
-    for i, (start, n_stacks, anchor) in enumerate(systems):
-        if anchor is None:
+    for index, number in bars:
+        if number is None:
             continue
         if not chain:
-            if anchor <= 4:          # trust only a plausible opening number
-                chain.append((i, anchor))
+            if number <= 6:
+                chain.append((index, number))
             continue
-        j, previous = chain[-1]
-        covered = sum(s[1] for s in systems[j:i])
-        gap = anchor - previous
-        if covered <= gap <= covered + 200:
-            chain.append((i, anchor))
+        last_index, last_number = chain[-1]
+        printed = index - last_index
+        gap = number - last_number
+        if printed <= gap <= printed + 200:
+            chain.append((index, number))
 
     spans: dict[int, int] = {}
-    for (j, previous), (i, anchor) in zip(chain, chain[1:]):
-        covered = sum(s[1] for s in systems[j:i])
-        surplus = anchor - previous - covered
+    for (i, previous), (j, number) in zip(chain, chain[1:]):
+        surplus = (number - previous) - (j - i)
         if surplus > 0:
-            last_stack = systems[i - 1][0] + systems[i - 1][1] - 1
-            spans[last_stack] = surplus + 1
+            spans[j - 1] = surplus + 1
+    if chain:
+        print(f"  {len(chain)} printed measure numbers read "
+              f"({chain[0][1]}..{chain[-1][1]})", flush=True)
+    return spans
+
+
+def spans_from_readings(readings: list["BarReading"]) -> dict[int, int]:
+    """How many measures each printed bar stands for, from what the model
+    read on the page: the number above a multi-bar rest, reconciled against
+    the measure numbers printed along the chart.
+
+    The printed numbers are the checksum. Between two of them, the measures
+    covered are known exactly, so any shortfall belongs to the multirests in
+    that stretch — which is how a bar marked "8 bars rest" stops being
+    counted as one bar.
+    """
+    spans = {}
+    for i, reading in enumerate(readings):
+        count = reading.multirest_count
+        spans[i] = count if count and 2 <= count <= 64 else 1
+
+    numbered = [(i, r.measure_number) for i, r in enumerate(readings)
+                if r.measure_number and r.measure_number > 0]
+    chain = []
+    for index, number in numbered:
+        if not chain:
+            if number <= 8:
+                chain.append((index, number))
+            continue
+        last_index, last_number = chain[-1]
+        printed = index - last_index
+        gap = number - last_number
+        if printed <= gap <= printed + 300:
+            chain.append((index, number))
+
+    for (i, previous), (j, number) in zip(chain, chain[1:]):
+        expected = number - previous
+        have = sum(spans[k] for k in range(i, j))
+        shortfall = expected - have
+        if shortfall <= 0:
+            continue
+        rests = [k for k in range(i, j) if spans[k] > 1] or \
+                [k for k in range(i, j) if not readings[k].strikes]
+        if rests:
+            spans[rests[-1]] += shortfall
+    if chain:
+        print(f"  measure numbers read: {chain[0][1]}..{chain[-1][1]} "
+              f"({len(chain)} of them)", flush=True)
     return spans
 
 
@@ -784,7 +836,7 @@ def main():
     cache = out.with_suffix(".grids.json")
     import json
     # Multirest bars need no reading — they are rests by definition.
-    to_read = [c for c in crops if c["stack"] not in rest_counts]
+    to_read = crops
     raw_cache = out.with_suffix(".readings.json")
     if "--recalibrate" in sys.argv and raw_cache.exists():
         readings = [BarReading.model_validate(r)
@@ -816,18 +868,15 @@ def main():
             out.with_suffix(".readings.json").write_text(
                 json.dumps([r.model_dump() for r in raw], indent=1))
 
-    # Re-assemble in printed order: read bars keep their grid, multirest
-    # bars expand to their measure count.
-    grids, rest_bars, cursor = [], {}, 0
-    for crop in crops:
-        span = rest_counts.get(crop["stack"])
-        if span:
-            rest_bars[len(grids)] = span
-            grids.append(BarGrid())
-        else:
-            grids.append(read_grids[cursor] if cursor < len(read_grids)
-                         else BarGrid())
-            cursor += 1
+    grids = read_grids
+    raw = getattr(transcribe_gemini, "last_readings", None)
+    if raw and len(raw) == len(grids):
+        rest_bars = {i: n for i, n in spans_from_readings(raw).items()
+                     if n > 1}
+    else:
+        rest_bars = {i: rest_counts[c["stack"]]
+                     for i, c in enumerate(crops)
+                     if c["stack"] in rest_counts}
 
     write_musicxml(grids, out, title=out.stem, rest_bars=rest_bars)
     apply_structure(work_dir, out, omr, hbars)
