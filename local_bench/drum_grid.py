@@ -115,7 +115,7 @@ step, its head, and accent=true if it carries an accent (>). Report the
 printed dynamic in this bar (p, mp, mf, f, ff) or null.
 
 Count the beam groups and note spacing carefully. Do not invent strikes in
-empty parts of the bar."""
+empty parts of the bar.{context}"""
 
 
 class Strike(BaseModel):
@@ -333,10 +333,21 @@ def transcribe_gemini(crops: list[dict], beats: int = 4, beat_type: int = 4,
            f"{model}:generateContent?key={key}")
     grids = []
     for i, crop in enumerate(crops):
+        # Drum charts repeat grooves: telling the model what the previous
+        # bar turned out to be constrains both instrument and slot choices,
+        # the way a reader carries the groove forward.
+        context = ""
+        if grids and grids[-1].strikes:
+            previous = ", ".join(
+                f"slot {s.slot}: step {s.step} {s.head}"
+                for s in grids[-1].strikes[:16])
+            context = ("\n\nFor reference, the PREVIOUS bar of this chart "
+                       f"read as: {previous}. This bar may well repeat that "
+                       "groove — but read what is actually printed here.")
         prompt = base_prompt.format(
             time=f"{beats}/{beat_type}", slots=slots, unit=unit,
             rows=", ".join(str(r) for r in crop.get("rows", [])),
-            height=crop.get("height", 0))
+            height=crop.get("height", 0), context=context)
         body = json.dumps({
             "contents": [{"parts": [
                 {"inline_data": {
@@ -373,6 +384,7 @@ def transcribe_gemini(crops: list[dict], beats: int = 4, beat_type: int = 4,
             grid = grids[-1]
         grids.append(grid)
         print(f"  bar {i + 1}: {len(grid.strikes)} strikes", flush=True)
+    transcribe_gemini.last_readings = grids
     step_map = calibrate(grids)
     return [reading_to_grid(r, step_map) for r in grids]
 
@@ -664,7 +676,15 @@ def main():
     import json
     # Multirest bars need no reading — they are rests by definition.
     to_read = [c for c in crops if c["stack"] not in rest_counts]
-    if "--rewrite" in sys.argv:
+    raw_cache = out.with_suffix(".readings.json")
+    if "--recalibrate" in sys.argv and raw_cache.exists():
+        readings = [BarReading.model_validate(r)
+                    for r in json.loads(raw_cache.read_text())]
+        step_map = calibrate(readings)
+        read_grids = [reading_to_grid(r, step_map) for r in readings]
+        print(f"re-mapped {len(read_grids)} bars with fresh calibration",
+              flush=True)
+    elif "--rewrite" in sys.argv:
         if cache.exists():
             read_grids = [BarGrid.model_validate(g)
                           for g in json.loads(cache.read_text())]
@@ -681,6 +701,11 @@ def main():
             read_grids = transcribe(to_read)
         cache.write_text(json.dumps([g.model_dump() for g in read_grids],
                                     indent=1))
+        raw = getattr(transcribe_gemini, "last_readings", None)
+        if raw:
+            # Raw steps let calibration be re-tuned without re-reading.
+            out.with_suffix(".readings.json").write_text(
+                json.dumps([r.model_dump() for r in raw], indent=1))
 
     # Re-assemble in printed order: read bars keep their grid, multirest
     # bars expand to their measure count.
