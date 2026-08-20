@@ -48,38 +48,120 @@ KIT = {
     "tom_low":   ("A", 4, None, 45, 1),
 }
 
+# Staff position + notehead -> kit piece. The model reports what it SEES
+# (which line or space, which notehead); the convention lives here, where we
+# can verify it against references instead of hoping the model knows it.
+POSITION_MAP = {
+    # Verified against the Newzik references: hi-hat sits ABOVE the top line
+    # (G5), ride ON the top line (F5), snare in the middle space (C5), kick
+    # in the bottom space (F4), floor tom in the second space (A4).
+    ("high_above", "x"): "crash",
+    ("high_above", "normal"): "crash",
+    ("above", "x"): "hh_closed",
+    ("above", "circled_x"): "hh_open",
+    ("above", "normal"): "hh_closed",
+    ("line5", "x"): "ride",
+    ("line5", "circled_x"): "ride_bell",
+    ("line5", "normal"): "tom_high",
+    ("space4", "x"): "ride",
+    ("space4", "circled_x"): "ride",
+    ("space4", "normal"): "tom_high",
+    ("line4", "x"): "ride",
+    ("line4", "normal"): "tom_high",
+    ("space3", "x"): "rim",
+    ("space3", "normal"): "snare",
+    ("line3", "x"): "rim",
+    ("line3", "normal"): "tom_mid",
+    ("space2", "x"): "ride",
+    ("space2", "normal"): "tom_low",
+    ("line2", "normal"): "tom_low",
+    ("space1", "normal"): "kick",
+    ("space1", "x"): "hh_pedal",
+    ("line1", "normal"): "kick",
+    ("below", "normal"): "kick",
+    ("below", "x"): "hh_pedal",
+}
+
 PROMPT = """You are reading ONE BAR of a printed drum-set chart.
 
-Drum notation is a rhythm grid, not melody. Staff position + notehead shape
-identify the INSTRUMENT; horizontal position identifies the BEAT SLOT.
-Conventions (5-line percussion staff, top to bottom):
-- x-heads above the staff / top line: cymbals — hi-hat (x on or above top
-  line), ride (x on 4th line), crash (x above staff). A circle around an
-  x-head means open hi-hat.
-- Normal heads: 3rd space = snare; spaces above = toms (high/mid);
-  1st space (low) = floor tom; below-middle with stem down = kick (bass
-  drum).
-- Stems UP = hands voice (cymbals, snare, toms). Stems DOWN = feet voice
-  (kick, pedal hi-hat).
-- A bold "/" or "%" style repeat sign means: play the SAME bar as the
-  previous one — report is_repeat_of_previous=true and no hits.
-- A whole-bar rest or empty bar: no hits.
+Drum notation is a rhythm grid, not melody: staff position and notehead
+shape identify WHICH instrument is struck, horizontal position identifies
+WHEN. Report exactly what you see — do not interpret which drum it is.
 
-The bar is in {time} time. Use a grid of {slots} equal slots (slot 0 =
-the downbeat; each slot = one {unit} note). For every slot where any
-instrument strikes, list the instruments (from EXACTLY this vocabulary:
-{vocab}). Mark accent=true when the note carries an accent mark (>).
-Report the prevailing dynamic if one is printed in this bar (p, mp, mf,
-f, ff), else null.
+This image is {height} pixels tall. The five staff lines are at these
+pixel rows, top line first: {rows}. Judge every notehead's vertical
+position against those measured rows — do not estimate the staff by eye.
 
-Read carefully: count beats by the beam groups and note spacing. Do not
-invent hits in empty parts of the bar."""
+Name each strike's vertical position with one of:
+  high_above - well above the staff, on its own ledger line (crash)
+  above   - just above the top line, no ledger line (hi-hat position)
+  line5   - ON the top line
+  space4  - in the space just below the top line
+  line4   - on the 4th line
+  space3  - in the middle space (the 3rd space)
+  line3   - on the middle (3rd) line
+  space2  - in the 2nd space
+  line2   - on the 2nd line
+  space1  - in the bottom space
+  line1   - ON the bottom line
+  below   - below the bottom line
+Distinguish 'above' from 'line5' carefully: they are different instruments.
+
+Name each notehead shape with one of:
+  normal      - a filled or hollow oval
+  x           - an x-shaped head
+  circled_x   - an x head with a circle around it
+
+Also note: stems up belong to the hands, stems down to the feet — a
+stem-down note low on the staff is the bass drum.
+A bold "/" or "%" repeat sign means play the previous bar again: report
+is_repeat_of_previous=true with no strikes. A whole-bar rest: no strikes.
+
+The bar is in {time} time. Use a grid of {slots} equal slots (slot 0 = the
+downbeat, each slot = one {unit} note). Report every strike: its slot, its
+position, its notehead, and accent=true if it carries an accent (>).
+Report the printed dynamic in this bar (p, mp, mf, f, ff) or null.
+
+Count the beam groups and note spacing carefully. Do not invent strikes in
+empty parts of the bar."""
+
+
+class Strike(BaseModel):
+    slot: int
+    position: str
+    head: str = "normal"
+    accent: bool = False
+
+
+class BarReading(BaseModel):
+    """What the model reports: positions and noteheads, not instruments."""
+    is_repeat_of_previous: bool = False
+    strikes: list[Strike] = []
+    dynamic: str | None = None
 
 
 class Hit(BaseModel):
     slot: int
     instruments: list[str]
     accent: bool = False
+
+
+def reading_to_grid(reading: "BarReading") -> "BarGrid":
+    """Map seen positions to kit pieces via POSITION_MAP."""
+    by_slot: dict[int, list[tuple[str, bool]]] = {}
+    for strike in reading.strikes:
+        inst = POSITION_MAP.get((strike.position, strike.head))
+        if inst is None:
+            inst = POSITION_MAP.get((strike.position, "normal"))
+        if inst is None:
+            continue
+        by_slot.setdefault(strike.slot, []).append((inst, strike.accent))
+    return BarGrid(
+        is_repeat_of_previous=reading.is_repeat_of_previous,
+        hits=[Hit(slot=s, instruments=[i for i, _ in v],
+                  accent=any(a for _, a in v))
+              for s, v in sorted(by_slot.items())],
+        dynamic=reading.dynamic)
 
 
 class BarGrid(BaseModel):
@@ -113,15 +195,25 @@ def bar_crops(omr_path: Path) -> list[dict]:
                 for stack in system.findall("stack"):
                     x0 = int(float(stack.get("left")))
                     x1 = int(float(stack.get("right")))
-                    crop = image.crop((
-                        max(x0 - 6, 0), max(int(top - interline * 4), 0),
-                        x1 + 6, int(bottom + interline * 4)))
-                    if crop.width > 900:  # cap vision tokens
-                        scale = 900 / crop.width
-                        crop = crop.resize((900, int(crop.height * scale)))
+                    # Tight vertical framing: the staff should dominate the
+                    # crop, so vertical position is easy to judge.
+                    y0 = max(int(top - interline * 2.6), 0)
+                    y1 = int(bottom + interline * 2.6)
+                    crop = image.crop((max(x0 - 6, 0), y0, x1 + 6, y1))
+                    scale = 3.0
+                    if crop.width * scale > 1100:
+                        scale = 1100 / crop.width
+                    crop = crop.resize((int(crop.width * scale),
+                                        int(crop.height * scale)))
+                    # Staff line rows in the CROPPED, SCALED image — the
+                    # model is told these instead of eyeballing them.
+                    rows = [round((float(ln.find("point").get("y")) - y0)
+                                  * scale) for ln in lines]
                     buf = io.BytesIO()
                     crop.save(buf, "PNG")
-                    crops.append({"png": buf.getvalue()})
+                    crops.append({"png": buf.getvalue(),
+                                  "rows": rows,
+                                  "height": crop.height})
     return crops
 
 
@@ -137,7 +229,7 @@ def transcribe_local(crops: list[dict], beats: int = 4,
     slots = beats * slots_per_beat
     unit = {1: "quarter", 2: "eighth", 4: "sixteenth"}[slots_per_beat]
     prompt = PROMPT.format(time=f"{beats}/{beat_type}", slots=slots,
-                           unit=unit, vocab=", ".join(KIT))
+                           unit=unit)
     grids = []
     for i, crop in enumerate(crops):
         body = json.dumps({
@@ -177,7 +269,7 @@ def _gemini_key() -> str:
 
 def transcribe_gemini(crops: list[dict], beats: int = 4, beat_type: int = 4,
                       slots_per_beat: int = 4,
-                      model: str = "gemini-3.1-pro-preview") -> list[BarGrid]:
+                      model: str = "gemini-3-flash-preview") -> list[BarGrid]:
     """Cloud backend using the Gemini key already on this machine."""
     import json
     import urllib.request
@@ -185,12 +277,15 @@ def transcribe_gemini(crops: list[dict], beats: int = 4, beat_type: int = 4,
     key = _gemini_key()
     slots = beats * slots_per_beat
     unit = {1: "quarter", 2: "eighth", 4: "sixteenth"}[slots_per_beat]
-    prompt = PROMPT.format(time=f"{beats}/{beat_type}", slots=slots,
-                           unit=unit, vocab=", ".join(KIT))
+    base_prompt = PROMPT
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{model}:generateContent?key={key}")
     grids = []
     for i, crop in enumerate(crops):
+        prompt = base_prompt.format(
+            time=f"{beats}/{beat_type}", slots=slots, unit=unit,
+            rows=", ".join(str(r) for r in crop.get("rows", [])),
+            height=crop.get("height", 0))
         body = json.dumps({
             "contents": [{"parts": [
                 {"inline_data": {
@@ -200,27 +295,29 @@ def transcribe_gemini(crops: list[dict], beats: int = 4, beat_type: int = 4,
             ]}],
             "generationConfig": {
                 "responseMimeType": "application/json",
-                "responseJsonSchema": BarGrid.model_json_schema(),
+                "responseJsonSchema": BarReading.model_json_schema(),
             },
         }).encode()
         req = urllib.request.Request(
             url, data=body, headers={"Content-Type": "application/json"})
         grid = None
-        for attempt in range(4):
+        for attempt in range(6):
             try:
                 with urllib.request.urlopen(req, timeout=120) as r:
                     payload = json.load(r)
                 text = payload["candidates"][0]["content"]["parts"][0]["text"]
-                grid = BarGrid.model_validate_json(text)
+                grid = reading_to_grid(BarReading.model_validate_json(text))
                 break
             except Exception as exc:
-                if attempt == 3:
+                if attempt == 5:
                     print(f"  bar {i + 1}: giving up ({exc}); empty bar",
                           flush=True)
                     grid = BarGrid()
                 else:
                     import time
-                    time.sleep(5 * (attempt + 1))
+                    # rate limits need a real pause, not a nudge
+                    rate_limited = "429" in str(exc)
+                    time.sleep((45 if rate_limited else 4) * (attempt + 1))
         if grid.is_repeat_of_previous and grids:
             grid = grids[-1]
         grids.append(grid)
@@ -236,7 +333,7 @@ def transcribe(crops: list[dict], beats: int = 4, beat_type: int = 4,
     slots = beats * slots_per_beat
     unit = {1: "quarter", 2: "eighth", 4: "sixteenth"}[slots_per_beat]
     prompt = PROMPT.format(time=f"{beats}/{beat_type}", slots=slots,
-                           unit=unit, vocab=", ".join(KIT))
+                           unit=unit)
     grids = []
     for i, crop in enumerate(crops):
         response = client.messages.parse(
