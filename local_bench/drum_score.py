@@ -77,13 +77,16 @@ def score(piece: str) -> dict | None:
         return None
     g, r = sound_sequence(grid), sound_sequence(ref)
     sim = SequenceMatcher(None, g, r, autojunk=False).ratio()
+    g_bars = len(ET.parse(grid).getroot().find("part").findall("measure"))
+    r_bars = len(ET.parse(ref).getroot().find("part").findall("measure"))
     from collections import Counter
     gc, rc = Counter(g), Counter(r)
     per_cat = {}
     for cat in sorted(set(gc) | set(rc)):
         got, want = gc.get(cat, 0), rc.get(cat, 0)
         per_cat[cat] = (got, want)
-    return {"similarity": sim, "hits": (len(g), len(r)), "per_cat": per_cat}
+    return {"similarity": sim, "hits": (len(g), len(r)),
+            "bars": (g_bars, r_bars), "per_cat": per_cat}
 
 
 def main():
@@ -96,8 +99,11 @@ def main():
             print(f"  {piece:26} (no grid or reference)")
             continue
         got, want = result["hits"]
+        bars, ref_bars = result["bars"]
+        flag = "" if bars == ref_bars else f"  <-- off by {bars - ref_bars:+d}"
         print(f"  {piece:26} {result['similarity']:6.1%}   "
-              f"{got} vs {want} strikes")
+              f"{got} vs {want} strikes   "
+              f"{bars} vs {ref_bars} measures{flag}")
         detail = "  ".join(f"{cat} {g}/{w}"
                            for cat, (g, w) in result["per_cat"].items())
         print(f"    {detail}")

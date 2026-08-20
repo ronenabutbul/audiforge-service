@@ -168,6 +168,7 @@ def bar_crops(omr_path: Path) -> list[dict]:
     from PIL import Image
 
     crops = []
+    stack_ordinal = -1
     with zipfile.ZipFile(omr_path) as z:
         sheets = sorted(
             {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
@@ -186,6 +187,7 @@ def bar_crops(omr_path: Path) -> list[dict]:
                 bottom = float(lines[-1].find("point").get("y"))
                 interline = (bottom - top) / max(len(lines) - 1, 1)
                 for stack in system.findall("stack"):
+                    stack_ordinal += 1
                     x0 = int(float(stack.get("left")))
                     x1 = int(float(stack.get("right")))
                     # Tight vertical framing: the staff should dominate the
@@ -206,7 +208,8 @@ def bar_crops(omr_path: Path) -> list[dict]:
                     crop.save(buf, "PNG")
                     crops.append({"png": buf.getvalue(),
                                   "rows": rows,
-                                  "height": crop.height})
+                                  "height": crop.height,
+                                  "stack": stack_ordinal})
     return crops
 
 
@@ -431,7 +434,11 @@ def grids_from_musicxml(path: Path) -> list[BarGrid]:
 
 def write_musicxml(grids: list[BarGrid], out: Path,
                    beats: int = 4, beat_type: int = 4,
-                   slots_per_beat: int = 4, title: str = "Drum Set"):
+                   slots_per_beat: int = 4, title: str = "Drum Set",
+                   rest_bars: dict[int, int] | None = None):
+    """rest_bars maps a grid index to how many MEASURES that printed bar
+    stands for — a multirest bar is one bar on the page but N measures of
+    music, which is why counting printed bars undercounts a piece."""
     slots = beats * slots_per_beat
     divisions = slots_per_beat  # slot = one division of a quarter
 
@@ -450,7 +457,22 @@ def write_musicxml(grids: list[BarGrid], out: Path,
         ET.SubElement(mi, "midi-unpitched").text = str(midi)
 
     part = ET.SubElement(score, "part", id="P1")
-    for num, grid in enumerate(grids, start=1):
+    rest_bars = rest_bars or {}
+    num = 0
+    for gi, grid in enumerate(grids):
+        span = rest_bars.get(gi, 1)
+        if span > 1:
+            # A multirest: N whole-measure rests, not one bar.
+            for _ in range(span):
+                num += 1
+                m = ET.SubElement(part, "measure", number=str(num))
+                note = ET.SubElement(m, "note")
+                ET.SubElement(note, "rest", measure="yes")
+                ET.SubElement(note, "duration").text = str(
+                    beats * slots_per_beat)
+                ET.SubElement(note, "voice").text = "1"
+            continue
+        num += 1
         measure = ET.SubElement(part, "measure", number=str(num))
         if num == 1:
             attrs = ET.SubElement(measure, "attributes")
@@ -521,6 +543,43 @@ def write_musicxml(grids: list[BarGrid], out: Path,
     ET.ElementTree(score).write(out, encoding="UTF-8", xml_declaration=True)
 
 
+def apply_structure(work_dir: Path, out: Path, omr: Path,
+                    hbars: list[dict]) -> None:
+    """Give the drum score the same structure the melodic pipeline builds:
+    printed tempo, repeat barlines and voltas, and rehearsal letters placed
+    by their pixel position."""
+    sys.path.insert(0, str(BENCH_DIR.parent / "app"))
+    from fix_hbars import place_rehearsals
+    from fix_tempo import fix as fix_tempo
+    from postprocess import graft_barlines, measure_signature  # noqa: F401
+
+    page1 = work_dir / "page_001.png"
+    if page1.exists():
+        bpm = fix_tempo(page1, out)
+        if bpm:
+            print(f"  tempo recovered: {bpm} BPM", flush=True)
+
+    engine = work_dir / "audiveris.musicxml"
+    if engine.exists():
+        # Repeats and voltas: the engine reads barlines fine even on drum
+        # staves, and its measures follow the same printed bars we do.
+        tree = ET.parse(out)
+        ours = tree.getroot().find("part").findall("measure")
+        theirs = ET.parse(engine).getroot().find("part").findall("measure")
+        grafted = 0
+        for i, src_measure in enumerate(theirs):
+            if i >= len(ours):
+                break
+            grafted += graft_barlines(ours, i, src_measure)
+        if grafted:
+            tree.write(out, encoding="UTF-8", xml_declaration=True)
+            print(f"  {grafted} repeat/ending barlines grafted", flush=True)
+
+    placed = place_rehearsals(omr, out, hbars)
+    if placed:
+        print(f"  {placed} rehearsal letters placed", flush=True)
+
+
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
@@ -529,33 +588,61 @@ def main():
     if "--limit" in sys.argv:
         limit = int(sys.argv[sys.argv.index("--limit") + 1])
     omr = next(work_dir.rglob("*.omr"))
+
+    sys.path.insert(0, str(BENCH_DIR.parent / "app"))
+    from fix_hbars import detect_hbars
+
     crops = bar_crops(omr)
-    print(f"{len(crops)} printed bars found", flush=True)
+    hbars = detect_hbars(omr)
+    rest_counts = {h["stack"]: h["count"] for h in hbars}
+    absorbed = {h["stack"] + k for h in hbars
+                for k in range(1, h.get("span", 1))}
+    crops = [c for c in crops if c["stack"] not in absorbed]
+    total_measures = sum(rest_counts.get(c["stack"], 1) for c in crops)
+    print(f"{len(crops)} printed bars = {total_measures} measures "
+          f"({len(rest_counts)} multirests)", flush=True)
     if limit:
         crops = crops[:limit]
+
     cache = out.with_suffix(".grids.json")
+    import json
+    # Multirest bars need no reading — they are rests by definition.
+    to_read = [c for c in crops if c["stack"] not in rest_counts]
     if "--rewrite" in sys.argv:
-        # Re-render from what we already read: cached grids, or the
-        # MusicXML from an earlier run.
-        import json
         if cache.exists():
-            grids = [BarGrid.model_validate(g)
-                     for g in json.loads(cache.read_text())]
+            read_grids = [BarGrid.model_validate(g)
+                          for g in json.loads(cache.read_text())]
         else:
-            grids = grids_from_musicxml(out)
-        print(f"re-writing {len(grids)} bars from saved reading", flush=True)
+            read_grids = grids_from_musicxml(out)
+        print(f"re-writing {len(read_grids)} bars from saved reading",
+              flush=True)
     else:
         if "--local" in sys.argv:
-            grids = transcribe_local(crops)
+            read_grids = transcribe_local(to_read)
         elif "--gemini" in sys.argv:
-            grids = transcribe_gemini(crops)
+            read_grids = transcribe_gemini(to_read)
         else:
-            grids = transcribe(crops)
-        import json
-        cache.write_text(json.dumps([g.model_dump() for g in grids],
+            read_grids = transcribe(to_read)
+        cache.write_text(json.dumps([g.model_dump() for g in read_grids],
                                     indent=1))
-    write_musicxml(grids, out, title=out.stem)
-    print(f"wrote {out}")
+
+    # Re-assemble in printed order: read bars keep their grid, multirest
+    # bars expand to their measure count.
+    grids, rest_bars, cursor = [], {}, 0
+    for crop in crops:
+        span = rest_counts.get(crop["stack"])
+        if span:
+            rest_bars[len(grids)] = span
+            grids.append(BarGrid())
+        else:
+            grids.append(read_grids[cursor] if cursor < len(read_grids)
+                         else BarGrid())
+            cursor += 1
+
+    write_musicxml(grids, out, title=out.stem, rest_bars=rest_bars)
+    apply_structure(work_dir, out, omr, hbars)
+    measures = len(ET.parse(out).getroot().find("part").findall("measure"))
+    print(f"wrote {out} — {measures} measures")
 
 
 if __name__ == "__main__":
