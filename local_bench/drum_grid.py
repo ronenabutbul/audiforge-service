@@ -116,11 +116,104 @@ def bar_crops(omr_path: Path) -> list[dict]:
                     crop = image.crop((
                         max(x0 - 6, 0), max(int(top - interline * 4), 0),
                         x1 + 6, int(bottom + interline * 4)))
-                    crop = crop.resize((crop.width * 2, crop.height * 2))
+                    if crop.width > 900:  # cap vision tokens
+                        scale = 900 / crop.width
+                        crop = crop.resize((900, int(crop.height * scale)))
                     buf = io.BytesIO()
                     crop.save(buf, "PNG")
                     crops.append({"png": buf.getvalue()})
     return crops
+
+
+def transcribe_local(crops: list[dict], beats: int = 4,
+                     beat_type: int = 4,
+                     slots_per_beat: int = 4,
+                     model: str = "qwen3-vl:8b") -> list[BarGrid]:
+    """Local backend: Ollama with JSON-schema-constrained output. Free and
+    offline; quality is the experiment."""
+    import json
+    import urllib.request
+
+    slots = beats * slots_per_beat
+    unit = {1: "quarter", 2: "eighth", 4: "sixteenth"}[slots_per_beat]
+    prompt = PROMPT.format(time=f"{beats}/{beat_type}", slots=slots,
+                           unit=unit, vocab=", ".join(KIT))
+    grids = []
+    for i, crop in enumerate(crops):
+        body = json.dumps({
+            "model": model,
+            "stream": False,
+            "format": BarGrid.model_json_schema(),
+            "messages": [{
+                "role": "user",
+                "content": prompt,
+                "images": [base64.standard_b64encode(crop["png"]).decode()],
+            }],
+        }).encode()
+        req = urllib.request.Request(
+            "http://localhost:11434/api/chat", data=body,
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=600) as r:
+            payload = json.load(r)
+        grid = BarGrid.model_validate_json(payload["message"]["content"])
+        if grid.is_repeat_of_previous and grids:
+            grid = grids[-1]
+        grids.append(grid)
+        print(f"  bar {i + 1}: {len(grid.hits)} hit slots", flush=True)
+    return grids
+
+
+def _gemini_key() -> str:
+    import os
+
+    if os.environ.get("SYNCSHEET_GEMINI_API_KEY"):
+        return os.environ["SYNCSHEET_GEMINI_API_KEY"]
+    env = Path.home() / "Documents" / "אישי" / "syncsheet-server" / ".env"
+    for line in env.read_text().splitlines():
+        if line.startswith("SYNCSHEET_GEMINI_API_KEY="):
+            return line.split("=", 1)[1].strip()
+    raise RuntimeError("no Gemini key found")
+
+
+def transcribe_gemini(crops: list[dict], beats: int = 4, beat_type: int = 4,
+                      slots_per_beat: int = 4,
+                      model: str = "gemini-3.1-pro-preview") -> list[BarGrid]:
+    """Cloud backend using the Gemini key already on this machine."""
+    import json
+    import urllib.request
+
+    key = _gemini_key()
+    slots = beats * slots_per_beat
+    unit = {1: "quarter", 2: "eighth", 4: "sixteenth"}[slots_per_beat]
+    prompt = PROMPT.format(time=f"{beats}/{beat_type}", slots=slots,
+                           unit=unit, vocab=", ".join(KIT))
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{model}:generateContent?key={key}")
+    grids = []
+    for i, crop in enumerate(crops):
+        body = json.dumps({
+            "contents": [{"parts": [
+                {"inline_data": {
+                    "mime_type": "image/png",
+                    "data": base64.standard_b64encode(crop["png"]).decode()}},
+                {"text": prompt},
+            ]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseJsonSchema": BarGrid.model_json_schema(),
+            },
+        }).encode()
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            payload = json.load(r)
+        text = payload["candidates"][0]["content"]["parts"][0]["text"]
+        grid = BarGrid.model_validate_json(text)
+        if grid.is_repeat_of_previous and grids:
+            grid = grids[-1]
+        grids.append(grid)
+        print(f"  bar {i + 1}: {len(grid.hits)} hit slots", flush=True)
+    return grids
 
 
 def transcribe(crops: list[dict], beats: int = 4, beat_type: int = 4,
@@ -261,7 +354,12 @@ def main():
     print(f"{len(crops)} printed bars found", flush=True)
     if limit:
         crops = crops[:limit]
-    grids = transcribe(crops)
+    if "--local" in sys.argv:
+        grids = transcribe_local(crops)
+    elif "--gemini" in sys.argv:
+        grids = transcribe_gemini(crops)
+    else:
+        grids = transcribe(crops)
     write_musicxml(grids, out, title=out.stem)
     print(f"wrote {out}")
 
