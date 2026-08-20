@@ -51,76 +51,68 @@ KIT = {
 # Staff position + notehead -> kit piece. The model reports what it SEES
 # (which line or space, which notehead); the convention lives here, where we
 # can verify it against references instead of hoping the model knows it.
-POSITION_MAP = {
-    # Verified against the Newzik references: hi-hat sits ABOVE the top line
-    # (G5), ride ON the top line (F5), snare in the middle space (C5), kick
-    # in the bottom space (F4), floor tom in the second space (A4).
-    ("high_above", "x"): "crash",
-    ("high_above", "normal"): "crash",
-    ("above", "x"): "hh_closed",
-    ("above", "circled_x"): "hh_open",
-    ("above", "normal"): "hh_closed",
-    ("line5", "x"): "ride",
-    ("line5", "circled_x"): "ride_bell",
-    ("line5", "normal"): "tom_high",
-    ("space4", "x"): "ride",
-    ("space4", "circled_x"): "ride",
-    ("space4", "normal"): "tom_high",
-    ("line4", "x"): "ride",
-    ("line4", "normal"): "tom_high",
-    ("space3", "x"): "rim",
-    ("space3", "normal"): "snare",
-    ("line3", "x"): "rim",
-    ("line3", "normal"): "tom_mid",
-    ("space2", "x"): "ride",
-    ("space2", "normal"): "tom_low",
-    ("line2", "normal"): "tom_low",
-    ("space1", "normal"): "kick",
-    ("space1", "x"): "hh_pedal",
-    ("line1", "normal"): "kick",
-    ("below", "normal"): "kick",
-    ("below", "x"): "hh_pedal",
+# Vertical position as STEPS BELOW THE TOP LINE: 0 = top line, 1 = the
+# space under it, 2 = 4th line, ... 8 = bottom line; negatives are above the
+# staff. Counting steps is unambiguous, unlike naming spaces, and the model
+# is given the measured line rows to count against. Verified against the
+# Newzik references: hi-hat -1 (G5), ride 0 (F5), snare 3 (C5), floor tom 5
+# (A4), kick 7 (F4).
+STEP_MAP = {
+    -3: {"x": "crash", "normal": "crash"},
+    -2: {"x": "crash", "normal": "crash"},
+    -1: {"x": "hh_closed", "circled_x": "hh_open", "normal": "hh_closed"},
+    0:  {"x": "ride", "circled_x": "ride_bell", "normal": "tom_high"},
+    1:  {"x": "ride", "circled_x": "ride", "normal": "tom_high"},
+    2:  {"x": "ride", "normal": "tom_high"},
+    3:  {"x": "rim", "normal": "snare"},
+    4:  {"x": "rim", "normal": "tom_mid"},
+    5:  {"x": "ride", "normal": "tom_low"},
+    6:  {"x": "rim", "normal": "tom_low"},
+    7:  {"x": "hh_pedal", "normal": "kick"},
+    8:  {"x": "hh_pedal", "normal": "kick"},
+    9:  {"x": "hh_pedal", "normal": "kick"},
 }
 
 PROMPT = """You are reading ONE BAR of a printed drum-set chart.
 
-Drum notation is a rhythm grid, not melody: staff position and notehead
+Drum notation is a rhythm grid, not melody: vertical position and notehead
 shape identify WHICH instrument is struck, horizontal position identifies
-WHEN. Report exactly what you see — do not interpret which drum it is.
+WHEN. Report what you see; do not interpret which drum it is.
 
-This image is {height} pixels tall. The five staff lines are at these
-pixel rows, top line first: {rows}. Judge every notehead's vertical
-position against those measured rows — do not estimate the staff by eye.
+This image is {height} pixels tall and the five staff lines are at these
+pixel rows, top line first: {rows}. Measure every notehead against those
+rows — do not estimate the staff by eye.
 
-Name each strike's vertical position with one of:
-  high_above - well above the staff, on its own ledger line (crash)
-  above   - just above the top line, no ledger line (hi-hat position)
-  line5   - ON the top line
-  space4  - in the space just below the top line
-  line4   - on the 4th line
-  space3  - in the middle space (the 3rd space)
-  line3   - on the middle (3rd) line
-  space2  - in the 2nd space
-  line2   - on the 2nd line
-  space1  - in the bottom space
-  line1   - ON the bottom line
-  below   - below the bottom line
-Distinguish 'above' from 'line5' carefully: they are different instruments.
+Give each strike a `step`: how many half-steps BELOW THE TOP LINE its
+notehead centre sits, counting a line and the space under it as one step
+each:
+   -2 = well above the staff, on a ledger line
+   -1 = in the space just above the top line
+    0 = ON the top line
+    1 = in the space just below the top line
+    2 = on the 4th line
+    3 = in the next space down          <- most filled noteheads here
+    4 = on the middle (3rd) line
+    5 = in the next space down
+    6 = on the 2nd line
+    7 = in the bottom space             <- stem-down notes here
+    8 = ON the bottom line
+    9 = below the bottom line
+Work it out from the pixel rows: a step is half the gap between two
+neighbouring lines.
 
-Name each notehead shape with one of:
+Give each strike a `head`:
   normal      - a filled or hollow oval
   x           - an x-shaped head
   circled_x   - an x head with a circle around it
 
-Also note: stems up belong to the hands, stems down to the feet — a
-stem-down note low on the staff is the bass drum.
 A bold "/" or "%" repeat sign means play the previous bar again: report
 is_repeat_of_previous=true with no strikes. A whole-bar rest: no strikes.
 
 The bar is in {time} time. Use a grid of {slots} equal slots (slot 0 = the
 downbeat, each slot = one {unit} note). Report every strike: its slot, its
-position, its notehead, and accent=true if it carries an accent (>).
-Report the printed dynamic in this bar (p, mp, mf, f, ff) or null.
+step, its head, and accent=true if it carries an accent (>). Report the
+printed dynamic in this bar (p, mp, mf, f, ff) or null.
 
 Count the beam groups and note spacing carefully. Do not invent strikes in
 empty parts of the bar."""
@@ -128,7 +120,7 @@ empty parts of the bar."""
 
 class Strike(BaseModel):
     slot: int
-    position: str
+    step: int
     head: str = "normal"
     accent: bool = False
 
@@ -150,9 +142,10 @@ def reading_to_grid(reading: "BarReading") -> "BarGrid":
     """Map seen positions to kit pieces via POSITION_MAP."""
     by_slot: dict[int, list[tuple[str, bool]]] = {}
     for strike in reading.strikes:
-        inst = POSITION_MAP.get((strike.position, strike.head))
-        if inst is None:
-            inst = POSITION_MAP.get((strike.position, "normal"))
+        row = STEP_MAP.get(max(-3, min(9, strike.step)))
+        if row is None:
+            continue
+        inst = row.get(strike.head) or row.get("normal")
         if inst is None:
             continue
         by_slot.setdefault(strike.slot, []).append((inst, strike.accent))
