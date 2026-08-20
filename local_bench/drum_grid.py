@@ -138,11 +138,66 @@ class Hit(BaseModel):
     accent: bool = False
 
 
-def reading_to_grid(reading: "BarReading") -> "BarGrid":
+def calibrate(readings: list["BarReading"]) -> dict:
+    """Infer THIS chart's staff convention from its own ink.
+
+    Publishers disagree about where the kit sits: Adele writes hi-hat above
+    the top line, Abba a step lower, Avihu uses two cymbal lines (hi-hat
+    above the staff, ride on the top line). A fixed table therefore reads
+    one chart's hi-hat as another's ride. The timekeeping cymbal is
+    whichever x-head line the chart hammers, so count them and let the
+    chart tell us.
+    """
+    from collections import Counter
+    x_steps = Counter(s.step for r in readings for s in r.strikes
+                      if s.head in ("x", "circled_x"))
+    plain_steps = Counter(s.step for r in readings for s in r.strikes
+                          if s.head == "normal")
+    step_map = {step: dict(row) for step, row in STEP_MAP.items()}
+
+    total_x = sum(x_steps.values())
+    if total_x:
+        main = sorted(s for s, n in x_steps.items() if n >= 0.15 * total_x)
+        for step in x_steps:
+            if not main:
+                break
+            if step < main[0]:
+                inst = "crash"          # above the timekeeper line
+            elif step == main[0]:
+                inst = "hh_closed"      # the highest hammered line
+            elif len(main) > 1 and step == main[1]:
+                inst = "ride"           # a second hammered line below it
+            elif step > main[-1] + 2:
+                inst = "hh_pedal"       # low x under the staff
+            else:
+                inst = "ride"
+            row = step_map.setdefault(step, {})
+            row["x"] = inst
+            row["circled_x"] = ("hh_open" if inst == "hh_closed"
+                                else "ride_bell" if inst == "ride" else inst)
+
+    # Kick and snare are stable across publishers (bottom space, middle
+    # space) — but if this chart's two busiest plain lines sit elsewhere,
+    # follow the chart.
+    total_plain = sum(plain_steps.values())
+    if total_plain:
+        busy = sorted((s for s, n in plain_steps.items()
+                       if n >= 0.2 * total_plain))
+        if len(busy) >= 2:
+            snare_step, kick_step = busy[0], busy[-1]
+            if kick_step > snare_step:
+                step_map.setdefault(snare_step, {})["normal"] = "snare"
+                step_map.setdefault(kick_step, {})["normal"] = "kick"
+    return step_map
+
+
+def reading_to_grid(reading: "BarReading",
+                    step_map: dict | None = None) -> "BarGrid":
     """Map seen positions to kit pieces via POSITION_MAP."""
     by_slot: dict[int, list[tuple[str, bool]]] = {}
     for strike in reading.strikes:
-        row = STEP_MAP.get(max(-3, min(9, strike.step)))
+        table = step_map or STEP_MAP
+        row = table.get(max(-4, min(10, strike.step)))
         if row is None:
             continue
         inst = row.get(strike.head) or row.get("normal")
@@ -302,7 +357,7 @@ def transcribe_gemini(crops: list[dict], beats: int = 4, beat_type: int = 4,
                 with urllib.request.urlopen(req, timeout=120) as r:
                     payload = json.load(r)
                 text = payload["candidates"][0]["content"]["parts"][0]["text"]
-                grid = reading_to_grid(BarReading.model_validate_json(text))
+                grid = BarReading.model_validate_json(text)
                 break
             except Exception as exc:
                 if attempt == 5:
@@ -317,8 +372,9 @@ def transcribe_gemini(crops: list[dict], beats: int = 4, beat_type: int = 4,
         if grid.is_repeat_of_previous and grids:
             grid = grids[-1]
         grids.append(grid)
-        print(f"  bar {i + 1}: {len(grid.hits)} hit slots", flush=True)
-    return grids
+        print(f"  bar {i + 1}: {len(grid.strikes)} strikes", flush=True)
+    step_map = calibrate(grids)
+    return [reading_to_grid(r, step_map) for r in grids]
 
 
 def transcribe(crops: list[dict], beats: int = 4, beat_type: int = 4,
