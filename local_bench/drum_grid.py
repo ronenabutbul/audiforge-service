@@ -157,7 +157,13 @@ def calibrate(readings: list["BarReading"]) -> dict:
 
     total_x = sum(x_steps.values())
     if total_x:
-        main = sorted(s for s, n in x_steps.items() if n >= 0.15 * total_x)
+        # Take the busiest lines by COUNT, then order them by height: a
+        # sparse stray line above the groove must not steal the hi-hat slot,
+        # which is what demoted Adele's hi-hat to ride.
+        busiest = [s for s, _ in sorted(x_steps.items(),
+                                        key=lambda kv: -kv[1])
+                   if x_steps[s] >= 0.20 * total_x][:2]
+        main = sorted(busiest)
         for step in x_steps:
             if not main:
                 break
@@ -611,6 +617,90 @@ def write_musicxml(grids: list[BarGrid], out: Path,
     ET.ElementTree(score).write(out, encoding="UTF-8", xml_declaration=True)
 
 
+def anchor_spans(omr_path: Path, n_stacks_total: int) -> dict[int, int]:
+    """How many MEASURES each printed bar really stands for, from the
+    printed measure numbers at system starts.
+
+    Counting printed bars undercounts a piece wherever a bar carries a
+    multi-bar rest, and the little number above such a bar is often
+    unreadable. The number printed at the start of each system is far more
+    legible and is an exact checksum: the gap between two consecutive
+    system numbers is how many measures that system covered. Any surplus
+    over its printed bars belongs to the multirest bars inside it.
+    """
+    import io
+    from PIL import Image
+    sys.path.insert(0, str(BENCH_DIR.parent / "app"))
+    from fix_multirests import _read_number
+
+    def read_anchor(image, left, top):
+        """The printed number at a system start, read without assuming
+        where the piece has got to — a chart with long rests drifts far
+        from any prediction, which is exactly when we need this most."""
+        from collections import Counter
+        votes = Counter()
+        for dy in (-125, -105, -85, -65):
+            for dx in (-105, -75, -45, -15):
+                value = _read_number(image, int(left + dx), int(top + dy),
+                                     25, 42, upper=1000)
+                if value:
+                    votes[value] += 1
+        if not votes:
+            return None
+        return votes.most_common(1)[0][0]
+
+    systems = []          # (first_stack, n_stacks, anchor or None)
+    ordinal = 0
+    with zipfile.ZipFile(omr_path) as z:
+        sheets = sorted(
+            {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+            key=lambda s: int(s.split("#")[1]))
+        predicted = 1
+        for sheet in sheets:
+            root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml")
+                                 .decode("utf-8", "replace"))
+            image = Image.open(io.BytesIO(z.read(f"{sheet}/BINARY.png"))) \
+                .convert("L")
+            for system in root.iter("system"):
+                staff = system.find(".//staff")
+                stacks = system.findall("stack")
+                anchor = None
+                if staff is not None and stacks:
+                    line = staff.find("lines/line/point")
+                    if line is not None:
+                        anchor = read_anchor(image, float(staff.get("left")),
+                                             float(line.get("y")))
+                systems.append((ordinal, len(stacks), anchor))
+                ordinal += len(stacks)
+                predicted += len(stacks)
+
+    # Keep only a physically consistent chain: numbers must increase, and a
+    # system can never cover fewer measures than it printed bars. Junk reads
+    # break one of those rules and drop out.
+    chain = []
+    for i, (start, n_stacks, anchor) in enumerate(systems):
+        if anchor is None:
+            continue
+        if not chain:
+            if anchor <= 4:          # trust only a plausible opening number
+                chain.append((i, anchor))
+            continue
+        j, previous = chain[-1]
+        covered = sum(s[1] for s in systems[j:i])
+        gap = anchor - previous
+        if covered <= gap <= covered + 200:
+            chain.append((i, anchor))
+
+    spans: dict[int, int] = {}
+    for (j, previous), (i, anchor) in zip(chain, chain[1:]):
+        covered = sum(s[1] for s in systems[j:i])
+        surplus = anchor - previous - covered
+        if surplus > 0:
+            last_stack = systems[i - 1][0] + systems[i - 1][1] - 1
+            spans[last_stack] = surplus + 1
+    return spans
+
+
 def apply_structure(work_dir: Path, out: Path, omr: Path,
                     hbars: list[dict]) -> None:
     """Give the drum score the same structure the melodic pipeline builds:
@@ -662,7 +752,26 @@ def main():
 
     crops = bar_crops(omr)
     hbars = detect_hbars(omr)
-    rest_counts = {h["stack"]: h["count"] for h in hbars}
+    # A multirest only counts when its printed number was actually read and
+    # is plausible: an unread bar defaults to 1, and treating that as a rest
+    # silently drops a bar of music, while a misread 45 or 96 invents dozens
+    # of empty measures.
+    rest_counts = {h["stack"]: h["count"] for h in hbars
+                   if h.get("read") and 2 <= h["count"] <= 32}
+    dropped = [h["count"] for h in hbars
+               if not (h.get("read") and 2 <= h["count"] <= 32)]
+    if dropped:
+        print(f"  {len(dropped)} unreadable multirest marks read as normal "
+              f"bars instead", flush=True)
+    # The printed system numbers are the checksum: where they say a system
+    # covered more measures than it printed bars, believe them.
+    from_anchors = anchor_spans(omr, len(crops))
+    for stack, span in from_anchors.items():
+        if rest_counts.get(stack, 1) < span:
+            rest_counts[stack] = span
+    if from_anchors:
+        print(f"  {len(from_anchors)} multirest spans recovered from printed "
+              f"measure numbers", flush=True)
     absorbed = {h["stack"] + k for h in hbars
                 for k in range(1, h.get("span", 1))}
     crops = [c for c in crops if c["stack"] not in absorbed]
