@@ -9,3 +9,5 @@ pdf2image>=1.17
 # pin is gone. Keep pinning exact tags: unpinned main regressed once before
 # (f6feedb shipped a decoder/checkpoint mismatch).
 homr @ git+https://github.com/liebharc/homr.git@v0.7.0
+# five app modules import PIL; declare it instead of riding on homr
+pillow>=10.0

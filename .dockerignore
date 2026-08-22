@@ -1,0 +1,5 @@
+local_bench/
+benchmark/
+__pycache__/
+.git/
+*.dmg

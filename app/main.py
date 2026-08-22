@@ -378,6 +378,38 @@ def _process_job(job_id: str, source: Path):
         _update_job(job_id, status="failed", error=str(exc))
 
 
+@app.post("/analyze-structure")
+def analyze_structure(file: UploadFile = File(...)):
+    """Structure-only livesheet analysis: bar boxes, measure counts,
+    repeats, meters, tempo — no note transcription. Synchronous (a
+    chart takes well under a minute); Audiveris runs are serialized by
+    a lock in audiveris_local. Failures return typed reasons the app
+    can show the user instead of a broken conversion:
+      one_line    - single-line percussion part (not supported yet)
+      unreadable  - no readable music found (bad scan / handwriting)
+    """
+    from app import audiveris_local, livesheet
+
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "PDF required")
+    job_dir = DATA_DIR / f"structure-{uuid.uuid4().hex[:12]}"
+    job_dir.mkdir(parents=True)
+    try:
+        pdf = job_dir / "input.pdf"
+        pdf.write_bytes(file.file.read())
+        try:
+            omr = audiveris_local.transcribe(pdf, job_dir)
+        except audiveris_local.PageUnreadable as exc:
+            return {"success": False,
+                    "reason": "one_line" if exc.one_line else "unreadable",
+                    "error": str(exc)}
+        except audiveris_local.AudiverisUnavailable as exc:
+            raise HTTPException(503, str(exc))
+        return livesheet.analyze(omr, job_dir)
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "engine": "ensemble (homr + audiveris)"}

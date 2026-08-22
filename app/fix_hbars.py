@@ -27,7 +27,10 @@ import zipfile
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from fix_multirests import _read_number
+try:
+    from app.fix_multirests import _read_number
+except ImportError:  # local_bench puts app/ itself on sys.path
+    from fix_multirests import _read_number
 
 
 def detect_hbars(omr_path: Path) -> list[dict]:
