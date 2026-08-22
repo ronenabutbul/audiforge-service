@@ -64,3 +64,35 @@ def transcribe(pdf: Path, work_dir: Path, timeout: int = 600) -> Path:
         raise AudiverisUnavailable(
             "tesseract legacy traineddata missing — OCR skipped")
     return omr
+
+
+def convert_musicxml(pdf: Path, dest: Path,
+                     timeout: int = 600) -> Path | None:
+    """Drop-in replacement for the remote audiveris_client.convert:
+    transcribe locally, unwrap the exported .mxl to plain MusicXML at
+    dest. Returns None on failure (the fusion pipeline treats a missing
+    Audiveris result as homr-only, same as before)."""
+    import zipfile
+
+    work = dest.parent / "audiveris-work"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        transcribe(pdf, work, timeout=timeout)
+    except (AudiverisUnavailable, PageUnreadable):
+        return None
+    except subprocess.TimeoutExpired:
+        return None
+    mxl = next(work.rglob("*.mxl"), None)
+    if mxl is not None:
+        with zipfile.ZipFile(mxl) as z:
+            names = [n for n in z.namelist()
+                     if n.endswith(".xml") and not n.startswith("META-INF")]
+            if names:
+                dest.write_bytes(z.read(names[0]))
+                return dest
+    exported = next(
+        (x for x in work.rglob("*.xml") if "META-INF" not in str(x)), None)
+    if exported is not None:
+        dest.write_bytes(exported.read_bytes())
+        return dest
+    return None
