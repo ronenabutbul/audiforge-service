@@ -206,7 +206,10 @@ def _gemini_json(png: bytes, prompt: str, schema: dict) -> dict | None:
             {"text": prompt}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
-            "responseJsonSchema": schema},
+            "responseJsonSchema": schema,
+            # these are read-a-number questions; thinking tokens bill as
+            # output and were 95% of the spend before this was disabled
+            "thinkingConfig": {"thinkingBudget": 0}},
     }).encode()
     req = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json"})
@@ -217,7 +220,8 @@ def _gemini_json(png: bytes, prompt: str, schema: dict) -> dict | None:
             meta = payload.get("usageMetadata", {})
             usage["calls"] += 1
             usage["prompt_tokens"] += meta.get("promptTokenCount", 0)
-            usage["output_tokens"] += meta.get("candidatesTokenCount", 0)
+            usage["output_tokens"] += (meta.get("candidatesTokenCount", 0)
+                                       + meta.get("thoughtsTokenCount", 0))
             return json.loads(
                 payload["candidates"][0]["content"]["parts"][0]["text"])
         except Exception:
