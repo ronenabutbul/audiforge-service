@@ -22,6 +22,7 @@ import base64
 import io
 import json
 import os
+import re
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
@@ -366,7 +367,7 @@ def analyze(omr: Path, work_dir: Path) -> dict:
         })
         bar_number += count
 
-    repeats, voltas, jumps = [], [], []
+    repeats, voltas, jumps, tempo_changes = [], [], [], []
     audiveris_xml = next(work_dir.glob("**/audiveris.musicxml"), None) \
         or next(work_dir.glob("**/*[!d].musicxml"), None)
     if audiveris_xml is not None:
@@ -387,11 +388,29 @@ def analyze(omr: Path, work_dir: Path) -> dict:
                                 "printed_bar": mi + 1,
                                 "number": ending.get("number", "1")})
                     for words in measure.iter("words"):
-                        kind = _jump_kind(words.text or "")
+                        text = words.text or ""
+                        kind = _jump_kind(text)
                         if kind:
                             jumps.append({"printed_bar": mi + 1,
                                           "kind": kind,
-                                          "text": (words.text or "").strip()})
+                                          "text": text.strip()})
+                        # Audiveris keeps tempo marks as plain text
+                        # ("Faster ( q=112 )"), never as <metronome>, so
+                        # the printed changes are free to recover here.
+                        found = re.search(r"=\s*(\d{2,3})", text)
+                        if found:
+                            bpm = int(found.group(1))
+                            if 40 <= bpm <= 240:
+                                tempo_changes.append(
+                                    {"printed_bar": mi + 1, "bpm": bpm,
+                                     "text": " ".join(text.split())})
+                    for direction in measure.iter("per-minute"):
+                        bpm = int(re.sub(r"\D", "", direction.text or "0")
+                                  or 0)
+                        if 40 <= bpm <= 240:
+                            tempo_changes.append(
+                                {"printed_bar": mi + 1, "bpm": bpm,
+                                 "text": f"= {bpm}"})
                     for tag, kind in (("segno", "segno"), ("coda", "coda")):
                         if measure.find(f".//{tag}") is not None:
                             jumps.append({"printed_bar": mi + 1,
@@ -412,6 +431,7 @@ def analyze(omr: Path, work_dir: Path) -> dict:
         "review_bars": sorted(
             t["measure_number"] for t in timeline if t["review"]),
         "repeats": repeats,
+        "tempo_changes": tempo_changes,
         "voltas": voltas,
         "jumps": jumps,
         "timeline": timeline,
