@@ -206,6 +206,33 @@ def constrain_spans(spans: dict[int, int],
     return constrained
 
 
+def _export_root(work_dir: Path):
+    """Audiveris' MusicXML export — as .mxl, which is what -export writes.
+
+    Reading only plain .musicxml quietly cost every repeat, ending, jump
+    and tempo mark: the container never produces that form.
+    """
+    for plain in sorted(work_dir.glob("**/*.musicxml")):
+        if "(grid)" in plain.name:
+            continue
+        try:
+            return ET.parse(plain).getroot()
+        except ET.ParseError:
+            continue
+    for mxl in sorted(work_dir.glob("**/*.mxl")):
+        try:
+            with zipfile.ZipFile(mxl) as z:
+                inner = [n for n in z.namelist()
+                         if n.endswith(".xml")
+                         and not n.startswith("META-INF")]
+                if inner:
+                    return ET.fromstring(
+                        z.read(inner[0]).decode("utf-8", "replace"))
+        except (zipfile.BadZipFile, ET.ParseError, KeyError):
+            continue
+    return None
+
+
 def _jump_kind(text: str) -> str | None:
     """Classify form-navigation words, tolerant of OCR garble ("BS. al
     Coda" is a real Audiveris read of "D.S. al Coda")."""
@@ -368,11 +395,9 @@ def analyze(omr: Path, work_dir: Path) -> dict:
         bar_number += count
 
     repeats, voltas, jumps, tempo_changes = [], [], [], []
-    audiveris_xml = next(work_dir.glob("**/audiveris.musicxml"), None) \
-        or next(work_dir.glob("**/*[!d].musicxml"), None)
-    if audiveris_xml is not None:
+    root = _export_root(work_dir)
+    if root is not None:
         try:
-            root = ET.parse(audiveris_xml).getroot()
             for part in root.findall("part"):
                 for mi, measure in enumerate(part.findall("measure")):
                     for barline in measure.findall("barline"):
@@ -416,7 +441,7 @@ def analyze(omr: Path, work_dir: Path) -> dict:
                             jumps.append({"printed_bar": mi + 1,
                                           "kind": kind, "text": tag})
                 break
-        except ET.ParseError:
+        except (ET.ParseError, AttributeError):
             pass
 
     tempo = read_start_tempo(omr)
