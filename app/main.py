@@ -308,6 +308,63 @@ def _select_engine(candidates: dict[str, Path | None]) -> tuple[str, Path | None
     return ranked[0][0], ranked[0][1], scores
 
 
+def _repair_structure(job_id: str, job_dir: Path, result: Path,
+                      aud_path: Path) -> None:
+    """Put back what the engines dropped: multirest counts, missed
+    multirests, drifted bar numbering, and rehearsal letters.
+
+    Each step is independent and advisory — a failure leaves the score as
+    it was rather than losing the conversion.
+    """
+    from app.fix_hbars import detect_hbars, place_rehearsals, stack_numbers
+    from app.fix_hbars import fix as fix_hbars
+    from app.fix_multirests import fix as fix_multirest_counts
+    from app.fix_structure import fix as fix_structure
+
+    try:
+        fixed = fix_multirest_counts(job_dir, result)
+        if fixed:
+            logger.info("job %s: %d multirest counts repaired", job_id, fixed)
+    except Exception:
+        logger.exception("job %s: multirest repair failed", job_id)
+
+    try:
+        fix_structure(job_dir, result)
+    except Exception:
+        logger.exception("job %s: structure repair failed", job_id)
+
+    try:
+        updated, inserted = fix_hbars(job_dir, result)
+        if updated or inserted:
+            logger.info("job %s: H-bars — %d counts corrected, %d multirests "
+                        "inserted", job_id, updated, inserted)
+    except Exception:
+        logger.exception("job %s: H-bar reconciliation failed", job_id)
+
+    if result.read_bytes() == aud_path.read_bytes():
+        return  # Audiveris is the score itself; nothing to graft onto it
+
+    omr = next(job_dir.rglob("*.omr"), None)
+    hbars = detect_hbars(omr) if omr is not None else []
+    try:
+        numbers = stack_numbers(omr, hbars) if hbars else None
+        placed = postprocess.graft_numbered(result, aud_path, numbers)
+        if placed:
+            logger.info("job %s: %d elements placed by printed number",
+                        job_id, placed)
+    except Exception:
+        logger.exception("job %s: numbered graft failed", job_id)
+
+    if omr is not None and hbars:
+        try:
+            moved = place_rehearsals(omr, result, hbars)
+            if moved:
+                logger.info("job %s: %d rehearsal letters re-placed",
+                            job_id, moved)
+        except Exception:
+            logger.exception("job %s: rehearsal placement failed", job_id)
+
+
 def _process_job(job_id: str, source: Path):
     job_dir = source.parent
     try:
@@ -350,6 +407,12 @@ def _process_job(job_id: str, source: Path):
                 logger.exception("job %s: fusion graft failed; keeping homr",
                                  job_id)
 
+        # Structure repair, which only became possible server-side once
+        # Audiveris started running in this container: every step below
+        # reads the .omr for printed geometry the MusicXML has lost.
+        if aud_path is not None:
+            _repair_structure(job_id, job_dir, result_path, aud_path)
+
         with jobs_lock:
             piece_title = jobs[job_id].get("piece_title")
         if piece_title:
@@ -368,6 +431,29 @@ def _process_job(job_id: str, source: Path):
                     _update_job(job_id, transposed=True)
             except Exception:
                 logger.exception("job %s: transpose failed", job_id)
+
+        page1 = job_dir / "page_001.png"
+        if page1.exists():
+            try:
+                from app.fix_tempo import fix as fix_tempo
+
+                bpm = fix_tempo(page1, result_path)
+                if bpm:
+                    logger.info("job %s: tempo recovered %s BPM", job_id, bpm)
+            except Exception:
+                logger.exception("job %s: tempo OCR failed", job_id)
+            try:
+                from app.fix_titles import fix as fix_titles
+
+                for line in fix_titles(page1, result_path):
+                    logger.info("job %s: title text %s", job_id, line)
+            except Exception:
+                logger.exception("job %s: title OCR failed", job_id)
+
+        try:
+            postprocess.app_compat(result_path)
+        except Exception:
+            logger.exception("job %s: app_compat failed", job_id)
 
         _update_job(
             job_id,

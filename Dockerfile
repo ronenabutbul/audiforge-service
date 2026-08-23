@@ -37,7 +37,11 @@ COPY app ./app
 
 ENV PORT=8080
 ENV AUDIVERIS_BIN=/opt/audiveris/bin/Audiveris
-ENV TESSDATA_DIR=/usr/local/share/audiveris-tessdata
+# Audiveris runs tesseract in legacy mode and needs the full data;
+# our own OCR needs the system tessdata, whose configs/ directory is
+# what makes tesseract's TSV output work.
+ENV AUDIVERIS_TESSDATA=/usr/local/share/audiveris-tessdata
+ENV TESSDATA_DIR=/usr/share/tesseract-ocr/5/tessdata
 ENV TESSERACT_BIN=/usr/bin/tesseract
 EXPOSE 8080
 

@@ -17,8 +17,11 @@ import threading
 from pathlib import Path
 
 AUDIVERIS_BIN = os.environ.get("AUDIVERIS_BIN", "/opt/audiveris/bin/Audiveris")
+# Audiveris needs the FULL legacy traineddata; the fix_* modules need the
+# system tessdata instead (its configs/ directory drives TSV output), so the
+# two paths are deliberately separate.
 TESSDATA_DIR = os.environ.get(
-    "TESSDATA_DIR", "/usr/local/share/audiveris-tessdata")
+    "AUDIVERIS_TESSDATA", "/usr/local/share/audiveris-tessdata")
 
 # one JVM at a time — Audiveris is memory-hungry and jobs are short
 _lock = threading.Lock()

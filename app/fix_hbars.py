@@ -311,7 +311,10 @@ def place_rehearsals(omr_path: Path, result_path: Path,
     tree = ET.parse(result_path)
     part = tree.getroot().find("part")
     measures = part.findall("measure")
-    from postprocess import _printed_numbers
+    try:
+        from app.postprocess import _printed_numbers
+    except ImportError:  # local_bench puts app/ itself on sys.path
+        from postprocess import _printed_numbers
     base_numbers = _printed_numbers(measures)
     base_by_number = {}
     for i, n in enumerate(base_numbers):

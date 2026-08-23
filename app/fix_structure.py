@@ -125,7 +125,10 @@ def _read_anchor(image, left: float, top: float, predicted: int):
     predicted number is credible; junk reads fall outside the band."""
     from PIL import Image
 
-    from fix_multirests import _ocr_digits, _read_number
+    try:
+        from app.fix_multirests import _ocr_digits, _read_number
+    except ImportError:  # local_bench puts app/ itself on sys.path
+        from fix_multirests import _ocr_digits, _read_number
 
     candidates = []
     for dy in (-125, -105, -85, -65):
