@@ -191,6 +191,28 @@ def constrain_spans(spans: dict[int, int],
     return constrained
 
 
+def _jump_kind(text: str) -> str | None:
+    """Classify form-navigation words, tolerant of OCR garble ("BS. al
+    Coda" is a real Audiveris read of "D.S. al Coda")."""
+    low = " ".join(text.lower().split())
+    if not low:
+        return None
+    if "al coda" in low:
+        return "ds_al_coda" if "d" in low.split("al")[0] or "s" in low \
+            else "ds_al_coda"
+    if "to coda" in low:
+        return "to_coda"
+    if "al fine" in low:
+        return "ds_al_fine"
+    if low in ("coda", "fine", "segno") or low.startswith("coda "):
+        return low.split()[0]
+    if low.startswith(("d.s", "ds.", "d. s")):
+        return "ds"
+    if low.startswith(("d.c", "dc.")):
+        return "dc"
+    return None
+
+
 # ------------------------------------------------------------- model reads
 
 def _gemini_json(png: bytes, prompt: str, schema: dict) -> dict | None:
@@ -330,15 +352,12 @@ def analyze(omr: Path, work_dir: Path) -> dict:
         })
         bar_number += count
 
-    repeats = []
+    repeats, voltas, jumps = [], [], []
     audiveris_xml = next(work_dir.glob("**/audiveris.musicxml"), None) \
-        or next(work_dir.glob("**/*.mxl"), None)
-    export = next(work_dir.glob("**/*[!d].musicxml"), None)
-    for candidate in (audiveris_xml, export):
-        if candidate is None or candidate.suffix == ".mxl":
-            continue
+        or next(work_dir.glob("**/*[!d].musicxml"), None)
+    if audiveris_xml is not None:
         try:
-            root = ET.parse(candidate).getroot()
+            root = ET.parse(audiveris_xml).getroot()
             for part in root.findall("part"):
                 for mi, measure in enumerate(part.findall("measure")):
                     for barline in measure.findall("barline"):
@@ -347,10 +366,25 @@ def analyze(omr: Path, work_dir: Path) -> dict:
                             repeats.append({
                                 "printed_bar": mi + 1,
                                 "direction": repeat.get("direction")})
+                        ending = barline.find("ending")
+                        if (ending is not None
+                                and ending.get("type") == "start"):
+                            voltas.append({
+                                "printed_bar": mi + 1,
+                                "number": ending.get("number", "1")})
+                    for words in measure.iter("words"):
+                        kind = _jump_kind(words.text or "")
+                        if kind:
+                            jumps.append({"printed_bar": mi + 1,
+                                          "kind": kind,
+                                          "text": (words.text or "").strip()})
+                    for tag, kind in (("segno", "segno"), ("coda", "coda")):
+                        if measure.find(f".//{tag}") is not None:
+                            jumps.append({"printed_bar": mi + 1,
+                                          "kind": kind, "text": tag})
                 break
-            break
         except ET.ParseError:
-            continue
+            pass
 
     tempo = read_start_tempo(omr)
     cost = (usage["prompt_tokens"] * 0.50
@@ -364,6 +398,8 @@ def analyze(omr: Path, work_dir: Path) -> dict:
         "review_bars": sorted(
             t["measure_number"] for t in timeline if t["review"]),
         "repeats": repeats,
+        "voltas": voltas,
+        "jumps": jumps,
         "timeline": timeline,
         "usage": {**usage, "estimated_cost_usd": round(cost, 5)},
     }
