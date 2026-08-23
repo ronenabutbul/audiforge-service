@@ -46,6 +46,9 @@ KIT = {
     "tom_high":  ("E", 5, None, 50, 1),
     "tom_mid":   ("D", 5, None, 47, 1),
     "tom_low":   ("A", 4, None, 45, 1),
+    # one-line percussion parts (see one_line.py)
+    "bongo_high": ("E", 5, None, 60, 1),
+    "bongo_low":  ("C", 5, None, 61, 1),
 }
 
 # Staff position + notehead -> kit piece. The model reports what it SEES
@@ -117,6 +120,8 @@ printed dynamic in this bar (p, mp, mf, f, ff) or null.
 If a measure number is printed for this bar — often in a small box above
 the barline — report it as measure_number; otherwise null. Do not confuse
 it with the "+" and "o" articulation marks above the staff.
+If a metronome marking (a small note = a number, like "= 120") is printed
+above this bar, report the number as tempo_bpm; otherwise null.
 If this bar is a MULTI-BAR REST (a thick horizontal bar across the staff
 with a number above it), report that number as multirest_count and no
 strikes.
@@ -139,12 +144,18 @@ class BarReading(BaseModel):
     dynamic: str | None = None
     measure_number: int | None = None
     multirest_count: int | None = None
+    tempo_bpm: int | None = None
 
 
 class Hit(BaseModel):
     slot: int
     instruments: list[str]
     accent: bool = False
+    # observed ink, parallel to instruments — lets the writer put each
+    # note where the ORIGINAL page shows it instead of at the textbook
+    # kit position, so the output engraves like the source
+    steps: list[int] = []
+    heads: list[str] = []
 
 
 def calibrate(readings: list["BarReading"]) -> dict:
@@ -209,7 +220,7 @@ def calibrate(readings: list["BarReading"]) -> dict:
 def reading_to_grid(reading: "BarReading",
                     step_map: dict | None = None) -> "BarGrid":
     """Map seen positions to kit pieces via POSITION_MAP."""
-    by_slot: dict[int, list[tuple[str, bool]]] = {}
+    by_slot: dict[int, list[tuple[str, bool, int, str]]] = {}
     for strike in reading.strikes:
         table = step_map or STEP_MAP
         row = table.get(max(-4, min(10, strike.step)))
@@ -218,11 +229,14 @@ def reading_to_grid(reading: "BarReading",
         inst = row.get(strike.head) or row.get("normal")
         if inst is None:
             continue
-        by_slot.setdefault(strike.slot, []).append((inst, strike.accent))
+        by_slot.setdefault(strike.slot, []).append(
+            (inst, strike.accent, strike.step, strike.head))
     return BarGrid(
         is_repeat_of_previous=reading.is_repeat_of_previous,
-        hits=[Hit(slot=s, instruments=[i for i, _ in v],
-                  accent=any(a for _, a in v))
+        hits=[Hit(slot=s, instruments=[i for i, _, _, _ in v],
+                  accent=any(a for _, a, _, _ in v),
+                  steps=[st for _, _, st, _ in v],
+                  heads=[h for _, _, _, h in v])
               for s, v in sorted(by_slot.items())],
         dynamic=reading.dynamic)
 
@@ -239,6 +253,8 @@ def bar_crops(omr_path: Path) -> list[dict]:
 
     crops = []
     stack_ordinal = -1
+    meter = (4, 4)
+    pending_sig = None  # courtesy signature at line end governs the NEXT bar
     with zipfile.ZipFile(omr_path) as z:
         sheets = sorted(
             {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
@@ -248,6 +264,20 @@ def bar_crops(omr_path: Path) -> list[dict]:
                                  .decode("utf-8", "replace"))
             image = Image.open(io.BytesIO(z.read(f"{sheet}/BINARY.png"))) \
                 .convert("L")
+            # Audiveris records every printed time signature with bounds;
+            # collected per sheet, matched to bars by position below.
+            sigs = []
+            for tag in ("time-pair", "time-whole"):
+                for el in root.iter(tag):
+                    rational = el.get("time-rational")
+                    b = el.find("bounds")
+                    if rational and b is not None and "/" in rational:
+                        num, den = rational.split("/")
+                        sigs.append({
+                            "x": float(b.get("x")) + float(b.get("w")) / 2,
+                            "y": float(b.get("y")) + float(b.get("h")) / 2,
+                            "meter": (int(num), int(den)),
+                        })
             for system in root.iter("system"):
                 staff = system.find(".//staff")
                 lines = staff.findall("lines/line") if staff is not None else []
@@ -256,10 +286,24 @@ def bar_crops(omr_path: Path) -> list[dict]:
                 top = float(lines[0].find("point").get("y"))
                 bottom = float(lines[-1].find("point").get("y"))
                 interline = (bottom - top) / max(len(lines) - 1, 1)
-                for stack in system.findall("stack"):
+                stacks = system.findall("stack")
+                for si, stack in enumerate(stacks):
                     stack_ordinal += 1
                     x0 = int(float(stack.get("left")))
                     x1 = int(float(stack.get("right")))
+                    if pending_sig is not None:
+                        meter = pending_sig
+                        pending_sig = None
+                    for sig in sigs:
+                        if not (top - 2 * interline <= sig["y"]
+                                <= bottom + 2 * interline):
+                            continue
+                        if x0 - 4 <= sig["x"] <= x1:
+                            if (si == len(stacks) - 1
+                                    and sig["x"] > x0 + 0.85 * (x1 - x0)):
+                                pending_sig = sig["meter"]
+                            else:
+                                meter = sig["meter"]
                     # Tight vertical framing: the staff should dominate the
                     # crop, so vertical position is easy to judge.
                     y0 = max(int(top - interline * 4.2), 0)
@@ -279,7 +323,8 @@ def bar_crops(omr_path: Path) -> list[dict]:
                     crops.append({"png": buf.getvalue(),
                                   "rows": rows,
                                   "height": crop.height,
-                                  "stack": stack_ordinal})
+                                  "stack": stack_ordinal,
+                                  "meter": meter})
     return crops
 
 
@@ -333,19 +378,82 @@ def _gemini_key() -> str:
     raise RuntimeError("no Gemini key found")
 
 
+def bar_slots(meter: tuple[int, int]) -> int:
+    """Sixteenth-note slots in one bar of this meter (6/8 -> 12)."""
+    num, den = meter
+    return max(num * 16 // den, 1)
+
+
+def _gemini_prompt(crop: dict, context: str, beats: int, beat_type: int,
+                   slots_per_beat: int) -> str:
+    num, den = crop.get("meter", (beats, beat_type))
+    slots = bar_slots((num, den))
+    unit = {1: "quarter", 2: "eighth", 4: "sixteenth"}[slots_per_beat]
+    return PROMPT.format(
+        time=f"{num}/{den}", slots=slots, unit=unit,
+        rows=", ".join(str(r) for r in crop.get("rows", [])),
+        height=crop.get("height", 0), context=context)
+
+
+USAGE = {"calls": 0, "prompt_tokens": 0, "output_tokens": 0}
+
+
+def usage_summary() -> str:
+    """What this run cost, measured — the basis for pricing the feature.
+    gemini-3-flash-preview list price: $0.50/1M input, $3.00/1M output."""
+    cost = (USAGE["prompt_tokens"] * 0.50
+            + USAGE["output_tokens"] * 3.00) / 1_000_000
+    return (f"{USAGE['calls']} model calls, "
+            f"{USAGE['prompt_tokens']:,} in + "
+            f"{USAGE['output_tokens']:,} out tokens ≈ ${cost:.4f}")
+
+
+def _gemini_read_bar(crop: dict, prompt: str, model: str,
+                     label: str = "bar") -> "BarReading | None":
+    import json
+    import urllib.request
+
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{model}:generateContent?key={_gemini_key()}")
+    body = json.dumps({
+        "contents": [{"parts": [
+            {"inline_data": {
+                "mime_type": "image/png",
+                "data": base64.standard_b64encode(crop["png"]).decode()}},
+            {"text": prompt},
+        ]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseJsonSchema": BarReading.model_json_schema(),
+        },
+    }).encode()
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"})
+    for attempt in range(6):
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                payload = json.load(r)
+            meta = payload.get("usageMetadata", {})
+            USAGE["calls"] += 1
+            USAGE["prompt_tokens"] += meta.get("promptTokenCount", 0)
+            USAGE["output_tokens"] += (meta.get("candidatesTokenCount", 0)
+                                       + meta.get("thoughtsTokenCount", 0))
+            text = payload["candidates"][0]["content"]["parts"][0]["text"]
+            return BarReading.model_validate_json(text)
+        except Exception as exc:
+            if attempt == 5:
+                print(f"  {label}: giving up ({exc})", flush=True)
+                return None
+            import time
+            # rate limits need a real pause, not a nudge
+            rate_limited = "429" in str(exc)
+            time.sleep((45 if rate_limited else 4) * (attempt + 1))
+
+
 def transcribe_gemini(crops: list[dict], beats: int = 4, beat_type: int = 4,
                       slots_per_beat: int = 4,
                       model: str = "gemini-3-flash-preview") -> list[BarGrid]:
     """Cloud backend using the Gemini key already on this machine."""
-    import json
-    import urllib.request
-
-    key = _gemini_key()
-    slots = beats * slots_per_beat
-    unit = {1: "quarter", 2: "eighth", 4: "sixteenth"}[slots_per_beat]
-    base_prompt = PROMPT
-    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{model}:generateContent?key={key}")
     grids = []
     for i, crop in enumerate(crops):
         # Drum charts repeat grooves: telling the model what the previous
@@ -359,42 +467,11 @@ def transcribe_gemini(crops: list[dict], beats: int = 4, beat_type: int = 4,
             context = ("\n\nFor reference, the PREVIOUS bar of this chart "
                        f"read as: {previous}. This bar may well repeat that "
                        "groove — but read what is actually printed here.")
-        prompt = base_prompt.format(
-            time=f"{beats}/{beat_type}", slots=slots, unit=unit,
-            rows=", ".join(str(r) for r in crop.get("rows", [])),
-            height=crop.get("height", 0), context=context)
-        body = json.dumps({
-            "contents": [{"parts": [
-                {"inline_data": {
-                    "mime_type": "image/png",
-                    "data": base64.standard_b64encode(crop["png"]).decode()}},
-                {"text": prompt},
-            ]}],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "responseJsonSchema": BarReading.model_json_schema(),
-            },
-        }).encode()
-        req = urllib.request.Request(
-            url, data=body, headers={"Content-Type": "application/json"})
-        grid = None
-        for attempt in range(6):
-            try:
-                with urllib.request.urlopen(req, timeout=120) as r:
-                    payload = json.load(r)
-                text = payload["candidates"][0]["content"]["parts"][0]["text"]
-                grid = BarReading.model_validate_json(text)
-                break
-            except Exception as exc:
-                if attempt == 5:
-                    print(f"  bar {i + 1}: giving up ({exc}); empty bar",
-                          flush=True)
-                    grid = BarGrid()
-                else:
-                    import time
-                    # rate limits need a real pause, not a nudge
-                    rate_limited = "429" in str(exc)
-                    time.sleep((45 if rate_limited else 4) * (attempt + 1))
+        prompt = _gemini_prompt(crop, context, beats, beat_type,
+                                slots_per_beat)
+        grid = _gemini_read_bar(crop, prompt, model, label=f"bar {i + 1}")
+        if grid is None:
+            grid = BarReading()
         if grid.is_repeat_of_previous and grids:
             grid = grids[-1]
         grids.append(grid)
@@ -402,6 +479,329 @@ def transcribe_gemini(crops: list[dict], beats: int = 4, beat_type: int = 4,
     transcribe_gemini.last_readings = grids
     step_map = calibrate(grids)
     return [reading_to_grid(r, step_map) for r in grids]
+
+
+def snap_steps(crops: list[dict], readings: list["BarReading"], omr: Path,
+               slots_per_beat: int = 4) -> list["BarReading"]:
+    """Move each strike to the staff position where the ink actually is.
+
+    The model wobbles one step on dense lines (a hi-hat above the top
+    line read as on it), and per-bar wobble splits one instrument into
+    two at calibration time. The page knows: measure the vertical blob
+    at the claimed step and its neighbors, and follow the tallest ink.
+    No API calls — pure geometry.
+    """
+    import io as _io
+    import zipfile as _zipfile
+    from fractions import Fraction
+
+    import numpy as np
+    from PIL import Image
+
+    from drum_overlay import bar_geometry, blob_at
+
+    bars = bar_geometry(omr)
+    stacks = [c["stack"] for c in crops]
+    images = {}
+    with _zipfile.ZipFile(omr) as z:
+        for name in {b["sheet"] for b in bars}:
+            images[name] = np.asarray(
+                Image.open(_io.BytesIO(z.read(f"{name}/BINARY.png")))
+                .convert("L")) < 128
+    moved = 0
+    for i, reading in enumerate(readings):
+        if i >= len(stacks) or stacks[i] >= len(bars):
+            break
+        bar = bars[stacks[i]]
+        pixels = images[bar["sheet"]]
+        for s in reading.strikes:
+            beats_at = Fraction(s.slot, slots_per_beat)
+            onset = next((o for o in bar["onsets"]
+                          if abs(o["beats"] - beats_at) < Fraction(1, 8)),
+                         None)
+            if onset is None:
+                continue
+            here = blob_at(pixels, onset["x"], s.step,
+                           bar["top"], bar["interline"])
+            if here >= 0.42:
+                continue
+            best_step, best = s.step, here
+            for d in (-1, 1):
+                b = blob_at(pixels, onset["x"], s.step + d,
+                            bar["top"], bar["interline"])
+                if b > best:
+                    best, best_step = b, s.step + d
+            if best >= 0.5 and best_step != s.step:
+                s.step = best_step
+                moved += 1
+    if moved:
+        print(f"  snapped {moved} strikes to the ink", flush=True)
+    return readings
+
+
+def merge_wobbled_lines(crops: list[dict], readings: list["BarReading"],
+                        omr: Path, slots_per_beat: int = 4
+                        ) -> list["BarReading"]:
+    """Decide chart-wide whether two adjacent busy x-head lines are two
+    instruments (hi-hat + ride) or one wobbling hi-hat.
+
+    Per-strike snapping failed (stems dwarf x-heads in any blob metric),
+    so this measures background-subtracted ink density — the staff line's
+    own ink cancels out — and decides by majority across the whole chart:
+    a claimed step whose ink sits on the neighboring line >=70% of the
+    time is wobble, and every strike on it moves to the neighbor.
+    Measured: Abba's above-line claims are 82% on-line (one hi-hat);
+    Avihu's stay 61% above (real hi-hat + ride, untouched).
+    """
+    import io as _io
+    import zipfile as _zipfile
+    from fractions import Fraction
+
+    import numpy as np
+    from PIL import Image
+
+    from drum_overlay import bar_geometry
+
+    bars = bar_geometry(omr)
+    stacks = [c["stack"] for c in crops]
+    images = {}
+    with _zipfile.ZipFile(omr) as z:
+        for name in {b["sheet"] for b in bars}:
+            images[name] = np.asarray(
+                Image.open(_io.BytesIO(z.read(f"{name}/BINARY.png")))
+                .convert("L")) < 128
+
+    def evidence(pixels, bar, x, step):
+        y = bar["top"] + step * bar["interline"] / 2
+        h = bar["interline"] * 0.4
+        rows = pixels[max(int(y - h), 0):int(y + h),
+                      int(bar["x0"]):int(bar["x1"])]
+        if not rows.size:
+            return 0.0
+        w = bar["interline"] * 0.55
+        x0 = max(int(x - w - bar["x0"]), 0)
+        x1 = min(int(x + w - bar["x0"]), rows.shape[1])
+        if x1 <= x0:
+            return 0.0
+        return float(rows[:, x0:x1].mean()
+                     - np.median(rows.mean(axis=0)))
+
+    def vote(claimed: int, other: int) -> tuple[int, int]:
+        stay = moved = 0
+        for i, r in enumerate(readings):
+            if i >= len(stacks) or stacks[i] >= len(bars):
+                break
+            bar = bars[stacks[i]]
+            pixels = images[bar["sheet"]]
+            for st in r.strikes:
+                if st.head not in ("x", "circled_x") or st.step != claimed:
+                    continue
+                onset = next(
+                    (o for o in bar["onsets"]
+                     if abs(o["beats"] - Fraction(st.slot, slots_per_beat))
+                     < Fraction(1, 8)), None)
+                if onset is None:
+                    continue
+                e_here = evidence(pixels, bar, onset["x"], claimed)
+                e_other = evidence(pixels, bar, onset["x"], other)
+                if max(e_here, e_other) < 0.05:
+                    continue
+                if e_here >= e_other:
+                    stay += 1
+                else:
+                    moved += 1
+        return stay, moved
+
+    # A bad scan wobbles one instrument across up to three steps, so
+    # merge repeatedly (nearest lines first) until nothing moves. Plain
+    # heads wobble too (a snare read one space high becomes a tom), so
+    # both head families get the same treatment — the ink vote is what
+    # keeps genuine neighboring instruments apart.
+    from collections import Counter
+    for head_family in (("x", "circled_x"), ("normal",)):
+      for _ in range(6):
+        counts = Counter(s.step for r in readings for s in r.strikes
+                         if s.head in head_family)
+        busy = sorted(s for s, n in counts.items() if n >= 50)
+        merged = False
+        for distance in (1, 2):
+            for a in busy:
+                b = a + distance
+                if b not in busy or merged:
+                    continue
+                for claimed, target in ((a, b), (b, a)):
+                    stay, moved = vote(claimed, target)
+                    total = stay + moved
+                    if total >= 30 and moved / total >= 0.7:
+                        n = 0
+                        for r in readings:
+                            for st in r.strikes:
+                                if (st.head in ("x", "circled_x")
+                                        and st.step == claimed):
+                                    st.step = target
+                                    n += 1
+                        print(f"  merged wobbled x-line: step {claimed:+d}"
+                              f" -> {target:+d} ({n} strikes; ink voted "
+                              f"{moved}/{total})", flush=True)
+                        merged = True
+                        break
+        if not merged:
+            break
+    return readings
+
+
+def read_start_tempo(omr: Path,
+                     model: str = "gemini-3-flash-preview") -> int | None:
+    """The opening tempo sits above the first system with the title, out
+    of reach of every per-bar crop — read the top of page 1 directly."""
+    import io as _io
+
+    from PIL import Image
+
+    with zipfile.ZipFile(omr) as z:
+        sheets = sorted(
+            (n.split("/")[0] for n in z.namelist()
+             if n.startswith("sheet#")),
+            key=lambda s: int(s.split("#")[1]))
+        if not sheets:
+            return None
+        image = Image.open(
+            _io.BytesIO(z.read(f"{sheets[0]}/BINARY.png"))).convert("L")
+    strip = image.crop((0, 0, image.width, int(image.height * 0.30)))
+    if strip.width > 1400:
+        ratio = 1400 / strip.width
+        strip = strip.resize((1400, int(strip.height * ratio)))
+    buf = _io.BytesIO()
+    strip.save(buf, format="PNG")
+    prompt = ("This is the top of the first page of a piece of printed "
+              "sheet music. If a metronome marking is printed anywhere "
+              "(a small note symbol, an equals sign, and a number — like "
+              "'= 100'), report the number as tempo_bpm. Otherwise "
+              "report tempo_bpm as null. Report no strikes.")
+    reading = _gemini_read_bar({"png": buf.getvalue()}, prompt, model,
+                               label="start tempo")
+    if reading and reading.tempo_bpm and 40 <= reading.tempo_bpm <= 240:
+        return reading.tempo_bpm
+    return None
+
+
+def verify_and_reread(crops: list[dict], readings: list["BarReading"],
+                      omr: Path, beats: int = 4, beat_type: int = 4,
+                      slots_per_beat: int = 4, threshold: float = 0.75,
+                      model: str = "gemini-3-flash-preview",
+                      max_rereads: int = 60) -> list["BarReading"]:
+    """The copyist loop: ink-check every bar, re-read the doubtful ones.
+
+    The overlay verifier locates each disagreement to a slot and an
+    instrument, so the re-read prompt can tell the model exactly what the
+    ink disputes. A re-read only replaces the original if the ink likes it
+    at least as much.
+    """
+    from drum_overlay import verify_grids
+
+    # NOTE: per-strike snap_steps stays disabled — its blob-height metric
+    # mistakes stems for noteheads on x-head instruments (measured:
+    # Avihu 72.9% -> 49.1%). Chart-level wobble merging replaces it.
+    readings = merge_wobbled_lines(crops, readings, omr, slots_per_beat)
+    step_map = calibrate(readings)
+    grids = [reading_to_grid(r, step_map) for r in readings]
+    stacks = [c["stack"] for c in crops]
+    reports = verify_grids(grids, omr, stacks, slots_per_beat)
+    flagged = [r for r in reports
+               if (r["score"] is not None and r["score"] < threshold)
+               # read as silent, but the engraving has real onsets
+               or (r["score"] is None and r["unclaimed_onsets"] >= 2)]
+    if not flagged:
+        print("  overlay check: every bar ink-confirmed", flush=True)
+        return readings
+    print(f"  overlay check: {len(flagged)} bars disputed by the ink; "
+          f"re-reading them", flush=True)
+    improved = 0
+    for rep in flagged[:max_rereads]:
+        i = rep["index"]
+        disputed = ", ".join(f"{inst} at onset {k}"
+                             for k, inst in rep["invented_detail"])
+        context = ""
+        if i and readings[i - 1].strikes:
+            previous = ", ".join(
+                f"slot {s.slot}: step {s.step} {s.head}"
+                for s in readings[i - 1].strikes[:16])
+            context = ("\n\nFor reference, the PREVIOUS bar of this chart "
+                       f"read as: {previous}.")
+        context += (
+            "\n\nIMPORTANT: an earlier reading of THIS bar was compared "
+            "against the printed ink and disagreed"
+            + (f" — it claimed {disputed} where the page shows no notehead"
+               if disputed else " — it missed printed noteheads")
+            + ". Look again carefully and report exactly what is printed, "
+            "nothing more and nothing less.")
+        prompt = _gemini_prompt(crops[i], context, beats, beat_type,
+                                slots_per_beat)
+        new = _gemini_read_bar(crops[i], prompt, model,
+                               label=f"re-read bar {i + 1}")
+        if new is None:
+            continue
+        if new.is_repeat_of_previous and i:
+            new = readings[i - 1]
+        check = verify_grids([reading_to_grid(new, step_map)], omr,
+                             [stacks[i]], slots_per_beat)
+        old_score, new_score = rep["score"], check[0]["score"] if check else None
+        if new_score is not None and (old_score is None
+                                      or new_score >= old_score):
+            readings[i] = new
+            improved += 1
+    print(f"  re-reads kept: {improved}/{len(flagged[:max_rereads])}",
+          flush=True)
+    # Fresh re-reads wobble like fresh reads do — without this second
+    # merge they quietly reintroduce the phantom second cymbal line that
+    # the first merge removed, and calibration flips again.
+    return merge_wobbled_lines(crops, readings, omr, slots_per_beat)
+
+
+MULTIREST_PROMPT = """This is ONE BAR of a printed percussion part. It was
+detected as a MULTI-BAR REST: a thick horizontal bar sitting on the middle
+of the staff, with a number printed above or near it saying how many bars
+of rest it stands for.
+
+Read that number and report it as multirest_count. Report no strikes.
+If you can clearly see the number, report it exactly. If there is no
+readable number, or this bar actually contains notes rather than a
+multi-bar rest, report multirest_count as null (and the strikes you see).
+"""
+
+
+def interrogate_multirests(crops: list[dict], readings: list["BarReading"],
+                           hbars: list[dict],
+                           model: str = "gemini-3-flash-preview"
+                           ) -> list["BarReading"]:
+    """Ask the model directly about H-bars whose printed count OCR missed.
+
+    An unread multirest silently collapses N measures into one bar, which
+    is how a 279-measure medley shows up as 172 — the biggest single source
+    of structural drift.
+    """
+    stack_to_index = {c["stack"]: i for i, c in enumerate(crops)}
+    targets = []
+    for h in hbars:
+        if h.get("read") and 2 <= h["count"] <= 150:
+            continue
+        i = stack_to_index.get(h["stack"])
+        if i is not None and not readings[i].multirest_count:
+            targets.append(i)
+    if not targets:
+        return readings
+    print(f"  asking the model about {len(targets)} unread multirest bars",
+          flush=True)
+    recovered = 0
+    for i in targets:
+        r = _gemini_read_bar(crops[i], MULTIREST_PROMPT, model,
+                             label=f"multirest bar {i + 1}")
+        if r and r.multirest_count and 2 <= r.multirest_count <= 150:
+            readings[i] = r
+            recovered += 1
+    print(f"  multirest counts recovered: {recovered}/{len(targets)}",
+          flush=True)
+    return readings
 
 
 def transcribe(crops: list[dict], beats: int = 4, beat_type: int = 4,
@@ -515,15 +915,84 @@ def grids_from_musicxml(path: Path) -> list[BarGrid]:
     return grids
 
 
+def _apply_beams(notes: list, bar_slots_n: int):
+    """Beam runs of sub-quarter notes within a beat group, the way an
+    engraver does — four eighths under one beam with the kick hanging
+    below, instead of a picket fence of flagged singles. The app's
+    renderer draws only the beams present in the MusicXML.
+    """
+    if bar_slots_n % 8 == 0:
+        group = 8          # 4/4-like: beam per half bar (4 eighths)
+    elif bar_slots_n % 6 == 0:
+        group = 6          # 6/8-like: beam per dotted-quarter beat
+    else:
+        group = 4
+    runs, run = [], []
+    for note, slot, duration in notes:
+        if run:
+            _, prev_slot, prev_dur = run[-1]
+            contiguous = slot == prev_slot + prev_dur
+            same_group = slot // group == run[0][1] // group
+            if not (contiguous and same_group):
+                runs.append(run)
+                run = []
+        run.append((note, slot, duration))
+    if run:
+        runs.append(run)
+    for run in runs:
+        if len(run) < 2:
+            continue
+        for i, (note, slot, duration) in enumerate(run):
+            state = ("begin" if i == 0
+                     else "end" if i == len(run) - 1 else "continue")
+            beams = [state]
+            if duration == 1:  # sixteenth: second beam level
+                prev_16 = i > 0 and run[i - 1][2] == 1
+                next_16 = i < len(run) - 1 and run[i + 1][2] == 1
+                if prev_16 and next_16:
+                    beams.append("continue")
+                elif next_16:
+                    beams.append("begin")
+                elif prev_16:
+                    beams.append("end")
+                else:
+                    beams.append("backward hook" if i else "forward hook")
+            # <beam> sits before <notations> in the note element order
+            notations = note.find("notations")
+            at = (list(note).index(notations) if notations is not None
+                  else len(list(note)))
+            for level, state in enumerate(beams, 1):
+                el = ET.Element("beam", number=str(level))
+                el.text = state
+                note.insert(at, el)
+                at += 1
+
+
+def _display_from_step(step: int) -> tuple[str, int]:
+    """Staff step (0 = top line, +1 the space below it) -> display pitch
+    on a 5-line percussion clef, where the top line engraves as F5."""
+    diatonic = 5 * 7 + 3 - step  # F5, descending one letter per step
+    return "CDEFGAB"[diatonic % 7], diatonic // 7
+
+
 def write_musicxml(grids: list[BarGrid], out: Path,
                    beats: int = 4, beat_type: int = 4,
                    slots_per_beat: int = 4, title: str = "Drum Set",
-                   rest_bars: dict[int, int] | None = None):
+                   rest_bars: dict[int, int] | None = None,
+                   meters: list[tuple[int, int]] | None = None,
+                   tempos: dict[int, int] | None = None):
     """rest_bars maps a grid index to how many MEASURES that printed bar
     stands for — a multirest bar is one bar on the page but N measures of
-    music, which is why counting printed bars undercounts a piece."""
-    slots = beats * slots_per_beat
+    music, which is why counting printed bars undercounts a piece.
+
+    meters is a per-bar (num, den) list from the printed time signatures;
+    tempos maps a grid index to a metronome marking printed above it."""
     divisions = slots_per_beat  # slot = one division of a quarter
+    meters = meters or []
+    tempos = dict(tempos or {})
+
+    def meter_of(gi: int) -> tuple[int, int]:
+        return meters[gi] if gi < len(meters) else (beats, beat_type)
 
     score = ET.Element("score-partwise", version="4.0")
     work = ET.SubElement(score, "work")
@@ -542,30 +1011,49 @@ def write_musicxml(grids: list[BarGrid], out: Path,
     part = ET.SubElement(score, "part", id="P1")
     rest_bars = rest_bars or {}
     num = 0
+    emitted_meter = None
+
+    def open_measure(gi: int):
+        nonlocal num, emitted_meter
+        num += 1
+        measure = ET.SubElement(part, "measure", number=str(num))
+        bar_meter = meter_of(gi)
+        if num == 1 or bar_meter != emitted_meter:
+            attrs = ET.SubElement(measure, "attributes")
+            if num == 1:
+                ET.SubElement(attrs, "divisions").text = str(divisions)
+            time = ET.SubElement(attrs, "time")
+            ET.SubElement(time, "beats").text = str(bar_meter[0])
+            ET.SubElement(time, "beat-type").text = str(bar_meter[1])
+            if num == 1:
+                clef = ET.SubElement(attrs, "clef")
+                ET.SubElement(clef, "sign").text = "percussion"
+                ET.SubElement(clef, "line").text = "2"
+            emitted_meter = bar_meter
+        bpm = tempos.pop(gi, None)
+        if bpm:
+            direction = ET.SubElement(measure, "direction",
+                                      placement="above")
+            dtype = ET.SubElement(direction, "direction-type")
+            metro = ET.SubElement(dtype, "metronome")
+            ET.SubElement(metro, "beat-unit").text = "quarter"
+            ET.SubElement(metro, "per-minute").text = str(bpm)
+            ET.SubElement(direction, "sound", tempo=str(bpm))
+        return measure
+
     for gi, grid in enumerate(grids):
+        slots = bar_slots(meter_of(gi))
         span = rest_bars.get(gi, 1)
         if span > 1:
             # A multirest: N whole-measure rests, not one bar.
             for _ in range(span):
-                num += 1
-                m = ET.SubElement(part, "measure", number=str(num))
+                m = open_measure(gi)
                 note = ET.SubElement(m, "note")
                 ET.SubElement(note, "rest", measure="yes")
-                ET.SubElement(note, "duration").text = str(
-                    beats * slots_per_beat)
+                ET.SubElement(note, "duration").text = str(slots)
                 ET.SubElement(note, "voice").text = "1"
             continue
-        num += 1
-        measure = ET.SubElement(part, "measure", number=str(num))
-        if num == 1:
-            attrs = ET.SubElement(measure, "attributes")
-            ET.SubElement(attrs, "divisions").text = str(divisions)
-            time = ET.SubElement(attrs, "time")
-            ET.SubElement(time, "beats").text = str(beats)
-            ET.SubElement(time, "beat-type").text = str(beat_type)
-            clef = ET.SubElement(attrs, "clef")
-            ET.SubElement(clef, "sign").text = "percussion"
-            ET.SubElement(clef, "line").text = "2"
+        measure = open_measure(gi)
         if grid.dynamic:
             direction = ET.SubElement(measure, "direction",
                                       placement="below")
@@ -573,16 +1061,18 @@ def write_musicxml(grids: list[BarGrid], out: Path,
             dyn = ET.SubElement(dtype, "dynamics")
             ET.SubElement(dyn, grid.dynamic)
 
-        by_voice: dict[int, dict[int, list[tuple[str, bool]]]] = {1: {}, 2: {}}
+        by_voice: dict[int, dict[int, list]] = {1: {}, 2: {}}
         for hit in grid.hits:
             if not 0 <= hit.slot < slots:
                 continue
-            for inst in hit.instruments:
+            for j, inst in enumerate(hit.instruments):
                 if inst not in KIT:
                     continue
                 voice = KIT[inst][4]
+                seen_step = hit.steps[j] if j < len(hit.steps) else None
+                seen_head = hit.heads[j] if j < len(hit.heads) else None
                 by_voice[voice].setdefault(hit.slot, []).append(
-                    (inst, hit.accent))
+                    (inst, hit.accent, seen_step, seen_head))
 
         for vi, voice in enumerate((1, 2)):
             events = by_voice[voice]
@@ -591,6 +1081,7 @@ def write_musicxml(grids: list[BarGrid], out: Path,
                 ET.SubElement(backup, "duration").text = str(slots)
             cursor = 0
             onsets = sorted(events)
+            beamable = []  # (lead note element, slot, duration) this voice
             for k, slot in enumerate(onsets):
                 if slot > cursor:
                     _add_rest(measure, slot - cursor, voice)
@@ -598,8 +1089,17 @@ def write_musicxml(grids: list[BarGrid], out: Path,
                 nxt = onsets[k + 1] if k + 1 < len(onsets) else slots
                 duration = _strike_slots(max(nxt - slot, 1))
                 name, dots = _DUR_TYPES[duration]
-                for j, (inst, accent) in enumerate(events[slot]):
+                for j, (inst, accent, seen_step, seen_head) in \
+                        enumerate(events[slot]):
                     step, octave, head, midi, _ = KIT[inst]
+                    # engrave where the ORIGINAL put the note, so the
+                    # output reads like the source chart (Ronen: the
+                    # notes must look like the PDF to compare them)
+                    if seen_step is not None:
+                        step, octave = _display_from_step(seen_step)
+                    if seen_head is not None:
+                        head = {"x": "x", "circled_x": "circle-x",
+                                "normal": None}.get(seen_head, head)
                     note = ET.SubElement(measure, "note")
                     if j > 0:
                         ET.SubElement(note, "chord")
@@ -620,9 +1120,12 @@ def write_musicxml(grids: list[BarGrid], out: Path,
                         notations = ET.SubElement(note, "notations")
                         artic = ET.SubElement(notations, "articulations")
                         ET.SubElement(artic, "accent")
+                    if j == 0 and duration < 4:
+                        beamable.append((note, slot, duration))
                 cursor = slot + duration
             if cursor < slots:
                 _add_rest(measure, slots - cursor, voice)
+            _apply_beams(beamable, slots)
     ET.ElementTree(score).write(out, encoding="UTF-8", xml_declaration=True)
 
 
@@ -721,7 +1224,7 @@ def spans_from_readings(readings: list["BarReading"]) -> dict[int, int]:
     spans = {}
     for i, reading in enumerate(readings):
         count = reading.multirest_count
-        spans[i] = count if count and 2 <= count <= 64 else 1
+        spans[i] = count if count and 2 <= count <= 150 else 1
 
     numbered = [(i, r.measure_number) for i, r in enumerate(readings)
                 if r.measure_number and r.measure_number > 0]
@@ -809,9 +1312,9 @@ def main():
     # silently drops a bar of music, while a misread 45 or 96 invents dozens
     # of empty measures.
     rest_counts = {h["stack"]: h["count"] for h in hbars
-                   if h.get("read") and 2 <= h["count"] <= 32}
+                   if h.get("read") and 2 <= h["count"] <= 150}
     dropped = [h["count"] for h in hbars
-               if not (h.get("read") and 2 <= h["count"] <= 32)]
+               if not (h.get("read") and 2 <= h["count"] <= 150)]
     if dropped:
         print(f"  {len(dropped)} unreadable multirest marks read as normal "
               f"bars instead", flush=True)
@@ -841,6 +1344,7 @@ def main():
     if "--recalibrate" in sys.argv and raw_cache.exists():
         readings = [BarReading.model_validate(r)
                     for r in json.loads(raw_cache.read_text())]
+        transcribe_gemini.last_readings = readings
         step_map = calibrate(readings)
         read_grids = [reading_to_grid(r, step_map) for r in readings]
         print(f"re-mapped {len(read_grids)} bars with fresh calibration",
@@ -870,6 +1374,23 @@ def main():
 
     grids = read_grids
     raw = getattr(transcribe_gemini, "last_readings", None)
+    if "--verify" in sys.argv:
+        if raw is None and raw_cache.exists():
+            raw = [BarReading.model_validate(r)
+                   for r in json.loads(raw_cache.read_text())]
+        if raw and len(raw) == len(crops):
+            raw = verify_and_reread(crops, raw, omr)
+            raw = interrogate_multirests(crops, raw, hbars)
+            raw_cache.write_text(json.dumps([r.model_dump() for r in raw],
+                                            indent=1))
+            transcribe_gemini.last_readings = raw
+            step_map = calibrate(raw)
+            grids = [reading_to_grid(r, step_map) for r in raw]
+            cache.write_text(json.dumps([g.model_dump() for g in grids],
+                                        indent=1))
+        else:
+            print("  --verify skipped: no readings aligned to crops",
+                  flush=True)
     if raw and len(raw) == len(grids):
         rest_bars = {i: n for i, n in spans_from_readings(raw).items()
                      if n > 1}
@@ -878,8 +1399,31 @@ def main():
                      for i, c in enumerate(crops)
                      if c["stack"] in rest_counts}
 
-    write_musicxml(grids, out, title=out.stem, rest_bars=rest_bars)
+    meters = [c.get("meter", (4, 4)) for c in crops]
+    changes = [(i, m) for i, m in enumerate(meters) if i and m != meters[i - 1]]
+    if changes:
+        print(f"  {len(changes)} meter changes from printed time "
+              f"signatures: {', '.join(f'{n}/{d}' for _, (n, d) in changes[:8])}",
+              flush=True)
+    tempos = {}
+    if raw and len(raw) == len(crops):
+        tempos = {i: r.tempo_bpm for i, r in enumerate(raw)
+                  if getattr(r, "tempo_bpm", None)
+                  and 40 <= r.tempo_bpm <= 240}
+        if 0 not in tempos:
+            start = read_start_tempo(omr)
+            if start:
+                tempos[0] = start
+                print(f"  start tempo read from the page top: {start} BPM",
+                      flush=True)
+        if tempos:
+            print(f"  {len(tempos)} printed tempo marks: "
+                  f"{sorted(set(tempos.values()))}", flush=True)
+    write_musicxml(grids, out, title=out.stem, rest_bars=rest_bars,
+                   meters=meters, tempos=tempos)
     apply_structure(work_dir, out, omr, hbars)
+    if USAGE["calls"]:
+        print(f"  cost: {usage_summary()}", flush=True)
     measures = len(ET.parse(out).getroot().find("part").findall("measure"))
     print(f"wrote {out} — {measures} measures")
 

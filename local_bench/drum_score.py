@@ -50,23 +50,62 @@ def canonical(name: str) -> str | None:
 
 
 def sound_sequence(path: Path) -> list[str]:
-    """Kit categories in playing order, one token per struck note."""
+    """Kit categories in TIME order, one token per struck note.
+
+    Document order is a voice-layout choice, not a musical one — Newzik
+    serializes hi-hat as its own voice (8 hi-hats, then the kicks), our
+    writer interleaves — and comparing document order made identical
+    bars look like different music. Walk the duration/backup cursor and
+    sort each measure by when notes actually sound.
+    """
     root = ET.parse(path).getroot()
     names = {s.get("id"): s.findtext("instrument-name") or ""
              for s in root.iter("score-instrument")}
     out = []
     for part in root.findall("part"):
         for measure in part.findall("measure"):
-            for note in measure.findall("note"):
-                if note.find("rest") is not None:
-                    continue
-                inst = note.find("instrument")
-                if inst is None:
-                    continue
-                cat = canonical(names.get(inst.get("id"), ""))
-                if cat:
-                    out.append(cat)
+            position = 0
+            sounded = []
+            for el in measure:
+                if el.tag == "backup":
+                    position -= int(el.findtext("duration") or 0)
+                elif el.tag == "forward":
+                    position += int(el.findtext("duration") or 0)
+                elif el.tag == "note":
+                    duration = int(el.findtext("duration") or 0)
+                    is_chord = el.find("chord") is not None
+                    at = position if not is_chord else position - duration
+                    if not is_chord:
+                        position += duration
+                    if el.find("rest") is not None:
+                        continue
+                    inst = el.find("instrument")
+                    if inst is None:
+                        continue
+                    cat = canonical(names.get(inst.get("id"), ""))
+                    if cat:
+                        sounded.append((at, cat))
+            out.extend(cat for _, cat in sorted(sounded))
     return out
+
+
+def last_sounding_measure(path: Path) -> int:
+    """1-based index of the last measure with a struck note.
+
+    Trailing silence is padding, not music — Newzik pads a part to the
+    full project length (Abba's ref ends with 124 empty measures), and
+    counting that tail penalizes a transcription that correctly ends
+    where the printed part ends.
+    """
+    root = ET.parse(path).getroot()
+    last = 0
+    for part in root.findall("part"):
+        for i, measure in enumerate(part.findall("measure"), 1):
+            for note in measure.findall("note"):
+                if note.find("rest") is None:
+                    last = max(last, i)
+                    break
+    return last
 
 
 def score(piece: str) -> dict | None:
@@ -77,8 +116,8 @@ def score(piece: str) -> dict | None:
         return None
     g, r = sound_sequence(grid), sound_sequence(ref)
     sim = SequenceMatcher(None, g, r, autojunk=False).ratio()
-    g_bars = len(ET.parse(grid).getroot().find("part").findall("measure"))
-    r_bars = len(ET.parse(ref).getroot().find("part").findall("measure"))
+    g_bars = last_sounding_measure(grid)
+    r_bars = last_sounding_measure(ref)
     from collections import Counter
     gc, rc = Counter(g), Counter(r)
     per_cat = {}

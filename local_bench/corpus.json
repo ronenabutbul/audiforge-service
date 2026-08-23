@@ -108,6 +108,14 @@
     {
       "name": "Beethoven Op18-1 - Violoncello (OSQ)",
       "group": "strings"
+    },
+    {
+      "name": "Abba Gold - Drum Set",
+      "group": "percussion"
+    },
+    {
+      "name": "Avihu Medina - Drum Set",
+      "group": "percussion"
     }
   ]
 }
