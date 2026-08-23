@@ -131,8 +131,16 @@ def _number_above(image, x: float, top: float) -> int | None:
 def anchor_spans(omr: Path, n_stacks: int) -> dict[int, int]:
     """Printed measure numbers as checksum: how many measures each
     printed bar stands for. Chain-filtered so junk OCR cannot enter."""
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
     from PIL import Image
-    bars = []
+
+    # Reading a number costs nine tesseract subprocesses, so a dense part
+    # (Aznavour: 311 printed bars) is ~2800 spawns. Serially that outlives
+    # the request; the probes are independent and release the GIL, so run
+    # them across cores.
+    probes: list[tuple[int, object, float, float]] = []
     ordinal = 0
     with zipfile.ZipFile(omr) as z:
         for sheet in _sheets(z):
@@ -146,12 +154,18 @@ def anchor_spans(omr: Path, n_stacks: int) -> dict[int, int]:
                         if staff is not None else None)
                 top = float(line.get("y")) if line is not None else None
                 for stack in system.findall("stack"):
-                    number = None
                     if top is not None:
-                        number = _number_above(
-                            image, float(stack.get("left")), top)
-                    bars.append((ordinal, number))
+                        probes.append(
+                            (ordinal, image, float(stack.get("left")), top))
                     ordinal += 1
+
+    workers = max(2, min(8, os.cpu_count() or 4))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        read = list(pool.map(
+            lambda task: (task[0], _number_above(task[1], task[2], task[3])),
+            probes))
+    numbers = dict(read)
+    bars = [(i, numbers.get(i)) for i in range(ordinal)]
     chain: list[tuple[int, int]] = []
     for index, number in bars:
         if number is None:

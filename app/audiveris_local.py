@@ -47,7 +47,9 @@ def transcribe(pdf: Path, work_dir: Path, timeout: int = 600) -> Path:
     env = {**os.environ, "TESSDATA_PREFIX": TESSDATA_DIR}
     with _lock:
         proc = subprocess.run(
-            [AUDIVERIS_BIN, "-batch", "-export",
+            # -swap releases each sheet after its step, which keeps a
+            # dense multi-page scan inside the container's memory
+            [AUDIVERIS_BIN, "-batch", "-export", "-swap",
              "-output", str(work_dir), str(pdf)],
             capture_output=True, text=True, timeout=timeout, env=env)
     log = (proc.stdout or "") + (proc.stderr or "")
