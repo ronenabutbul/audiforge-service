@@ -48,6 +48,29 @@ def _sheets(z: zipfile.ZipFile) -> list[str]:
         key=lambda s: int(s.split("#")[1]))
 
 
+def _signature_only(image, x0: float, x1: float, top: float, bottom: float,
+                    sig_right: float) -> bool:
+    """True when a stack holds a time signature and nothing else.
+
+    Audiveris splits the courtesy signature at a system end into its own
+    stack. It is not a bar — counting it inserts a measure and shifts every
+    number after it — and the page settles the question: past the signature
+    there is no ink but the staff lines.
+    """
+    import numpy as np
+
+    left = int(max(sig_right + 2, x0))
+    right = int(x1 - 2)
+    if right - left < 4:
+        return True
+    band = np.asarray(image.crop(
+        (left, int(top), right, int(bottom)))) < 128
+    if not band.size:
+        return True
+    # staff lines alone ink about one row in five; notes and rests far more
+    return float(band.mean()) < 0.10
+
+
 def stack_geometry(omr: Path) -> tuple[list[dict], dict[int, tuple[int, int]]]:
     """Every printed bar's page + normalized bounds + per-bar meter."""
     boxes = []
@@ -71,6 +94,7 @@ def stack_geometry(omr: Path) -> tuple[list[dict], dict[int, tuple[int, int]]]:
                         num, den = rational.split("/")
                         sigs.append({
                             "x": float(b.get("x")) + float(b.get("w")) / 2,
+                            "right": float(b.get("x")) + float(b.get("w")),
                             "y": float(b.get("y")) + float(b.get("h")) / 2,
                             "meter": (int(num), int(den))})
             for system in root.iter("system"):
@@ -90,6 +114,7 @@ def stack_geometry(omr: Path) -> tuple[list[dict], dict[int, tuple[int, int]]]:
                     if pending_sig is not None:
                         meter = pending_sig
                         pending_sig = None
+                    fragment = False
                     for sig in sigs:
                         if not (top - 2 * interline <= sig["y"]
                                 <= bottom + 2 * interline):
@@ -98,8 +123,14 @@ def stack_geometry(omr: Path) -> tuple[list[dict], dict[int, tuple[int, int]]]:
                             if (si == len(stacks) - 1
                                     and sig["x"] > x0 + 0.85 * (x1 - x0)):
                                 pending_sig = sig["meter"]
+                            elif _signature_only(image, x0, x1, top, bottom,
+                                                 sig["right"]):
+                                pending_sig = sig["meter"]
+                                fragment = True
                             else:
                                 meter = sig["meter"]
+                    if fragment:
+                        continue
                     boxes.append({
                         "page": page_index + 1,
                         "left": x0 / width,

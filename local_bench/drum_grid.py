@@ -247,6 +247,29 @@ class BarGrid(BaseModel):
     dynamic: str | None = None
 
 
+def _signature_only(image, x0: float, x1: float, top: float, bottom: float,
+                    sig_right: float) -> bool:
+    """True when a stack holds a time signature and nothing else.
+
+    Audiveris splits the courtesy signature at a system end into its own
+    stack. It is not a bar — counting it inserts a measure and shifts every
+    number after it — and the page settles the question: past the signature
+    there is no ink but the staff lines.
+    """
+    import numpy as np
+
+    left = int(max(sig_right + 2, x0))
+    right = int(x1 - 2)
+    if right - left < 4:
+        return True
+    band = np.asarray(image.crop(
+        (left, int(top), right, int(bottom)))) < 128
+    if not band.size:
+        return True
+    # staff lines alone ink about one row in five; notes and rests far more
+    return float(band.mean()) < 0.10
+
+
 def bar_crops(omr_path: Path) -> list[dict]:
     """Per printed bar: PNG crop + time signature context."""
     from PIL import Image
@@ -275,6 +298,7 @@ def bar_crops(omr_path: Path) -> list[dict]:
                         num, den = rational.split("/")
                         sigs.append({
                             "x": float(b.get("x")) + float(b.get("w")) / 2,
+                            "right": float(b.get("x")) + float(b.get("w")),
                             "y": float(b.get("y")) + float(b.get("h")) / 2,
                             "meter": (int(num), int(den)),
                         })
@@ -294,6 +318,7 @@ def bar_crops(omr_path: Path) -> list[dict]:
                     if pending_sig is not None:
                         meter = pending_sig
                         pending_sig = None
+                    fragment = False
                     for sig in sigs:
                         if not (top - 2 * interline <= sig["y"]
                                 <= bottom + 2 * interline):
@@ -302,8 +327,16 @@ def bar_crops(omr_path: Path) -> list[dict]:
                             if (si == len(stacks) - 1
                                     and sig["x"] > x0 + 0.85 * (x1 - x0)):
                                 pending_sig = sig["meter"]
+                            elif _signature_only(image, x0, x1, top, bottom,
+                                                 sig["right"]):
+                                # a courtesy signature standing alone: its
+                                # meter belongs to the next real bar
+                                pending_sig = sig["meter"]
+                                fragment = True
                             else:
                                 meter = sig["meter"]
+                    if fragment:
+                        continue
                     # Tight vertical framing: the staff should dominate the
                     # crop, so vertical position is easy to judge.
                     y0 = max(int(top - interline * 4.2), 0)
@@ -1256,6 +1289,144 @@ def spans_from_readings(readings: list["BarReading"]) -> dict[int, int]:
     return spans
 
 
+# Terms a chart actually prints. Audiveris reads them off scans well enough
+# to recognise but not always to spell ("Gym." for "Cym.", "Lar hetto"), and
+# a wrong word on the page is worse than none.
+_TERMS = [
+    "Allegro", "Allegretto", "Andante", "Moderato", "Largo", "Larghetto",
+    "Adagio", "Vivace", "Presto", "a tempo", "rit.", "ritard.", "rall.",
+    "accel.", "Fine", "Solo", "Tacet", "Swing", "Rock", "Samba", "Cha cha",
+    "Cym.", "Hi-hat", "Hit hat", "Ride", "Cup", "Bell", "Sticks", "Brushes",
+    "Snare", "Toms", "Bass drum", "Fill", "Cue", "Vamp", "Open", "Choke",
+]
+
+
+def _known_term(text: str) -> str | None:
+    """Keep an instruction only when the page plausibly printed it."""
+    from difflib import SequenceMatcher
+
+    cleaned = " ".join(text.split()).strip(" .,:;-")
+    if len(cleaned) < 2 or not any(c.isalpha() for c in cleaned):
+        return None
+    for term in _TERMS:
+        if cleaned.lower() == term.lower().strip("."):
+            return term
+    best, score = None, 0.0
+    for term in _TERMS:
+        ratio = SequenceMatcher(None, cleaned.lower(),
+                                term.lower(), autojunk=False).ratio()
+        if ratio > score:
+            best, score = term, ratio
+    # close enough to be that word misread; otherwise it is not a term we
+    # can vouch for, and guessing would print something the page never said
+    if best is not None and score >= 0.75:
+        return best
+    return None
+
+
+def place_words(omr_path: Path, out: Path, crops: list[dict],
+                rest_bars: dict[int, int]) -> int:
+    """Put the page's words back on the score: Allegro, Cym., Hit hat,
+    Larghetto, a tempo, rit.
+
+    The grid writer knows only strikes, so every printed instruction was
+    being dropped. Audiveris already read them; each sentence's pixel
+    position picks the bar it sits over, exactly as rehearsal letters are
+    placed.
+    """
+    import zipfile as _zipfile
+
+    # measure number of each crop, once multirests are expanded
+    measure_of: dict[int, int] = {}
+    measure = 1
+    for i, crop in enumerate(crops):
+        measure_of[crop["stack"]] = measure
+        measure += rest_bars.get(i, 1)
+
+    found: list[tuple[int, str]] = []  # (stack ordinal, text)
+    stack_ordinal = 0
+    with _zipfile.ZipFile(omr_path) as z:
+        sheets = sorted(
+            {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+            key=lambda s: int(s.split("#")[1]))
+        for sheet in sheets:
+            root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml")
+                                 .decode("utf-8", "replace"))
+            words = []
+            for word in root.iter("word"):
+                b = word.find("bounds")
+                value = (word.get("value") or "").strip()
+                if b is None or not value:
+                    continue
+                words.append({
+                    "x": float(b.get("x")), "y": float(b.get("y")),
+                    "w": float(b.get("w")), "h": float(b.get("h")),
+                    "value": value})
+            sentences = []
+            for sentence in root.iter("sentence"):
+                b = sentence.find("bounds")
+                # Titles and composer credits belong to the header, and a
+                # bare number is the printed bar number, not an instruction.
+                if b is None or sentence.get("role") == "CreatorLyricist":
+                    continue
+                sx, sy = float(b.get("x")), float(b.get("y"))
+                sw, sh = float(b.get("w")), float(b.get("h"))
+                inside = sorted(
+                    (w for w in words
+                     if sx - 4 <= w["x"] <= sx + sw + 4
+                     and sy - 4 <= w["y"] <= sy + sh + 4),
+                    key=lambda w: w["x"])
+                # A printed bar number often shares a sentence with the
+                # instruction beside it ("42 Allegretto").
+                tokens = [w["value"] for w in inside
+                          if not w["value"].strip(".").isdigit()]
+                text = _known_term(" ".join(tokens).strip())
+                if not text:
+                    continue
+                sentences.append((sx + sw / 2, sy, text))
+
+            for system in root.iter("system"):
+                staff = system.find(".//staff")
+                line = (staff.find("lines/line/point")
+                        if staff is not None else None)
+                top = float(line.get("y")) if line is not None else None
+                stacks = system.findall("stack")
+                starts = [float(s.get("left")) for s in stacks]
+                for cx, sy, text in sentences:
+                    if top is None or not (top - 220 < sy < top):
+                        continue  # belongs to another system
+                    if not starts:
+                        continue
+                    si = min(range(len(starts)),
+                             key=lambda i: abs(starts[i] - cx))
+                    found.append((stack_ordinal + si, text))
+                stack_ordinal += len(stacks)
+
+    if not found:
+        return 0
+    tree = ET.parse(out)
+    part = tree.getroot().find("part")
+    by_number = {m.get("number"): m for m in part.findall("measure")}
+    placed = 0
+    seen: set[tuple[int, str]] = set()
+    for stack, text in found:
+        number = measure_of.get(stack)
+        if number is None or (number, text) in seen:
+            continue
+        measure = by_number.get(str(number))
+        if measure is None:
+            continue
+        seen.add((number, text))
+        direction = ET.Element("direction", placement="above")
+        dtype = ET.SubElement(direction, "direction-type")
+        ET.SubElement(dtype, "words").text = text
+        measure.insert(0, direction)
+        placed += 1
+    if placed:
+        tree.write(out, encoding="UTF-8", xml_declaration=True)
+    return placed
+
+
 def apply_structure(work_dir: Path, out: Path, omr: Path,
                     hbars: list[dict]) -> None:
     """Give the drum score the same structure the melodic pipeline builds:
@@ -1422,6 +1593,10 @@ def main():
     write_musicxml(grids, out, title=out.stem, rest_bars=rest_bars,
                    meters=meters, tempos=tempos)
     apply_structure(work_dir, out, omr, hbars)
+    words = place_words(omr, out, crops, rest_bars)
+    if words:
+        print(f"  {words} printed instructions placed (Allegro, Cym., …)",
+              flush=True)
     if USAGE["calls"]:
         print(f"  cost: {usage_summary()}", flush=True)
     measures = len(ET.parse(out).getroot().find("part").findall("measure"))
