@@ -80,7 +80,8 @@ def stack_geometry(omr: Path) -> tuple[list[dict], dict[int, tuple[int, int]]]:
     with zipfile.ZipFile(omr) as z:
         from PIL import Image
         for page_index, sheet in enumerate(_sheets(z)):
-            with Image.open(io.BytesIO(z.read(f"{sheet}/BINARY.png"))) as im:
+            page_png = z.read(f"{sheet}/BINARY.png")
+            with Image.open(io.BytesIO(page_png)) as im:
                 page_sizes[page_index] = im.size
             width, height = page_sizes[page_index]
             root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml")
@@ -97,6 +98,13 @@ def stack_geometry(omr: Path) -> tuple[list[dict], dict[int, tuple[int, int]]]:
                             "right": float(b.get("x")) + float(b.get("w")),
                             "y": float(b.get("y")) + float(b.get("h")) / 2,
                             "meter": (int(num), int(den))})
+            # Telling a courtesy signature from a real bar means reading the
+            # page's ink, so the image is decoded only when there is a
+            # signature to judge — most pages never need it.
+            image = None
+            if sigs:
+                with Image.open(io.BytesIO(page_png)) as im:
+                    image = im.copy()
             for system in root.iter("system"):
                 staff = system.find(".//staff")
                 lines = (staff.findall("lines/line")
