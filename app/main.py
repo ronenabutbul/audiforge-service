@@ -24,7 +24,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pdf2image import convert_from_path
 
-from app import audiveris_local, postprocess
+from app import audiveris_local, postprocess, resource_usage
 from app.transpose import apply_transpose
 
 logging.basicConfig(level=logging.INFO)
@@ -367,6 +367,12 @@ def _repair_structure(job_id: str, job_dir: Path, result: Path,
 
 def _process_job(job_id: str, source: Path):
     job_dir = source.parent
+    # The instruments pipeline is the expensive one - two engines over every
+    # page - and it was the one with no measurement at all. The meter closes
+    # in the `finally`, so a failed job reports what it burned before it
+    # failed rather than nothing.
+    meter = resource_usage.Meter()
+    meter.__enter__()
     try:
         _update_job(job_id, status="processing", progress=0.05)
 
@@ -471,6 +477,12 @@ def _process_job(job_id: str, source: Path):
     except Exception as exc:
         logger.exception("job %s failed", job_id)
         _update_job(job_id, status="failed", error=str(exc))
+    finally:
+        meter.__exit__(None, None, None)
+        _update_job(job_id, resources=meter.as_dict())
+        logger.info("job %s: %.1fs cpu, %.1fs wall, %.0fMB peak", job_id,
+                    meter.cpu_seconds, meter.wall_seconds,
+                    meter.peak_memory_mb)
 
 
 @app.post("/analyze-structure")
@@ -483,7 +495,7 @@ def analyze_structure(file: UploadFile = File(...)):
       one_line    - single-line percussion part (not supported yet)
       unreadable  - no readable music found (bad scan / handwriting)
     """
-    from app import audiveris_local, livesheet
+    from app import audiveris_local, livesheet, resource_usage
 
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "PDF required")
@@ -492,15 +504,27 @@ def analyze_structure(file: UploadFile = File(...)):
     try:
         pdf = job_dir / "input.pdf"
         pdf.write_bytes(file.file.read())
-        try:
-            omr = audiveris_local.transcribe(pdf, job_dir)
-        except audiveris_local.PageUnreadable as exc:
-            return {"success": False,
-                    "reason": "one_line" if exc.one_line else "unreadable",
-                    "error": str(exc)}
-        except audiveris_local.AudiverisUnavailable as exc:
-            raise HTTPException(503, str(exc))
-        return livesheet.analyze(omr, job_dir)
+        # Measured, not estimated. The caller prices the conversion from
+        # this; without it the only number it had was the vision model's
+        # spend, which on a run that calls no model reads as free.
+        result: dict
+        with resource_usage.Meter() as meter:
+            try:
+                omr = audiveris_local.transcribe(pdf, job_dir)
+                result = livesheet.analyze(omr, job_dir)
+            except audiveris_local.PageUnreadable as exc:
+                result = {"success": False,
+                          "reason": "one_line" if exc.one_line else "unreadable",
+                          "error": str(exc)}
+            except audiveris_local.AudiverisUnavailable as exc:
+                raise HTTPException(503, str(exc))
+        # Read after the meter closes. A `return` inside the block evaluates
+        # its expression before __exit__ runs, and reports zeros. A decline
+        # is metered too: Audiveris has already read the page by the time it
+        # decides the page is unreadable, and that CPU is billed.
+        if isinstance(result, dict):
+            result["resources"] = meter.as_dict()
+        return result
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
 
