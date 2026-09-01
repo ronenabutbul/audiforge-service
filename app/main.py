@@ -24,7 +24,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pdf2image import convert_from_path
 
-from app import audiveris_client, audiveris_local, postprocess
+from app import audiveris_local, postprocess
 from app.transpose import apply_transpose
 
 logging.basicConfig(level=logging.INFO)
@@ -380,10 +380,16 @@ def _process_job(job_id: str, source: Path):
         aud_path: Path | None = None
         if source.suffix.lower() == ".pdf":
             _update_job(job_id, progress=0.75)
-            aud_path = audiveris_local.convert_musicxml(
-                source, job_dir / "audiveris.musicxml"
-            ) if audiveris_local.available() else audiveris_client.convert(
-                source, job_dir / "audiveris.musicxml")
+            # Local only. The remote service returned MusicXML without the
+            # .omr, so _repair_structure below had nothing to read and the
+            # fusion graft lost its source of text and voltas. A half-run is
+            # worse than a missing half: better to let homr stand alone.
+            if audiveris_local.available():
+                aud_path = audiveris_local.convert_musicxml(
+                    source, job_dir / "audiveris.musicxml")
+            else:
+                logger.warning("job %s: no local Audiveris; homr runs alone "
+                               "and structure repair is skipped", job_id)
 
         engine, winner, scores = _select_engine({"homr": homr_path, "audiveris": aud_path})
         _update_job(job_id, engine=engine, engine_scores=scores)
