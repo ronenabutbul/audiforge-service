@@ -29,6 +29,25 @@ _STEP_SEMITONES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 FUSION_DIRECTION_TAGS = ("dynamics", "wedge", "words", "metronome", "rehearsal",
                          "segno", "coda")
 
+# Measured over the bench corpus: real vocal parts carry syllables on
+# 67-77% of their measures, every instrumental part on 14% or less (one
+# outlier at 33%). The classes do not overlap, so the midpoint is safe.
+LYRIC_COVERAGE_MIN = 0.5
+
+# Coverage is a ratio, so it weakens on a short input: a truncated 8-bar
+# Audiveris fragment carrying 4 bars of footer text reads as 50%. A sung
+# line also runs under consecutive bars (21 and 22 in the corpus), which
+# furniture in a fragment cannot. Kept far below those two so a vocal part
+# Audiveris read patchily still qualifies. Run length is a second lock,
+# never a replacement: the corpus's worst offender (a percussion part with
+# 182 OCR'd syllables) has the longest run of any score, 24.
+LYRIC_RUN_MIN = 4
+
+# The two time symbols that state something about the printed page. The
+# rest of the MusicXML vocabulary ("normal", "single-number", note glyphs)
+# is engraver preference, not a reading of the source.
+PAGE_TIME_SYMBOLS = ("common", "cut")
+
 
 def _pitch_key(note) -> str | None:
     p = note.find("pitch")
@@ -274,11 +293,39 @@ def graft_rehearsals_by_number(base_measures, sec_measures,
     return grafted
 
 
+def lyric_coverage(measures) -> float:
+    """Fraction of measures carrying at least one syllable."""
+    if len(measures) == 0:
+        return 0.0
+    return sum(1 for m in measures
+               if m.find(".//lyric") is not None) / len(measures)
+
+
+def lyric_run(measures) -> int:
+    """Longest stretch of consecutive measures carrying a syllable."""
+    best = run = 0
+    for measure in measures:
+        run = run + 1 if measure.find(".//lyric") is not None else 0
+        best = max(best, run)
+    return best
+
+
 def graft_lyrics_by_number(base_measures, sec_measures,
                            sec_numbers=None) -> int:
     """Vocal charts route to homr for note quality, but homr never reads
     lyrics. Copy each measure's syllables from the secondary engine onto the
-    base measure's notes in order, keyed by printed measure number."""
+    base measure's notes in order, keyed by printed measure number.
+
+    Only when the secondary engine actually read a lyric line. Page
+    furniture - a publisher imprint, a copyright line - lands in Audiveris
+    output as <lyric> too, and grafting that typesets the bottom of the
+    page into the middle of the score. A sung line runs under most of the
+    music; furniture sits on a handful of measures at one page edge, so
+    coverage separates them. Neither engine can be trusted to say which
+    part is vocal: both label a clarinet part "Voice"."""
+    if (lyric_coverage(sec_measures) < LYRIC_COVERAGE_MIN
+            or lyric_run(sec_measures) < LYRIC_RUN_MIN):
+        return 0
     base_numbers = _printed_numbers(base_measures)
     if sec_numbers is None:
         sec_numbers = _printed_numbers(sec_measures)
@@ -324,6 +371,217 @@ def graft_numbered(base_path: Path, secondary_path: Path,
     return grafted
 
 
+# Words worth keeping when Audiveris hands us text. Only single short
+# tokens are ever repaired against this, and only by one character: a
+# metronome mark, a cue ("W.W./Glockenspiel") or a song title in quotes is
+# left exactly as read.
+SCORE_TERMS = (
+    "rit.", "rall.", "accel.", "cresc.", "decresc.", "dim.", "a tempo", "Fine",
+    "Coda", "To Coda", "al Coda", "D.S.", "D.C.", "tutti", "solo", "Soli",
+    "dolce", "legato", "stacc.", "simile", "sim.", "Attacca", "poco", "molto",
+    "più", "meno", "mosso", "Allegro", "Allegretto", "Andante", "Adagio",
+    "Moderato", "Largo", "Lento", "Presto", "Vivace", "Maestoso", "Grave",
+    "espress.", "marcato", "ten.", "sfz", "subito", "sempre", "Tempo I",
+    "Swing", "Latin", "Rock", "Ballad")
+
+# Systematic OCR confusions seen on the bench: the "ri" ligature reads as
+# "n", and a double l as two capital I's.
+OCR_CONFUSIONS = {"nt.": "rit.", "raII.": "rall.", "raIl.": "rall.",
+                  "pidff": "più f", "piuf": "più f"}
+
+
+def _one_edit_apart(a: str, b: str) -> bool:
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) == 1
+    short, long_ = (a, b) if len(a) < len(b) else (b, a)
+    return any(long_[:i] + long_[i + 1:] == short for i in range(len(long_)))
+
+
+def clean_word(text: str) -> str | None:
+    """What a <words> reading should say, or None when it is OCR debris.
+
+    Audiveris emits everything its OCR saw as a direction, and on a scan
+    that includes hairpins read as ":-:=-", slash patterns as "+°+o", and
+    a torn "rit." as "nt.". Debris is recognised by shape - mostly
+    symbols, no letters, one repeated letter, a lone character - and a
+    short single token one slip away from a standard term is repaired to
+    it. Everything else is kept as read; the bench corpus showed a
+    vocabulary whitelist would throw away cue text and titles.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    letters = sum(c.isalpha() for c in t)
+    digits = sum(c.isdigit() for c in t)
+    symbols = sum(1 for c in t
+                  if not c.isalnum() and not c.isspace()
+                  and c not in ".,'\u2019\"\u201c\u201d()-/:=")
+    if letters + digits == 0 or symbols / len(t) > 0.3:
+        return None
+    if len(t) == 1 and not t.isdigit():
+        return None
+    if letters >= 3 and len(set(t.lower())) == 1:
+        return None
+    if " " in t or digits or len(t) > 6:
+        return t
+    if t in OCR_CONFUSIONS:
+        return OCR_CONFUSIONS[t]
+    lowered = t.lower()
+    for term in SCORE_TERMS:
+        if lowered == term.lower():
+            return t
+    for term in SCORE_TERMS:
+        if _one_edit_apart(lowered, term.lower()):
+            return term
+    vowels = set("aeiouy")
+    if letters >= 2 and "." not in t and not (set(lowered) & vowels):
+        return None
+    return t
+
+
+def clean_words(result_path: Path) -> tuple[int, int]:
+    """Apply clean_word to every <words> in the file. Returns (repaired,
+    dropped). A direction left with no direction-type is removed."""
+    tree = ET.parse(result_path)
+    repaired = dropped = 0
+    for measure in tree.getroot().iter("measure"):
+        for direction in list(measure.findall("direction")):
+            for dtype in list(direction.findall("direction-type")):
+                for words in list(dtype.findall("words")):
+                    cleaned = clean_word(words.text)
+                    if cleaned is None:
+                        dtype.remove(words)
+                        dropped += 1
+                    elif cleaned != (words.text or "").strip():
+                        words.text = cleaned
+                        repaired += 1
+                if len(dtype) == 0:
+                    direction.remove(dtype)
+            if direction.find("direction-type") is None:
+                measure.remove(direction)
+    if repaired or dropped:
+        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    return repaired, dropped
+
+
+def graft_missing_measures(base_path: Path, secondary_path: Path) -> int:
+    """Put back a bar the base engine skipped, from the secondary's read.
+
+    homr can drop a printed bar outright - a single sparse bar of a note
+    and rests between two busy ones - and every bar after it then sits
+    one early. When the secondary engine has a bar that aligns to nothing
+    in the base, with aligned bars on both sides of it, that bar is on
+    the page and missing here, and it goes right after the base bar its
+    predecessor aligned to. Not by printed number: the secondary's
+    measures do not always map one-to-one onto the page's bars, and a
+    number one off puts the bar on the wrong side of its neighbour.
+    Only short runs are trusted: a long unaligned stretch is the two
+    engines disagreeing, not one of them skipping. Returns inserted."""
+    base = ET.parse(base_path)
+    part = base.getroot().find("part")
+    base_measures = part.findall("measure")
+    sec_measures = ET.parse(secondary_path).getroot().find("part").findall("measure")
+    ops = _best_alignment(base_measures, sec_measures).get_opcodes()
+    aligned_op = lambda op: op[0] == "equal" or (op[0] == "replace" and op[2] - op[1] == op[4] - op[3])
+
+    inserts = []  # (base index to insert at, secondary indices)
+    for k, (tag, i1, i2, j1, j2) in enumerate(ops):
+        if tag != "insert" or j2 - j1 > 2:
+            continue
+        if not (k > 0 and aligned_op(ops[k - 1]) and k + 1 < len(ops) and aligned_op(ops[k + 1])):
+            continue
+        inserts.append((i1, list(range(j1, j2))))
+
+    inserted = 0
+    for at, js in sorted(inserts, reverse=True):
+        index = (list(part).index(base_measures[at]) if at < len(base_measures)
+                 else len(list(part)))
+        for offset, j in enumerate(js):
+            copy_ = copy.deepcopy(sec_measures[j])
+            # The bar's notes are the reading; its attributes belong to the
+            # secondary engine's own header and are not carried.
+            for attrs in copy_.findall("attributes"):
+                copy_.remove(attrs)
+            part.insert(index + offset, copy_)
+            inserted += 1
+
+    if inserted:
+        for number, m in enumerate(part.findall("measure"), start=1):
+            m.set("number", str(number))
+        base.write(base_path, encoding="UTF-8", xml_declaration=True)
+    return inserted
+
+
+def graft_time_symbol(base_path: Path, secondary_path: Path) -> int:
+    """Copy the C / cut-C time symbol from the secondary engine.
+
+    homr always writes a numeric time signature; Audiveris reads whether
+    the page printed 4/4 or C, 2/2 or cut time. Only the symbol travels,
+    and only onto a signature whose beats already agree, so no duration
+    changes. Returns the number of <time> elements stamped."""
+    secondary = ET.parse(secondary_path).getroot()
+    symbols = {}
+    for time in secondary.iter("time"):
+        symbol = time.get("symbol")
+        if symbol in PAGE_TIME_SYMBOLS:
+            symbols.setdefault(
+                (time.findtext("beats"), time.findtext("beat-type")), symbol)
+    if not symbols:
+        return 0
+
+    base = ET.parse(base_path)
+    stamped = 0
+    for time in base.getroot().iter("time"):
+        if time.get("symbol"):
+            continue
+        symbol = symbols.get(
+            (time.findtext("beats"), time.findtext("beat-type")))
+        if symbol:
+            time.set("symbol", symbol)
+            stamped += 1
+    if stamped:
+        base.write(base_path, encoding="UTF-8", xml_declaration=True)
+    return stamped
+
+
+def _spelling_agnostic(signature: tuple) -> tuple:
+    """A signature compared on step and octave, with the accidental dropped."""
+    return tuple((step, octave) for step, _, octave in signature)
+
+
+def _best_alignment(base_measures, sec_measures) -> SequenceMatcher:
+    """Align the two readings on whichever spelling agrees better.
+
+    The engines disagree about accidentals in a way that is not a musical
+    disagreement: homr writes <alter>1</alter> on every F of a G-major part
+    while Audiveris leaves the sharp to the key signature, so in a sharp key
+    every F fails to match and the alignment collapses. Resolving against the
+    key signature does not rescue it either - both engines flip the printed
+    key mid-piece (homr claimed four flats on a chart in G).
+
+    So try both spellings and keep whichever aligns more measures. Dropping
+    the accidental everywhere is not the answer on its own: it costs
+    information, and on a score where the engines DO agree about accidentals
+    the looser signature finds spurious matches and picks a worse alignment
+    (one vocal part measured 78% strict against 41% loose).
+    """
+    strict = ([measure_signature(m) for m in base_measures],
+              [measure_signature(m) for m in sec_measures])
+    loose = ([_spelling_agnostic(s) for s in strict[0]],
+             [_spelling_agnostic(s) for s in strict[1]])
+
+    best = None
+    for base_sigs, sec_sigs in (strict, loose):
+        matcher = SequenceMatcher(None, base_sigs, sec_sigs, autojunk=False)
+        score = sum(i2 - i1 for op, i1, i2, j1, j2 in matcher.get_opcodes()
+                    if op == "equal" or (op == "replace" and i2 - i1 == j2 - j1))
+        if best is None or score > best[0]:
+            best = (score, matcher)
+    return best[1]
+
+
 def graft_features(base_path: Path, secondary_path: Path) -> tuple[int, int]:
     """Graft directions and repeat/ending barlines from the secondary engine
     into the base file in place. Measures align by pitch signature; equal
@@ -333,12 +591,7 @@ def graft_features(base_path: Path, secondary_path: Path) -> tuple[int, int]:
     sec_measures = ET.parse(secondary_path).getroot().find("part").findall(
         "measure")
 
-    matcher = SequenceMatcher(
-        None,
-        [measure_signature(m) for m in base_measures],
-        [measure_signature(m) for m in sec_measures],
-        autojunk=False,
-    )
+    matcher = _best_alignment(base_measures, sec_measures)
     aligned = grafted = 0
     for op, i1, i2, j1, j2 in matcher.get_opcodes():
         if not (op == "equal" or (op == "replace" and i2 - i1 == j2 - j1)):
