@@ -808,25 +808,20 @@ def _omr_rehearsal_marks(omr_path: Path) -> list[tuple[int, int, int, str]]:
     return marks
 
 
-def place_rehearsals(omr_path: Path, result_path: Path, hbars: list[dict],
-                     extra_marks: list[tuple[int, int, int, str]] = ()) -> int:
-    """Authoritative rehearsal-letter placement: each mark's pixel position
-    falls in a printed bar, and the verified multirest numbering turns
-    that into a printed measure number. Replaces any previously grafted
-    rehearsal directions.
+def _place_marks(omr_path: Path, result_path: Path, hbars: list[dict],
+                 marks: list[tuple[int, int, int, str]], make_direction,
+                 replaces) -> int:
+    """Put page marks into the score by the printed bar they sit over.
 
-    Marks come from Audiveris's own recognition plus `extra_marks` in the
-    same (sheet, x, y, value) shape - the circled letters it never reads.
-    Values that are not a letter are dropped. A mark inside a stack the
-    engine merged with its neighbour is assigned to the printed bar it
-    actually sits over, counted off the interior barlines."""
-    marks = [m for m in list(_omr_rehearsal_marks(omr_path)) + list(extra_marks)
-             if _REHEARSAL_VALUE.match(m[3])]
+    `marks` are (sheet ordinal, x, y, value); `make_direction(value)`
+    builds the <direction> to insert; `replaces(direction)` says which
+    existing directions are earlier placements of the same kind and
+    must go first. A mark inside a stack the engine merged with its
+    neighbour is assigned to the printed bar it actually sits over,
+    counted off the interior barlines. Returns marks placed."""
     if not marks:
         return 0
-    # Audiveris and the image detector can both see the same letter. Same
-    # sheet and same place - letters on different systems share an x all
-    # the time, every system starts at the same margin.
+    # Two readers can see the same mark: same sheet and same place.
     deduped = []
     for m in marks:
         if any(d[0] == m[0] and abs(d[1] - m[1]) < 40 and abs(d[2] - m[2]) < 40
@@ -837,8 +832,7 @@ def place_rehearsals(omr_path: Path, result_path: Path, hbars: list[dict],
 
     numbers = stack_numbers(omr_path, hbars)
     by_stack = {h["stack"]: h for h in hbars}
-    letters = []  # (printed measure number, value)
-    sheet_of = {}
+    placed_at = []  # (printed measure number, value)
     with zipfile.ZipFile(omr_path) as z:
         sheets = sorted(
             {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
@@ -848,6 +842,7 @@ def place_rehearsals(omr_path: Path, result_path: Path, hbars: list[dict],
     ordinal = 0
     with zipfile.ZipFile(omr_path) as z:
         import io
+        import statistics
 
         import numpy as np
         from PIL import Image
@@ -875,13 +870,10 @@ def place_rehearsals(omr_path: Path, result_path: Path, hbars: list[dict],
                     # Not this system's if it lies beyond either end: a
                     # coda fragment engraved beside the main system shares
                     # its row, and would otherwise claim the main system's
-                    # letters for its own first bar.
+                    # marks for its own first bar.
                     if (not bounds or mx > bounds[-1][1] + 2 * il
                             or mx < bounds[0][0] - 2 * il):
                         continue
-                    # The printed bar boundaries of this system: stack
-                    # edges plus any barline the engine merged over.
-                    import statistics
                     row_median = statistics.median(sx1 - sx0 for sx0, sx1 in bounds)
                     boundaries = []  # (x, stack index, bar index within stack)
                     for si, (sx0, sx1) in enumerate(bounds):
@@ -898,10 +890,10 @@ def place_rehearsals(omr_path: Path, result_path: Path, hbars: list[dict],
                     if k:
                         h = by_stack.get(stack_idx)
                         number += (h["count"] + k - 1) if h else k
-                    letters.append((number, value))
+                    placed_at.append((number, value))
                 ordinal += len(stacks)
 
-    if not letters:
+    if not placed_at:
         return 0
     tree = ET.parse(result_path)
     part = tree.getroot().find("part")
@@ -915,28 +907,116 @@ def place_rehearsals(omr_path: Path, result_path: Path, hbars: list[dict],
     for i, n in enumerate(base_numbers):
         base_by_number.setdefault(n, i)
 
-    for measure in measures:  # drop previously grafted letters
+    for measure in measures:  # drop earlier placements of this kind
         for d in list(measure.findall("direction")):
-            if any(dt.find("rehearsal") is not None
-                   for dt in d.findall("direction-type")):
+            if replaces(d):
                 measure.remove(d)
     placed = 0
-    for number, value in letters:
+    for number, value in placed_at:
         bi = base_by_number.get(number)
         if bi is None:
             continue
-        direction = ET.Element("direction", placement="above")
-        dtype = ET.SubElement(direction, "direction-type")
-        ET.SubElement(dtype, "rehearsal").text = value
-        measures[bi].insert(0, direction)
+        measures[bi].insert(0, make_direction(value))
         placed += 1
     if placed:
         tree.write(result_path, encoding="UTF-8", xml_declaration=True)
     return placed
 
 
-if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        sys.exit(__doc__)
-    u, i = fix(Path(sys.argv[1]), Path(sys.argv[2]))
-    print(f"{u} counts updated, {i} groups inserted")
+def place_rehearsals(omr_path: Path, result_path: Path, hbars: list[dict],
+                     extra_marks: list[tuple[int, int, int, str]] = ()) -> int:
+    """Authoritative rehearsal-letter placement: each mark's pixel position
+    falls in a printed bar, and the verified multirest numbering turns
+    that into a printed measure number. Replaces any previously grafted
+    rehearsal directions.
+
+    Marks come from Audiveris's own recognition plus `extra_marks` in the
+    same (sheet, x, y, value) shape - the circled letters it never reads.
+    Values that are not a letter are dropped."""
+    marks = [m for m in list(_omr_rehearsal_marks(omr_path)) + list(extra_marks)
+             if _REHEARSAL_VALUE.match(m[3])]
+
+    def make(value):
+        direction = ET.Element("direction", placement="above")
+        dtype = ET.SubElement(direction, "direction-type")
+        ET.SubElement(dtype, "rehearsal").text = value
+        return direction
+
+    def replaces(direction):
+        return any(dt.find("rehearsal") is not None
+                   for dt in direction.findall("direction-type"))
+
+    return _place_marks(omr_path, result_path, hbars, marks, make, replaces)
+
+
+# A coda sign is a ring with a cross through it, and the cross's arms span
+# the whole inner diameter in both directions. Audiveris files circled
+# letters and circled bar numbers as CODA too; a letter's strokes never
+# reach across the ring. Measured: every real sign scores 1.00 on both
+# axes, every letter or number at most 0.90 on one.
+CODA_ARM_MIN = 0.95
+SEGNO_GRADE_MIN = 0.5
+
+
+def _omr_sign_marks(omr_path: Path) -> list[tuple[int, int, int, str]]:
+    """(sheet ordinal, x, y, "coda"|"segno") for the signs Audiveris
+    recognised in the project file and never exported."""
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    marks = []
+    with zipfile.ZipFile(omr_path) as z:
+        sheets = sorted(
+            {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+            key=lambda s: int(s.split("#")[1]))
+        for sheet_index, sheet in enumerate(sheets):
+            root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml")
+                                 .decode("utf-8", "replace"))
+            pixels = None
+            for marker in root.iter("marker"):
+                shape = marker.get("shape")
+                bounds = marker.find("bounds")
+                if shape not in ("CODA", "SEGNO") or bounds is None:
+                    continue
+                x, y, w, h = (int(float(bounds.get(k))) for k in ("x", "y", "w", "h"))
+                cx, cy = x + w // 2, y + h // 2
+                if shape == "SEGNO":
+                    if float(marker.get("grade") or 0) >= SEGNO_GRADE_MIN:
+                        marks.append((sheet_index, cx, cy, "segno"))
+                    continue
+                if pixels is None:
+                    pixels = np.asarray(Image.open(io.BytesIO(
+                        z.read(f"{sheet}/BINARY.png"))).convert("L")) < 128
+                rx, ry = int(w * 0.35), int(h * 0.35)
+                band = int(min(w, h) * 0.15)
+                if rx < 2 or ry < 2:
+                    continue
+                best_row = max(pixels[r, cx - rx:cx + rx].mean()
+                               for r in range(cy - band, cy + band + 1))
+                best_col = max(pixels[cy - ry:cy + ry, c].mean()
+                               for c in range(cx - band, cx + band + 1))
+                if best_row >= CODA_ARM_MIN and best_col >= CODA_ARM_MIN:
+                    marks.append((sheet_index, cx, cy, "coda"))
+    return marks
+
+
+def place_signs(omr_path: Path, result_path: Path, hbars: list[dict]) -> int:
+    """Put the coda and segno signs on the bars they are printed over.
+
+    Audiveris recognises both glyphs but exports neither, so a part with a
+    D.S. al Coda arrived with no sign of it. Placement is shared with the
+    rehearsal letters. Returns signs placed."""
+    def make(kind):
+        direction = ET.Element("direction", placement="above")
+        dtype = ET.SubElement(direction, "direction-type")
+        ET.SubElement(dtype, kind)
+        return direction
+
+    def replaces(direction):
+        return any(dt.find("coda") is not None or dt.find("segno") is not None
+                   for dt in direction.findall("direction-type"))
+
+    return _place_marks(omr_path, result_path, hbars, _omr_sign_marks(omr_path),
+                        make, replaces)
