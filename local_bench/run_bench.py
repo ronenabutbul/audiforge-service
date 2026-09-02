@@ -37,6 +37,10 @@ import score as scorer  # benchmark/score.py
 from transpose import apply_transpose  # app/transpose.py
 from postprocess import (  # app/postprocess.py — shared with production
     graft_features,
+    graft_time_symbol,
+    clean_words,
+    beam_by_beat,
+    drop_phantom_clef_changes,
     measure_signature,
     normalize_homr,
 )
@@ -173,8 +177,12 @@ def run_fusion(pdf: Path, work_dir: Path) -> Path:
     if h_val >= a_val:
         shutil.copy(homr_path, out)
         aligned, grafted = graft_features(out, aud_path)
+        clean_words(out)
+        drop_phantom_clef_changes(out)
+        beam_by_beat(out)
+        stamped = graft_time_symbol(out, aud_path)
         print(f"  fusion: homr base, {aligned} measures aligned, "
-              f"{grafted} grafted", flush=True)
+              f"{grafted} grafted, {stamped} time symbols", flush=True)
     else:
         shutil.copy(aud_path, out)
         print("  fusion: audiveris base (homr rhythm validity lost)",

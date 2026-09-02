@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import shutil
 import subprocess
 import uuid
@@ -135,6 +136,29 @@ def _merge_musicxml(outputs: list[Path], result_path: Path) -> Path:
     return result_path
 
 
+# A store id in front of the name: the app keeps a piece's file under its own
+# identifier, and that identifier should not become the title printed at the
+# top of the score. Matches a bare UUID or hex id followed by a separator,
+# with or without dashes, and only at the start.
+_STORE_ID_PREFIX = re.compile(
+    r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}[ _-]+"
+    r"|^[0-9a-f]{12,32}[ _-]+",
+    re.IGNORECASE)
+
+
+def title_from_filename(filename: str | None) -> str:
+    """The piece title a musician should see, from an uploaded filename.
+
+    Strips a leading store id, so "<uuid>_Caribbean Variation.pdf" is read as
+    "Caribbean Variation" rather than printing the id across the top of the
+    first page. A name that is nothing but an id leaves nothing to show, and
+    the OCR'd title block (see fix_titles) is the better source there.
+    """
+    stem = Path(filename or "").stem.strip()
+    without_id = _STORE_ID_PREFIX.sub("", stem).strip(" _-")
+    return without_id or stem or "Untitled"
+
+
 def _apply_metadata(result_path: Path, piece_title: str):
     """Set work/movement title and part name from the uploaded filename.
 
@@ -151,19 +175,23 @@ def _apply_metadata(result_path: Path, piece_title: str):
     if root.tag != "score-partwise":
         return
 
-    for tag in ("work/work-title", "movement-title"):
-        el = root.find(tag)
-        if el is None:
-            parent = root
-            leaf = tag
-            if "/" in tag:
-                parent_tag, leaf = tag.split("/")
-                parent = root.find(parent_tag)
-                if parent is None:
-                    parent = ET.Element(parent_tag)
-                    root.insert(0, parent)
-            el = ET.SubElement(parent, leaf)
-        el.text = title
+    work = root.find("work")
+    if work is None:
+        work = ET.Element("work")
+        root.insert(0, work)
+    work_title = work.find("work-title")
+    if work_title is None:
+        work_title = ET.SubElement(work, "work-title")
+    work_title.text = title
+
+    # The title goes in one place only. Writing it to movement-title as well
+    # makes a renderer that draws both - OSMD draws a title and a subtitle -
+    # print the same words twice down the top of the first page. homr's own
+    # guess lives there too ("Brown", "Voice"), so an existing one is
+    # cleared rather than left to show under the real title.
+    movement_title = root.find("movement-title")
+    if movement_title is not None:
+        root.remove(movement_title)
 
     if part_name:
         for name_el in root.findall("part-list/score-part/part-name"):
@@ -316,7 +344,8 @@ def _repair_structure(job_id: str, job_dir: Path, result: Path,
     Each step is independent and advisory — a failure leaves the score as
     it was rather than losing the conversion.
     """
-    from app.fix_hbars import detect_hbars, place_rehearsals, stack_numbers
+    from app.fix_hbars import (detect_circled_letters, detect_hbars,
+                                place_rehearsals, stack_numbers)
     from app.fix_hbars import fix as fix_hbars
     from app.fix_multirests import fix as fix_multirest_counts
     from app.fix_structure import fix as fix_structure
@@ -346,8 +375,16 @@ def _repair_structure(job_id: str, job_dir: Path, result: Path,
 
     omr = next(job_dir.rglob("*.omr"), None)
     hbars = detect_hbars(omr) if omr is not None else []
+    numbers = None
     try:
-        numbers = stack_numbers(omr, hbars) if hbars else None
+        numbers = stack_numbers(omr, hbars) if omr is not None else None
+        missing = postprocess.graft_missing_measures(result, aud_path)
+        if missing:
+            logger.info("job %s: %d bar(s) the base engine skipped put back "
+                        "from Audiveris", job_id, missing)
+    except Exception:
+        logger.exception("job %s: missing-bar graft failed", job_id)
+    try:
         placed = postprocess.graft_numbered(result, aud_path, numbers)
         if placed:
             logger.info("job %s: %d elements placed by printed number",
@@ -355,12 +392,22 @@ def _repair_structure(job_id: str, job_dir: Path, result: Path,
     except Exception:
         logger.exception("job %s: numbered graft failed", job_id)
 
-    if omr is not None and hbars:
+    if omr is not None:
+        # Circled letters are invisible to Audiveris's text OCR; read them
+        # off the page and place them with whatever it did recognise.
+        circled = []
         try:
-            moved = place_rehearsals(omr, result, hbars)
+            circled = detect_circled_letters(omr)
+            if circled:
+                logger.info("job %s: %d circled rehearsal letters read: %s",
+                            job_id, len(circled),
+                            "".join(c[3] for c in circled))
+        except Exception:
+            logger.exception("job %s: circled-letter detection failed", job_id)
+        try:
+            moved = place_rehearsals(omr, result, hbars, extra_marks=circled)
             if moved:
-                logger.info("job %s: %d rehearsal letters re-placed",
-                            job_id, moved)
+                logger.info("job %s: %d rehearsal letters placed", job_id, moved)
         except Exception:
             logger.exception("job %s: rehearsal placement failed", job_id)
 
@@ -418,6 +465,23 @@ def _process_job(job_id: str, source: Path):
             except Exception:
                 logger.exception("job %s: fusion graft failed; keeping homr",
                                  job_id)
+            try:
+                repaired, dropped = postprocess.clean_words(result_path)
+                if repaired or dropped:
+                    logger.info("job %s: words - %d repaired, %d debris dropped",
+                                job_id, repaired, dropped)
+            except Exception:
+                logger.exception("job %s: word cleanup failed", job_id)
+            try:
+                # Independent of the alignment above: the time symbol is
+                # keyed by the signature itself, so it survives a score
+                # the two engines could not align.
+                stamped = postprocess.graft_time_symbol(result_path, aud_path)
+                if stamped:
+                    logger.info("job %s: %d time signatures stamped C/cut",
+                                job_id, stamped)
+            except Exception:
+                logger.exception("job %s: time-symbol graft failed", job_id)
 
         # Structure repair, which only became possible server-side once
         # Audiveris started running in this container: every step below
@@ -462,6 +526,16 @@ def _process_job(job_id: str, source: Path):
             except Exception:
                 logger.exception("job %s: title OCR failed", job_id)
 
+        try:
+            # Last, once every bar is in place: homr writes no beams, and
+            # a page of flagged eighths reads nothing like the beamed one
+            # it came from.
+            phantom = postprocess.drop_phantom_clef_changes(result_path)
+            beamed = postprocess.beam_by_beat(result_path)
+            logger.info("job %s: %d notes beamed, %d phantom clef/key/fermata "
+                        "removed", job_id, beamed, phantom)
+        except Exception:
+            logger.exception("job %s: beaming failed", job_id)
         try:
             postprocess.app_compat(result_path)
         except Exception:
@@ -546,7 +620,7 @@ async def upload(file: UploadFile = File(...)):
     source = job_dir / f"input{suffix}"
     source.write_bytes(await file.read())
 
-    piece_title = Path(file.filename or "").stem.strip() or "Untitled"
+    piece_title = title_from_filename(file.filename)
     with jobs_lock:
         jobs[job_id] = {
             "id": job_id,
