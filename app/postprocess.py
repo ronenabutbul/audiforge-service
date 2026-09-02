@@ -199,6 +199,198 @@ def expand_multirests(result_path: Path) -> int:
     return added
 
 
+def _beat_length(divisions: int, beats: int, beat_type: int) -> int:
+    """Duration units per beam group. Simple meters beam by the beat;
+    compound ones (6/8, 9/8, 12/8) by the dotted beat, three eighths."""
+    if beat_type == 8 and beats % 3 == 0:
+        return divisions * 3 // 2
+    return divisions * 4 // beat_type
+
+
+def _beam_level(duration: int, divisions: int) -> int:
+    """Beams a note needs: one for an eighth, two for a sixteenth..."""
+    level, unit = 0, divisions
+    while duration < unit and level < 4:
+        unit //= 2
+        level += 1
+    return level
+
+
+def _set_beams(note, marks: dict[int, str]) -> None:
+    for old in note.findall("beam"):
+        note.remove(old)
+    # <beam> precedes <notations> and <lyric> in the schema.
+    tail = next((i for i, c in enumerate(note)
+                 if c.tag in ("notations", "lyric", "play")), len(note))
+    for number in sorted(marks):
+        el = ET.Element("beam", number=str(number))
+        el.text = marks[number]
+        note.insert(tail, el)
+        tail += 1
+
+
+def beam_by_beat(result_path: Path) -> int:
+    """Join eighths and shorter into beamed groups, one group per beat.
+
+    homr writes every note with its own flag, and a page of flagged
+    eighths reads nothing like the beamed page it came from - the eye
+    parses rhythm by the beams. The grouping follows the time signature,
+    which is what an engraver does too: within a beat the notes join, a
+    rest or a beat boundary breaks the group. Returns notes beamed."""
+    tree = ET.parse(result_path)
+    beamed = 0
+    for part in tree.getroot().findall("part"):
+        divisions, beats, beat_type = 1, 4, 4
+        for measure in part.findall("measure"):
+            for attrs in measure.findall("attributes"):
+                divisions = int(attrs.findtext("divisions") or divisions)
+                time = attrs.find("time")
+                if time is not None:
+                    beats = int(time.findtext("beats") or beats)
+                    beat_type = int(time.findtext("beat-type") or beat_type)
+            beat = max(_beat_length(divisions, beats, beat_type), 1)
+            # In 4/4 an engraver joins four eighths across the half-bar;
+            # the beat still breaks the sixteenth beams underneath.
+            span = beat * 2 if (beats, beat_type) == (4, 4) else beat
+
+            groups, group, position, span_index = [], [], 0, 0
+            def close():
+                nonlocal group
+                if len(group) >= 2:
+                    groups.append(group)
+                group = []
+            for el in measure:
+                if el.tag == "backup":
+                    position -= int(el.findtext("duration") or 0)
+                    close()
+                    continue
+                if el.tag == "forward":
+                    position += int(el.findtext("duration") or 0)
+                    close()
+                    continue
+                if el.tag != "note":
+                    continue
+                if el.find("chord") is not None:
+                    continue  # rides on the note before it
+                duration = int(el.findtext("duration") or 0)
+                if el.find("grace") is not None:
+                    continue
+                level = _beam_level(duration, divisions)
+                is_rest = el.find("rest") is not None
+                if position // span != span_index:
+                    close()
+                    span_index = position // span
+                if is_rest or level == 0:
+                    close()
+                else:
+                    group.append((el, level, position // beat))
+                position += duration
+            close()
+
+            for group in groups:
+                n = len(group)
+                for i, (note, level, beat_no) in enumerate(group):
+                    marks = {}
+                    for number in range(1, level + 1):
+                        # The primary beam runs the whole group; every
+                        # further beam stops at the beat.
+                        same_beat = lambda j: number == 1 or group[j][2] == beat_no
+                        before = i > 0 and group[i - 1][1] >= number and same_beat(i - 1)
+                        after = i < n - 1 and group[i + 1][1] >= number and same_beat(i + 1)
+                        if before and after:
+                            marks[number] = "continue"
+                        elif after:
+                            marks[number] = "begin"
+                        elif before:
+                            marks[number] = "end"
+                        else:
+                            # A lone sixteenth among eighths: a hook.
+                            marks[number] = "forward hook" if i < n - 1 else "backward hook"
+                    _set_beams(note, marks)
+                    beamed += 1
+    if beamed:
+        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    return beamed
+
+
+def drop_phantom_clef_changes(result_path: Path) -> int:
+    """Remove clef and key changes an engine invented for a rest.
+
+    homr can put a bass clef and a new key on a silent bar of a clarinet
+    part and change them again before anything sounds. A change that
+    governs no sounding note is not a reading of the page: real changes
+    are printed for the notes that follow. Its reverting declaration is
+    then a change to what is already in force, which a renderer draws as
+    a courtesy clef that splits a multirest; those go too. A fermata on
+    a silent bar with more silence after it is the same kind of
+    invention. A measure may carry several <attributes> elements (homr
+    writes divisions in one and the clef in another), so all are read.
+    Returns elements removed."""
+    tree = ET.parse(result_path)
+    removed = 0
+
+    def value(el) -> str:
+        return "".join(f"{c.tag}={c.text}" for c in el)
+
+    def changes(measure, tag):
+        return [(attrs, attrs.find(tag)) for attrs in measure.findall("attributes")
+                if attrs.find(tag) is not None]
+
+    def tidy(measure):
+        for attrs in list(measure.findall("attributes")):
+            if len(attrs) == 0:
+                measure.remove(attrs)
+
+    for part in tree.getroot().findall("part"):
+        measures = part.findall("measure")
+        silent = [bool(m.findall("note")) and all(
+            n.find("rest") is not None for n in m.findall("note")) for m in measures]
+
+        # 1. a change on a silent bar that governs no sounding note
+        for tag in ("clef", "key"):
+            for i, measure in enumerate(measures):
+                if i == 0 or not silent[i]:
+                    continue
+                for attrs, change in changes(measure, tag):
+                    governs = False
+                    for later in measures[i + 1:]:
+                        if changes(later, tag):
+                            break
+                        if any(n.find("rest") is None for n in later.findall("note")):
+                            governs = True
+                            break
+                    if not governs:
+                        attrs.remove(change)
+                        removed += 1
+                tidy(measure)
+
+        # 2. a declaration of what is already in force
+        for tag in ("clef", "key"):
+            current = None
+            for i, measure in enumerate(measures):
+                for attrs, change in changes(measure, tag):
+                    if i > 0 and value(change) == current:
+                        attrs.remove(change)
+                        removed += 1
+                    else:
+                        current = value(change)
+                tidy(measure)
+
+        # 3. a hold inside silence
+        for i, measure in enumerate(measures):
+            if silent[i] and i + 1 < len(measures) and silent[i + 1]:
+                for note in measure.findall("note"):
+                    for notations in list(note.findall("notations")):
+                        for fermata in notations.findall("fermata"):
+                            notations.remove(fermata)
+                            removed += 1
+                        if len(notations) == 0:
+                            note.remove(notations)
+    if removed:
+        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    return removed
+
+
 def normalize_homr(result_path: Path) -> tuple[int, int, int]:
     """The full homr normalizer chain. Returns per-normalizer change counts."""
     return (slurs_to_ties(result_path), sort_chords(result_path),
