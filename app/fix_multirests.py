@@ -103,8 +103,25 @@ def _read_number(image, cx, cy, cw, ch, upper: int = 100) -> int | None:
     x0, x1 = max(cx - 4 * cw, 0), cx + 5 * cw
     y0, y1 = max(cy - 3, 0), cy + ch + 3
     band = np.asarray(image.convert("L").crop((x0, y0, x1, y1))) < 128
-    # Kill near-full dark rows (staff line / H-bar edges clipping the band).
-    band[band.mean(axis=1) > 0.6] = False
+    # Staff lines and H-bar edges cross the band as near-full dark rows.
+    # A number printed on the staff (older engraving sets the count
+    # straddling the top line) must keep its strokes through those rows,
+    # so a line row is replaced by what continues through it from the
+    # rows above and below, not simply blanked.
+    line_rows = list(np.where(band.mean(axis=1) > 0.4)[0])
+    blocks, block = [], []
+    for r in line_rows:
+        if block and r != block[-1] + 1:
+            blocks.append(block)
+            block = []
+        block.append(r)
+    if block:
+        blocks.append(block)
+    for block in blocks:  # a line is several rows thick: bridge the whole block
+        r0, r1 = block[0] - 1, block[-1] + 1
+        above = band[r0] if r0 >= 0 else np.zeros_like(band[0])
+        below = band[r1] if r1 < len(band) else np.zeros_like(band[0])
+        band[block[0]:block[-1] + 1] = above & below
 
     col = band.mean(axis=0)
     dark = col > 0.08
@@ -136,12 +153,52 @@ def _read_number(image, cx, cy, cw, ch, upper: int = 100) -> int | None:
             break
     left = runs[min(keep)][0]
     right = runs[max(keep)][1]
+    # The number is the tallest run of consecutive inked rows in the
+    # chain; a fragment above or below it (the quote mark of a song
+    # title) sits in rows of its own, separated by blank ones, and goes.
+    rows = band[:, left:right].sum(axis=1) > 0
+    blocks, start = [], None
+    for i, v in enumerate(list(rows) + [False]):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            blocks.append((start, i))
+            start = None
+    r_lo, r_hi = max(blocks, key=lambda b: b[1] - b[0]) if blocks else (0, len(rows))
+    body = band[r_lo:r_hi, left:right]
+    # Digits are separate segments of inked columns; a stroke two
+    # pixels wide is still a digit, a lone speck is not.
+    strong = body.sum(axis=0) >= 2
+    segments, start = [], None
+    for i, v in enumerate(list(strong) + [False]):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            if i - start >= 2:
+                segments.append((left + start, left + i))
+            start = None
+    if segments:
+        left, right = segments[0][0], segments[-1][1]
+    expected = max(len(segments), 1)
     from PIL import Image, ImageOps
-    number = image.convert("L").crop((x0 + left - 2, y0, x0 + right + 2, y1))
+    number = image.convert("L").crop((x0 + left - 2, y0 + max(r_lo - 3, 0),
+                                      x0 + right + 2, y0 + min(r_hi + 3, y1 - y0)))
     number = number.resize((number.width * 3, number.height * 3),
                            Image.LANCZOS)
-    number = ImageOps.expand(number, border=16, fill=255)
-    return _ocr_digits(number, upper)
+    # Tesseract is fickle about the white around a short word: at a
+    # 16-px border a bold "11" comes back as "1", at 32 a "14" comes
+    # back as "4", at 48 an "8" as "38". The ink itself says how many
+    # digits there are, so the borders are tried in turn and the first
+    # reading with that many digits wins, the 16-px reading failing that.
+    readings = []
+    for border in (16, 32, 48):
+        reading = _ocr_digits(ImageOps.expand(number, border=border, fill=255), upper)
+        if reading is None:
+            continue
+        if len(str(reading)) == expected:
+            return reading
+        readings.append(reading)
+    return readings[0] if readings else None
 
 
 def _ocr_digits(image, upper: int = 100) -> int | None:
@@ -201,7 +258,7 @@ def apply_counts(result_path: Path, pairs: list[tuple[int, int]]) -> int:
             last = measures[mi + old - 1] if mi + old - 1 < len(measures) else measure
             at = list(part).index(last)
             for k in range(ocr_count - old):
-                part.insert(at + 1 + k, copy.deepcopy(last))
+                part.insert(at + 1 + k, _bare_rest_like(last))
             changed += 1
         if changed:
             for number, m in enumerate(part.findall("measure"), start=1):
@@ -209,6 +266,21 @@ def apply_counts(result_path: Path, pairs: list[tuple[int, int]]) -> int:
     if changed:
         tree.write(result_path, encoding="UTF-8", xml_declaration=True)
     return changed
+
+
+def _bare_rest_like(measure) -> ET.Element:
+    """A whole-bar rest of the same length and nothing else. The bars that
+    pad a multirest out to its printed count must not be copies of the
+    marked bar: that bar carries the rehearsal number, the barline and the
+    attributes, and a number printed once would then show on every bar of
+    the rest."""
+    duration = sum(int(n.findtext("duration") or 0)
+                   for n in measure.findall("note") if n.find("chord") is None)
+    bare = ET.Element("measure")
+    note = ET.SubElement(bare, "note")
+    ET.SubElement(note, "rest", measure="yes")
+    ET.SubElement(note, "duration").text = str(duration or 1)
+    return bare
 
 
 def fix(work_dir: Path, result_path: Path) -> int:

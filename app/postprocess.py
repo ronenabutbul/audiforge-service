@@ -322,7 +322,7 @@ def drop_phantom_clef_changes(result_path: Path) -> int:
     are printed for the notes that follow. Its reverting declaration is
     then a change to what is already in force, which a renderer draws as
     a courtesy clef that splits a multirest; those go too. A fermata on
-    a silent bar with more silence after it is the same kind of
+    a silent bar with silence on both sides of it is the same kind of
     invention. A measure may carry several <attributes> elements (homr
     writes divisions in one and the clef in another), so all are read.
     Returns elements removed."""
@@ -378,7 +378,11 @@ def drop_phantom_clef_changes(result_path: Path) -> int:
 
         # 3. a hold inside silence
         for i, measure in enumerate(measures):
-            if silent[i] and i + 1 < len(measures) and silent[i + 1]:
+            # Only INSIDE a run of silence: a held whole rest right
+            # before a multirest is a printed idiom ("hold, then count"),
+            # and that bar has music before it.
+            if (silent[i] and 0 < i and silent[i - 1]
+                    and i + 1 < len(measures) and silent[i + 1]):
                 for note in measure.findall("note"):
                     for notations in list(note.findall("notations")):
                         for fermata in notations.findall("fermata"):
@@ -476,6 +480,19 @@ def graft_rehearsals_by_number(base_measures, sec_measures,
             if bi is None:
                 continue
             target = base_measures[bi]
+            # The base may carry the engine's own copy of this number a
+            # bar or two off, where the bar it was read over drifted to;
+            # one mark per number, at the bar the number names.
+            value = next((dt.find("rehearsal").text for dt in el.findall("direction-type")
+                          if dt.find("rehearsal") is not None), None)
+            for near in base_measures[max(bi - 3, 0):bi + 4]:
+                if near is target:
+                    continue
+                for d in list(near.findall("direction")):
+                    if any(dt.find("rehearsal") is not None
+                           and dt.find("rehearsal").text == value
+                           for dt in d.findall("direction-type")):
+                        near.remove(d)
             if any(dt.find("rehearsal") is not None
                    for d in target.findall("direction")
                    for dt in d.findall("direction-type")):

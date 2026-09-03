@@ -24,13 +24,37 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
+import logging
 from difflib import SequenceMatcher
 from pathlib import Path
+
+logger = logging.getLogger("omr-service")
 
 try:
     from app.fix_multirests import _read_number
 except ImportError:  # local_bench puts app/ itself on sys.path
     from fix_multirests import _read_number
+
+
+def _staff_at(lines, x: float) -> tuple[float, float]:
+    """Top and bottom staff-line y at column x. The engine stores each
+    line as a polyline, and only its first point is at the left margin:
+    a skewed scan drops the staff by two interlines across the page, so
+    read at the margin, the right-hand bars of every system sit a whole
+    band below where the detectors look."""
+    def y_at(line) -> float:
+        points = sorted((float(p.get("x")), float(p.get("y")))
+                        for p in line.findall("point"))
+        if len(points) == 1 or x <= points[0][0]:
+            return points[0][1]
+        if x >= points[-1][0]:
+            return points[-1][1]
+        for (ax, ay), (bx, by) in zip(points, points[1:]):
+            if ax <= x <= bx:
+                return ay + (by - ay) * (x - ax) / (bx - ax) if bx > ax else ay
+        return points[-1][1]
+
+    return y_at(lines[0]), y_at(lines[-1])
 
 
 def _iter_stacks(omr_path: Path):
@@ -61,15 +85,14 @@ def _iter_stacks(omr_path: Path):
                 lines = staff.findall("lines/line")
                 if len(lines) < 5:
                     continue
-                top = float(lines[0].find("point").get("y"))
-                bottom = float(lines[-1].find("point").get("y"))
-                interline = (bottom - top) / 4
                 stacks = system.findall("stack")
                 system_x0 = min((int(float(s.get("left"))) for s in stacks),
                                 default=0)
                 for stack in stacks:
                     x0 = int(float(stack.get("left")))
                     x1 = int(float(stack.get("right")))
+                    top, bottom = _staff_at(lines, (x0 + x1) / 2)
+                    interline = (bottom - top) / 4
                     yield (image, pixels, top, bottom, interline, x0, x1,
                            ordinal, system_x0)
                     ordinal += 1
@@ -110,9 +133,10 @@ def _interior_barline_xs(pixels, top: float, bottom: float, x0: int, x1: int,
         a staff line runs for many interlines and is skipped, a notehead
         never exceeds two - rather than by where the lines should be:
         on a skewed scan they sit pixels from the predicted row."""
-        notehead, staff_line = 0.6 * interline, 3 * interline
+        notehead, staff_line = 0.75 * interline, 3 * interline
+        skip_until = 0
         for r in range(t + 3, b - 2):
-            if not pixels[r, x]:
+            if not pixels[r, x] or r < skip_until:
                 continue
             l = x
             while l > 0 and pixels[r, l - 1]:
@@ -122,15 +146,31 @@ def _interior_barline_xs(pixels, top: float, bottom: float, x0: int, x1: int,
                 rgt += 1
             width = rgt - l + 1
             if width > staff_line:
+                # The row under a staff line carries the line's ragged
+                # edge, a short blob joined to the stroke; not a notehead.
+                skip_until = r + 3
                 continue
             if width > notehead:
                 return False
         return True
 
+    def continuous(seg) -> bool:
+        """Ink down the whole segment, allowing the pinholes a photocopy
+        punches in a stroke: nine rows in ten dark, no gap over 3."""
+        if seg.all():
+            return True
+        if seg.mean() < 0.9:
+            return False
+        gap = longest = 0
+        for v in seg:
+            gap = 0 if v else gap + 1
+            longest = max(longest, gap)
+        return longest <= 3
+
     found, last = [], None
     for x in range(x0 + inset, x1 - inset):
         col = pixels[:, x]
-        is_bar = (col[t + 2:b - 1].all()
+        is_bar = (continuous(col[t + 2:b - 1])
                   and not col[max(t - 4, 0)] and not col[min(b + 4, len(col) - 1)]
                   and thin_all_the_way(x))
         if is_bar and (last is None or x - last > interline):
@@ -154,30 +194,50 @@ MERGED_STACK_MIN_RATIO = 1.3
 MERGED_STACK_EDGE_IL = 4.0
 
 
+# The first stack of a system opens with clef, key and time signature,
+# and a repeat sign right after them is a stroke inside the stack that
+# divides nothing: the bar begins at it.
+MERGED_STACK_HEAD_IL = 9.0
+
+
 def _merged_bar_xs(pixels, top: float, bottom: float, x0: int, x1: int,
-                   interline: float, row_median_width: float) -> list[int]:
+                   interline: float, row_median_width: float,
+                   head: bool = False) -> list[int]:
     """Barlines inside a stack that the engine merged over, or nothing
-    when the stack is not wide enough to hold two bars."""
+    when the stack is not wide enough to hold two bars. `head` marks
+    the first stack of its system."""
     if row_median_width and (x1 - x0) < MERGED_STACK_MIN_RATIO * row_median_width:
         return []
     edge = MERGED_STACK_EDGE_IL * interline
+    left = max(edge, MERGED_STACK_HEAD_IL * interline) if head else edge
     return [x for x in _interior_barline_xs(pixels, top, bottom, x0, x1, interline)
-            if x - x0 >= edge and x1 - x >= edge]
+            if x - x0 >= left and x1 - x >= edge]
 
 
 def _row_median_widths(omr_path: Path) -> dict[int, float]:
-    """Median stack width of each stack's own system, by ordinal."""
+    """Median stack width of each stack's own system, by ordinal. Walks
+    the systems the way _iter_stacks does so the ordinals agree."""
     import statistics
-    from collections import defaultdict
 
-    rows = defaultdict(list)
-    for (image, _p, top, _b, _il, x0, x1, ordinal, _s) in _iter_stacks(omr_path):
-        rows[(id(image), top)].append((ordinal, x1 - x0))
-    out = {}
-    for members in rows.values():
-        median = statistics.median(w for _, w in members)
-        for ordinal, _ in members:
-            out[ordinal] = median
+    out, ordinal = {}, 0
+    with zipfile.ZipFile(omr_path) as z:
+        sheets = sorted(
+            {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+            key=lambda s: int(s.split("#")[1]))
+        for sheet in sheets:
+            root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml")
+                                 .decode("utf-8", "replace"))
+            for system in root.iter("system"):
+                staff = system.find(".//staff")
+                if staff is None or len(staff.findall("lines/line")) < 5:
+                    continue
+                stacks = system.findall("stack")
+                widths = [float(st.get("right")) - float(st.get("left"))
+                          for st in stacks]
+                median = statistics.median(widths) if widths else 0
+                for _ in stacks:
+                    out[ordinal] = median
+                    ordinal += 1
     return out
 
 
@@ -290,10 +350,17 @@ def detect_circled_letters(omr_path: Path) -> list[tuple[int, int, int, str]]:
                 lines = staff.findall("lines/line") if staff is not None else []
                 if len(lines) < 5:
                     continue
-                top = float(lines[0].find("point").get("y"))
-                bottom = float(lines[-1].find("point").get("y"))
-                il = (bottom - top) / 4
-                y0, y1 = max(int(top - 6 * il), 0), int(top - 0.1 * il)
+                stacks = system.findall("stack")
+                sx0 = min((float(s.get("left")) for s in stacks), default=0)
+                sx1 = max((float(s.get("right")) for s in stacks), default=0)
+                top_l, bottom_l = _staff_at(lines, sx0)
+                top_r, bottom_r = _staff_at(lines, sx1)
+                il = ((bottom_l - top_l) + (bottom_r - top_r)) / 8
+                # The strip spans the system at both ends of a skewed
+                # staff; each hit is then held against the staff at its
+                # own column.
+                y0 = max(int(min(top_l, top_r) - 6 * il), 0)
+                y1 = int(max(top_l, top_r) - 0.1 * il)
                 if y1 <= y0:
                     continue
                 circles = cv2.HoughCircles(
@@ -304,6 +371,9 @@ def detect_circled_letters(omr_path: Path) -> list[tuple[int, int, int, str]]:
                     continue
                 for x, y, r in circles[0]:
                     cx, cy = int(x), int(y0 + y)
+                    top, _bottom = _staff_at(lines, cx)
+                    if not (top - 6 * il < cy < top - 0.1 * il):
+                        continue  # inside the staff at this column
                     # Two systems can share a row (a coda fragment beside
                     # the main system) and both see the same circle.
                     if any(abs(cx - sx) < il and abs(cy - sy) < il for sx, sy in seen):
@@ -354,6 +424,9 @@ def _snap_to_sequence(marks: list[tuple[int, int, int, str]]):
     return [(s, x, y, e) for (s, x, y, _), e in zip(ordered, expected)]
 
 
+MULTIREST_COUNT_MAX = 40
+
+
 def _read_count_above(image, top: float, interline: float, cx: int):
     """The printed count over a multirest glyph centred at cx.
 
@@ -364,8 +437,11 @@ def _read_count_above(image, top: float, interline: float, cx: int):
     the ink here: a count often shares the strip with a rehearsal box or
     a tempo word, and _read_number's own run-chaining isolates it."""
     cw = int(0.9 * interline)
-    return _read_number(image, cx - cw // 2, int(top - 3.2 * interline),
-                        cw, int(3.1 * interline))
+    count = _read_number(image, cx - cw // 2, int(top - 3.2 * interline),
+                         cw, int(3.1 * interline))
+    # A band part rests for a few bars, a dozen, two dozen; a count in
+    # the forties is a misread of a dirty scan, not a rest.
+    return count if count and count <= MULTIREST_COUNT_MAX else None
 
 
 def detect_block_rests(omr_path: Path) -> list[dict]:
@@ -440,9 +516,116 @@ def _detect_hbars_only(omr_path: Path) -> list[dict]:
     """All multirest H-bars in reading order:
     {count, x0, x1} per printed bar that carries one."""
     import io
+    import statistics
 
     import numpy as np
     from PIL import Image
+
+    def probe(image, pixels, top, bottom, interline, a, b):
+        """The H-bar drawn in the printed bar spanning columns a..b, as
+        {count, read, bar}, or None when that bar holds none."""
+        mid = (top + bottom) / 2
+        if b - a < interline * 3:
+            return None
+        band = pixels[int(mid - interline * 0.7):int(mid + interline * 0.7),
+                      a + 8:b - 8]
+        if band.size == 0:
+            return None
+        rows = band.mean(axis=1)
+        row_mask = rows >= 0.55
+        thick = row_mask.sum()
+        if thick < max(interline * 0.35, 2):
+            return None  # no H-bar here
+        # An H-bar is WIDE: its dark rows must be dark across most of the
+        # bar. A time signature or lone glyph makes dark rows too, but
+        # only over a narrow column range.
+        cols = band[row_mask].mean(axis=0)
+        if (cols >= 0.5).mean() < 0.55:
+            return None
+        # A bar of beamed eighths is also a thick dark run across most of
+        # the bar. What a beam has and an H-bar never does is stems: ink
+        # crossing the run that reaches three interlines or more. Measure
+        # the ink height through the run's centre row along its interior;
+        # an H-bar is flat, a beam is a comb. The bar's extent is the
+        # LONGEST unbroken dark run, not first-dark-to-last-dark: a clef
+        # or key signature is dark in this band too, and measuring from
+        # there reads the blank staff between them as part of the bar.
+        # Probe through the run's own centre row, not the middle line: an
+        # H-bar drawn in the space above the line never touches it.
+        dark = [c >= 0.5 for c in cols]
+        best, start = (0, 0), None
+        for i, d in enumerate(dark + [False]):
+            if d and start is None:
+                start = i
+            elif not d and start is not None:
+                if i - start > best[1] - best[0]:
+                    best = (start, i)
+                start = None
+        run_x0 = a + 8 + best[0]
+        run_x1 = a + 8 + best[1]
+        band_top = int(mid - interline * 0.7)
+        # The bar's own rows are the largest run of dark rows; the middle
+        # staff line is dark in this band too, and a mean over both lands
+        # in the gap between them.
+        runs, run = [], []
+        for r in np.where(row_mask)[0]:
+            if run and r != run[-1] + 1:
+                runs.append(run)
+                run = []
+            run.append(r)
+        runs.append(run)
+        centre_row = band_top + int(np.mean(max(runs, key=len)))
+        inset = int((run_x1 - run_x0) * 0.2)
+        interior = range(run_x0 + inset, max(run_x1 - inset, run_x0 + inset + 1))
+        heights = [
+            _ink_through(pixels, x, centre_row, int(top - 3 * interline),
+                         int(bottom + 3 * interline)) / interline
+            for x in interior]
+        stems = sum(1 for h in heights if h >= 2.5)
+        # A beam has a stem every couple of interlines, ink far taller
+        # than any bar; an H-bar has none inside its ends. Two allowed
+        # for noise.
+        if stems > 2:
+            return None
+        # And a bar has ink along its own centre line. The thick rows of
+        # a bar-repeat slash or a bar of notes are staff lines and
+        # smeared diagonals with a blank row between them, so at most
+        # interior columns the centre row holds nothing. Only the median
+        # is asked, since a lightly printed bar comes through porous.
+        if sorted(heights)[len(heights) // 2] < 0.1:
+            return None
+        # And nothing but staff lines between the bar and the outer
+        # lines: a group of beamed thirty-seconds is a thick dark run
+        # too, with noteheads and stems over it at most columns.
+        bar_top = band_top + min(max(runs, key=len))
+        bar_bottom = band_top + max(max(runs, key=len))
+        for lo, hi in ((int(top) + 3, bar_top - 2),
+                       (bar_bottom + 3, int(bottom) - 2)):
+            if hi - lo < 3:
+                continue
+            region = pixels[lo:hi, run_x0 + inset:run_x1 - inset].copy()
+            # A staff line on a skewed scan spreads over rows at partial
+            # coverage; every such row goes, and a column counts as
+            # inked only with three pixels left, more than line residue.
+            region[region.mean(axis=1) > 0.3] = False
+            if region.size and (region.sum(axis=0) >= 3).mean() > 0.15:
+                return None
+        # The count sits over the H-bar itself, not over the bar's
+        # centre: a stack the engine merged with its neighbour puts the
+        # two far apart.
+        count = _read_count_above(image, top, interline,
+                                  (run_x0 + run_x1) // 2)
+        for dx in (0, -80, 80) if not count else ():
+            for dy, ch in ((58, 42), (80, 60), (44, 38)):
+                count = _read_number(
+                    image, (a + b) // 2 - 15 + dx, int(top) - dy, 25, ch)
+                if count:
+                    break
+            if count:
+                break
+        if count and count > MULTIREST_COUNT_MAX:
+            count = None
+        return {"count": count or 1, "read": bool(count), "bar": (a, b)}
 
     found = []
     stack_ordinal = 0
@@ -463,98 +646,40 @@ def _detect_hbars_only(omr_path: Path) -> list[dict]:
                 lines = staff.findall("lines/line")
                 if len(lines) < 5:
                     continue
-                top = float(lines[0].find("point").get("y"))
-                bottom = float(lines[-1].find("point").get("y"))
-                interline = (bottom - top) / 4
-                mid = (top + bottom) / 2
-                for stack in system.findall("stack"):
+                stacks = system.findall("stack")
+                widths = [float(st.get("right")) - float(st.get("left"))
+                          for st in stacks]
+                row_median = statistics.median(widths) if widths else 0
+                for stack in stacks:
                     stack_ordinal += 1
                     x0 = int(float(stack.get("left")))
                     x1 = int(float(stack.get("right")))
-                    if x1 - x0 < interline * 3:
-                        continue
-                    band = pixels[int(mid - interline * 0.7):
-                                  int(mid + interline * 0.7),
-                                  x0 + 8:x1 - 8]
-                    if band.size == 0:
-                        continue
-                    rows = band.mean(axis=1)
-                    row_mask = rows >= 0.55
-                    thick = row_mask.sum()
-                    if thick < max(interline * 0.35, 2):
-                        continue  # no H-bar here
-                    # An H-bar is WIDE: its dark rows must be dark across
-                    # most of the bar. A time signature or lone glyph makes
-                    # dark rows too, but only over a narrow column range.
-                    cols = band[row_mask].mean(axis=0)
-                    if (cols >= 0.5).mean() < 0.55:
-                        continue
-                    # A bar of beamed eighths is also a thick dark run
-                    # across most of the bar. What a beam has and an
-                    # H-bar never does is stems: ink crossing the run
-                    # that reaches three interlines or more. Measure the
-                    # ink height through the run's centre row along its
-                    # interior; an H-bar is flat, a beam is a comb.
-                    # The bar's extent is the LONGEST unbroken dark run,
-                    # not first-dark-to-last-dark: a clef or key
-                    # signature is dark in this band too, and measuring
-                    # from there reads the blank staff between them as
-                    # part of the bar. Probe through the run's own centre
-                    # row, not the middle line: an H-bar drawn in the
-                    # space above the line never touches it.
-                    dark = [c >= 0.5 for c in cols]
-                    best, start = (0, 0), None
-                    for i, d in enumerate(dark + [False]):
-                        if d and start is None:
-                            start = i
-                        elif not d and start is not None:
-                            if i - start > best[1] - best[0]:
-                                best = (start, i)
-                            start = None
-                    run_x0 = x0 + 8 + best[0]
-                    run_x1 = x0 + 8 + best[1]
-                    band_top = int(mid - interline * 0.7)
-                    centre_row = band_top + int(np.mean(np.where(row_mask)[0]))
-                    inset = int((run_x1 - run_x0) * 0.2)
-                    interior = range(run_x0 + inset, max(run_x1 - inset,
-                                                         run_x0 + inset + 1))
-                    heights = [
-                        _ink_through(pixels, x, centre_row, int(top - 3 * interline),
-                                     int(bottom + 3 * interline)) / interline
-                        for x in interior]
-                    stems = sum(1 for h in heights if h >= 2.5)
-                    # A beam has a stem every couple of interlines, ink
-                    # far taller than any bar; an H-bar has none inside
-                    # its ends. Two allowed for noise.
-                    if stems > 2:
-                        continue
-                    # And a bar has ink along its own centre line. The
-                    # thick rows of a bar-repeat slash or a bar of notes
-                    # are staff lines and smeared diagonals with a blank
-                    # row between them, so at most interior columns the
-                    # centre row holds nothing. Only the median is asked,
-                    # since a lightly printed bar comes through porous.
-                    if sorted(heights)[len(heights) // 2] < 0.1:
-                        continue
-                    # The count sits over the H-bar itself, not over the
-                    # bar's centre: a stack the engine merged with its
-                    # neighbour puts the two far apart.
-                    count = _read_count_above(image, top, interline,
-                                              (run_x0 + run_x1) // 2)
-                    for dx in (0, -80, 80) if not count else ():
-                        for dy, ch in ((58, 42), (80, 60), (44, 38)):
-                            count = _read_number(
-                                image, (x0 + x1) // 2 - 15 + dx,
-                                int(top) - dy, 25, ch)
-                            if count:
-                                break
-                        if count:
-                            break
-                    found.append({"count": count or 1, "read": bool(count),
-                                  "x0": x0, "x1": x1,
-                                  "stack": stack_ordinal - 1,
-                                  "extra_bars": _interior_barlines(
-                                      pixels, top, bottom, x0, x1, interline)})
+                    top, bottom = _staff_at(lines, (x0 + x1) / 2)
+                    interline = (bottom - top) / 4
+                    # A stack the engine merged over a barline holds two
+                    # printed bars, and a rest in the second is dark over
+                    # a third of the stack's width, which reads as no bar
+                    # at all. Each printed bar is probed on its own.
+                    edges = [x0] + _merged_bar_xs(
+                        pixels, top, bottom, x0, x1, interline, row_median,
+                        head=stack is stacks[0]) + [x1]
+                    for k, (a, b) in enumerate(zip(edges, edges[1:])):
+                        hit = probe(image, pixels, top, bottom, interline, a, b)
+                        if hit is None and stack is stacks[0] and k == 0:
+                            # The system's first bar shares its stack with
+                            # clef, key and time signature; a rest there
+                            # is dark over less of the width than a bar
+                            # of music, so the bar is probed past them.
+                            hit = probe(image, pixels, top, bottom, interline,
+                                        a + int(0.4 * (b - a)), b)
+                        if hit is None:
+                            continue
+                        hit.update(
+                            x0=x0, x1=x1, stack=stack_ordinal - 1, bar_offset=k,
+                            extra_bars=_interior_barlines(
+                                pixels, top, bottom, x0, x1, interline))
+                        found.append(hit)
+                        break  # one multirest per stack; a second is the same glyph
     # The engine sometimes splits one printed multirest into two stacks
     # (clef segment + bar). Contiguous H-bar stacks where only one carries
     # a readable count are one printed bar — merge them.
@@ -597,8 +722,14 @@ def stack_numbers(omr_path: Path, hbars: list[dict]) -> list[int]:
     counts = {}
     for (_, pixels, top, bottom, il, x0, x1, ordinal,
          _sx0) in _iter_stacks(omr_path):
+        if x1 - x0 < 3 * il:
+            # A sliver at a system's end holds a courtesy clef or time
+            # signature, not a bar.
+            counts[ordinal] = 0
+            continue
         counts[ordinal] = 1 + len(_merged_bar_xs(
-            pixels, top, bottom, x0, x1, il, medians.get(ordinal, 0)))
+            pixels, top, bottom, x0, x1, il, medians.get(ordinal, 0),
+            head=x0 == _sx0))
     for h in hbars:
         counts[h["stack"]] = h["count"] + h.get("extra_bars", 0)
     absorbed = {h["stack"] + k for h in hbars
@@ -663,6 +794,17 @@ def _rest_measure(duration: int):
     return m
 
 
+def _filler_measure(duration: int):
+    """A bar the export lost: whole-bar silence with a "?" over it, so a
+    proofreader knows the page has something here the engine did not."""
+    m = _rest_measure(duration)
+    direction = ET.Element("direction", placement="above")
+    dtype = ET.SubElement(direction, "direction-type")
+    ET.SubElement(dtype, "words", {"font-weight": "bold"}).text = "?"
+    m.insert(0, direction)
+    return m
+
+
 def _mark_multirest(measure, count: int) -> None:
     mr = measure.find(".//multiple-rest")
     if mr is not None:
@@ -698,25 +840,63 @@ def reconcile(result_path: Path, hbars: list[dict],
     tree = ET.parse(result_path)
     part = tree.getroot().find("part")
 
-    updated = inserted = 0
+    updated = inserted = padded = 0
     used = set()
+    # How far the XML runs ahead of the printed numbering at the last
+    # rest matched. Bars the export lost are padded as they are found,
+    # so the XML never lags for long; bars it invented are never removed,
+    # so once it runs ahead every later rest sits that much later than
+    # its number says, and is looked for there - not inserted again.
+    ahead = 0
+    assigned = {}  # span start -> count given to it
     for h in sorted(hbars, key=lambda h: h["stack"]):
         if h["stack"] >= len(numbers):
             continue
-        # Every multirest before this one has already been put right, so
-        # the XML is in printed numbering up to here and the printed
-        # number names the measure directly.
         measures = part.findall("measure")
         durations = _measure_durations(measures)
-        target = numbers[h["stack"]] - 1
+        target = numbers[h["stack"]] + h.get("bar_offset", 0) - 1
         count = h["count"]
-        near = [s for s in _rest_spans(measures)
-                if s[0] not in used and abs(s[0] - target) <= PLACEMENT_TOLERANCE]
+        # Two printed multirests side by side ("5" then "11") are one run
+        # of silent bars in the XML: what a run has beyond the count
+        # already given to it is the next rest's span.
+        spans = []
+        for start, marked, length in _rest_spans(measures):
+            if start in assigned:
+                given = assigned[start]
+                if length > given:
+                    spans.append((start + given, 0, length - given))
+            else:
+                spans.append((start, marked, length))
+        near = [s for s in spans
+                if s[0] not in used
+                and abs(s[0] - (target + ahead)) <= PLACEMENT_TOLERANCE]
+        logger.debug("multirest stack %d count %d read=%s: target %d ahead %d near %s",
+                     h["stack"], count, h["read"], target, ahead, near)
         if near:
-            start, marked, length = min(near, key=lambda s: abs(s[0] - target))
-            used.add(start)
+            # A span already marked with this very count is the rest,
+            # wherever it drifted to; otherwise the nearest.
+            exact = [s for s in near if s[1] == count]
+            start, marked, length = min(exact or near,
+                                        key=lambda s: abs(s[0] - (target + ahead)))
+            ahead = max(start - target, 0)
             if not h["read"] and marked >= count:
+                used.add(start)
                 continue  # an unread H-bar defaults to 1; keep the XML's
+            if start < target:
+                # The rest sits earlier than the page numbers it: the
+                # export lost bars before it (a measure it could not
+                # write, a system it skipped). The print says how many,
+                # not where; they go in right before the rest, each
+                # marked for the proofreader.
+                at = list(part).index(measures[start])
+                for k in range(target - start):
+                    part.insert(at + k, _filler_measure(durations[start]))
+                padded += target - start
+                measures = part.findall("measure")
+                durations = _measure_durations(measures)
+                start = target
+            used.add(start)
+            assigned[start] = count
             _mark_multirest(measures[start], count)
             # The page shows one printed rest; every bar of it is a whole
             # bar of silence. An engine may have written a quarter rest
@@ -735,7 +915,12 @@ def reconcile(result_path: Path, hbars: list[dict],
             if marked != count:
                 updated += 1
         else:
-            at_measure = min(max(target, 0), len(measures) - 1)
+            if not h["read"]:
+                # An unread bar is a 1 by default, which is only safe when
+                # the XML already holds a rest there; inserting a bar of
+                # silence into music on a default is how bars get invented.
+                continue
+            at_measure = min(max(target + ahead, 0), len(measures) - 1)
             at = list(part).index(measures[at_measure])
             duration = durations[at_measure]
             first = _rest_measure(duration)
@@ -746,10 +931,13 @@ def reconcile(result_path: Path, hbars: list[dict],
             used.add(at_measure)
             inserted += 1
 
-    if updated or inserted:
+    if updated or inserted or padded:
         for number, m in enumerate(part.findall("measure"), start=1):
             m.set("number", str(number))
         tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    if padded:
+        logger.info("%d bar(s) of silence put in before rests the page "
+                    "numbers later than the export had them", padded)
     return updated, inserted
 
 
@@ -765,6 +953,549 @@ def fix(work_dir: Path, result_path: Path) -> tuple[int, int]:
     return reconcile(result_path, hbars, stack_numbers(omr_files[0], hbars))
 
 
+
+# ---------------------------------------------------------------------------
+# Hairpins, repeat signs, tempo marks and text, all from the project file.
+# Audiveris recognises far more on the page than its MusicXML export
+# keeps: on one part it saw 8 hairpins and wrote 4, 12 repeat signs and
+# wrote 8, and no tempo mark at all. Each is placed here the way dynamics
+# are, by the printed bar its ink sits over.
+
+HAIRPIN_GRADE_MIN = 0.5
+
+
+def _sheet_roots(omr_path: Path):
+    """(sheet ordinal, parsed sheet XML) for every sheet, in order."""
+    with zipfile.ZipFile(omr_path) as z:
+        sheets = sorted(
+            {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+            key=lambda s: int(s.split("#")[1]))
+        for sheet_index, sheet in enumerate(sheets):
+            yield sheet_index, ET.fromstring(
+                z.read(f"{sheet}/{sheet}.xml").decode("utf-8", "replace"))
+
+
+def _centre(el) -> tuple[int, int, int, int] | None:
+    bounds = el.find("bounds")
+    if bounds is None:
+        return None
+    x, y, w, h = (int(float(bounds.get(k))) for k in ("x", "y", "w", "h"))
+    return x, y, w, h
+
+
+def _omr_hairpins(omr_path: Path, grade_min: float = HAIRPIN_GRADE_MIN):
+    """(sheet ordinal, x0, x1, y, "crescendo"|"diminuendo") for every
+    wedge Audiveris recognised."""
+    wedges = []
+    for sheet_index, root in _sheet_roots(omr_path):
+        for el in root.iter("wedge"):
+            shape = el.get("shape") or ""
+            if shape not in ("CRESCENDO", "DIMINUENDO"):
+                continue
+            if float(el.get("grade") or 0) < grade_min:
+                continue
+            box = _centre(el)
+            if box is None:
+                continue
+            x, y, w, h = box
+            wedges.append((sheet_index, x, x + w, y + h // 2, shape.lower()))
+    return wedges
+
+
+def place_hairpins(omr_path: Path, result_path: Path, hbars: list[dict]) -> int:
+    """Crescendo and diminuendo hairpins from the project file. A wedge
+    opens the bar under its left end and closes the bar under its right
+    end; a bar that already carries a wedge of that kind, or a
+    neighbour that does, has the exported copy and is left alone. Both
+    ends are always written together, so no hairpin is left open.
+    Returns hairpins placed."""
+    wedges = _omr_hairpins(omr_path)
+    if not wedges:
+        return 0
+    start_of = {}
+    for n, i in _locate_marks(
+            omr_path, hbars, [(s, x0, y, i) for i, (s, x0, _x1, y, _k) in enumerate(wedges)],
+            band="below", containing=True, slack_il=0.5):
+        start_of.setdefault(i, n)
+    stop_of = {}
+    for n, i in _locate_marks(
+            omr_path, hbars, [(s, x1, y, i) for i, (s, _x0, x1, y, _k) in enumerate(wedges)],
+            band="below", containing=True, slack_il=-0.5):
+        stop_of.setdefault(i, n)
+
+    tree = ET.parse(result_path)
+    part = tree.getroot().find("part")
+    measures = part.findall("measure")
+    by_number = _measure_index_by_number(measures)
+
+    def has_wedge(measure, kind) -> bool:
+        return any(w.get("type") == kind for w in measure.iter("wedge"))
+
+    def direction(kind):
+        d = ET.Element("direction", placement="below")
+        ET.SubElement(ET.SubElement(d, "direction-type"), "wedge", type=kind)
+        return d
+
+    placed = 0
+    for i, (_s, _x0, _x1, _y, kind) in enumerate(wedges):
+        if i not in start_of or i not in stop_of:
+            continue
+        bs, be = by_number.get(start_of[i]), by_number.get(stop_of[i])
+        if bs is None or be is None:
+            continue
+        be = max(be, bs)
+        if any(has_wedge(m, kind) for m in measures[max(bs - 1, 0):bs + 2]):
+            continue
+        measures[bs].insert(0, direction(kind))
+        measures[be].append(direction("stop"))
+        placed += 1
+    if placed:
+        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    return placed
+
+
+def _omr_repeat_signs(omr_path: Path):
+    """(sheet ordinal, x, y, "forward"|"backward") for every pair of
+    repeat dots, told apart by which side of its barline the pair
+    sits on."""
+    signs = []
+    for sheet_index, root in _sheet_roots(omr_path):
+        dots, barlines = [], []
+        for el in root.iter():
+            shape = el.get("shape") or ""
+            box = _centre(el)
+            if box is None:
+                continue
+            x, y, w, h = box
+            if shape == "REPEAT_DOT":
+                dots.append((x + w / 2, y + h / 2, el.get("staff")))
+            elif shape in ("THIN_BARLINE", "THICK_BARLINE"):
+                barlines.append((x + w / 2, y, y + h))
+        dots.sort()
+        used = set()
+        for i, (x, y, staff) in enumerate(dots):
+            if i in used:
+                continue
+            mate = next((j for j in range(i + 1, len(dots))
+                         if j not in used and dots[j][2] == staff
+                         and abs(dots[j][0] - x) < 8 and 4 < abs(dots[j][1] - y) < 40),
+                        None)
+            if mate is None:
+                continue
+            used.update({i, mate})
+            cy = (y + dots[mate][1]) / 2
+            near = [b for b in barlines if b[1] - 10 <= cy <= b[2] + 10 and abs(b[0] - x) < 40]
+            if not near:
+                continue
+            bx = min(near, key=lambda b: abs(b[0] - x))[0]
+            signs.append((sheet_index, int(x), int(cy),
+                          "backward" if x < bx else "forward"))
+    return signs
+
+
+def _strip_barline(measure, barline, tag: str) -> None:
+    """Remove the `tag` children of a barline; a barline left with only
+    its style goes too, and one that keeps an ending or repeat is
+    restyled to match what is left."""
+    for child in barline.findall(tag):
+        barline.remove(child)
+    if barline.find("ending") is None and barline.find("repeat") is None:
+        measure.remove(barline)
+        return
+    style = barline.find("bar-style")
+    if style is not None and barline.find("repeat") is None:
+        style.text = "regular"
+
+
+def _barline_of(measure, location: str):
+    """The measure's barline at `location`, created if absent, with its
+    bar-style child first as the schema orders."""
+    barline = next((b for b in measure.findall("barline")
+                    if b.get("location") == location), None)
+    if barline is None:
+        barline = ET.Element("barline", location=location)
+        if location == "right":
+            measure.append(barline)
+        else:
+            measure.insert(0, barline)
+    if barline.find("bar-style") is None:
+        barline.insert(0, ET.Element("bar-style"))
+        barline.find("bar-style").text = "regular"
+    return barline
+
+
+def place_repeats(omr_path: Path, result_path: Path, hbars: list[dict]) -> int:
+    """Repeat barlines from the project file's repeat dots. Dots left of
+    their barline close the bar they sit in; dots right of it open the
+    bar they sit in. Every repeat the export carried is dropped first:
+    it came from these same dots and moved with its drifting bar.
+    Returns repeat signs placed."""
+    signs = _omr_repeat_signs(omr_path)
+    if not signs:
+        return 0
+    located = _locate_marks(omr_path, hbars, signs, band="staff",
+                            containing=True, slack_il=0)
+    if not located:
+        return 0
+    tree = ET.parse(result_path)
+    part = tree.getroot().find("part")
+    measures = part.findall("measure")
+    by_number = _measure_index_by_number(measures)
+    # The export's repeats came from these same dots, attached to bars
+    # that have since drifted; the dots' own positions replace them.
+    for measure in measures:
+        for barline in list(measure.findall("barline")):
+            _strip_barline(measure, barline, "repeat")
+
+    placed = 0
+    for number, direction in located:
+        bi = by_number.get(number)
+        if bi is None:
+            continue
+        if any(r.get("direction") == direction for r in measures[bi].iter("repeat")):
+            continue
+        location = "right" if direction == "backward" else "left"
+        barline = _barline_of(measures[bi], location)
+        barline.find("bar-style").text = "light-heavy" if location == "right" else "heavy-light"
+        ET.SubElement(barline, "repeat", direction=direction)
+        placed += 1
+    if placed:
+        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    return placed
+
+
+def _omr_endings(omr_path: Path):
+    """(sheet ordinal, x0, x1, y, closed, number) for every volta bracket
+    Audiveris recognised: closed when it has a right leg, and numbered
+    from the text printed inside it ("1.", "1. 2.") when a word lies
+    there, else by its place in the run of brackets it belongs to."""
+    endings = []
+    for sheet_index, root in _sheet_roots(omr_path):
+        words = []
+        for w in root.iter("word"):
+            box = _centre(w)
+            value = (w.get("value") or "").strip()
+            if box is not None and re.fullmatch(r"[\d.,\s]+", value) and any(c.isdigit() for c in value):
+                words.append((box, value))
+        sheet_endings = []
+        for el in root.iter("ending"):
+            box = _centre(el)
+            line = el.find("line")
+            if box is None or line is None:
+                continue
+            x0 = float(line.find("p1").get("x"))
+            x1 = float(line.find("p2").get("x"))
+            y = float(line.find("p1").get("y"))
+            closed = el.find("right-leg") is not None
+            # The number stands just inside the left leg, on the line;
+            # a multirest count further along under the bracket does not.
+            inside = [v for (bx, by, bw, bh), v in words
+                      if x0 - 4 <= bx <= x0 + 60 and y - 4 <= by <= y + 40
+                      and all(int(n) <= 9 for n in re.findall(r"\d+", v))]
+            number = ", ".join(re.findall(r"\d+", inside[0])) if inside else None
+            sheet_endings.append([sheet_index, int(x0), int(x1), int(y), closed, number, el.get("staff")])
+        sheet_endings.sort(key=lambda e: (e[6], e[3], e[1]))
+        # Brackets that meet end to start form one run: number the
+        # unnumbered ones by position in the run.
+        run_index, prev = 0, None
+        for e in sheet_endings:
+            if prev is not None and e[6] == prev[6] and abs(e[3] - prev[3]) < 30 and e[1] - prev[2] < 40:
+                run_index += 1
+            else:
+                run_index = 0
+            if e[5] is None:
+                e[5] = str(run_index + 1)
+            prev = e
+        endings.extend(tuple(e[:6]) for e in sheet_endings)
+    return endings
+
+
+def place_endings(omr_path: Path, result_path: Path, hbars: list[dict]) -> int:
+    """Volta brackets from the project file. A bracket opens the bar its
+    left leg stands on and closes the bar its line ends over - as a
+    stop when it has a right leg, otherwise open-ended. Every ending
+    the export carried is dropped first: it came from these same
+    brackets and moved with its drifting bar. Returns brackets placed."""
+    endings = _omr_endings(omr_path)
+    if not endings:
+        return 0
+    start_of, stop_of = {}, {}
+    for n, i in _locate_marks(
+            omr_path, hbars, [(s, x0, y + 20, i) for i, (s, x0, _x1, y, _c, _n) in enumerate(endings)],
+            band="above", containing=True, slack_il=0.5):
+        start_of.setdefault(i, n)
+    for n, i in _locate_marks(
+            omr_path, hbars, [(s, x1, y + 20, i) for i, (s, _x0, x1, y, _c, _n) in enumerate(endings)],
+            band="above", containing=True, slack_il=-1.0):
+        stop_of.setdefault(i, n)
+    if not start_of:
+        return 0
+    tree = ET.parse(result_path)
+    part = tree.getroot().find("part")
+    measures = part.findall("measure")
+    by_number = _measure_index_by_number(measures)
+    for measure in measures:
+        for barline in list(measure.findall("barline")):
+            _strip_barline(measure, barline, "ending")
+
+    def add(measure, location, number, kind):
+        barline = _barline_of(measure, location)
+        ending = ET.Element("ending", number=number, type=kind)
+        repeat = barline.find("repeat")
+        if repeat is not None:
+            barline.insert(list(barline).index(repeat), ending)
+        else:
+            barline.append(ending)
+
+    placed = 0
+    for i, (_s, _x0, _x1, _y, closed, number) in enumerate(endings):
+        if i not in start_of or i not in stop_of:
+            continue
+        bs, be = by_number.get(start_of[i]), by_number.get(stop_of[i])
+        if bs is None or be is None:
+            continue
+        be = max(be, bs)
+        add(measures[bs], "left", number, "start")
+        add(measures[be], "right", number, "stop" if closed else "discontinue")
+        placed += 1
+    if placed:
+        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    return placed
+
+
+def _ocr_tsv(image) -> list[tuple[int, int, int, int, str]]:
+    """(left, top, width, height, text) for every word Tesseract finds
+    in the image, sparse-text mode."""
+    import io
+    import subprocess
+
+    try:
+        from app.fix_multirests import TESSERACT
+    except ImportError:
+        from fix_multirests import TESSERACT
+    buf = io.BytesIO()
+    image.save(buf, "PNG")
+    proc = subprocess.run(
+        [TESSERACT, "stdin", "stdout", "--psm", "11", "tsv"],
+        input=buf.getvalue(), capture_output=True, timeout=120)
+    words = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines()[1:]:
+        cols = line.split("\t")
+        if len(cols) < 12 or cols[0] != "5" or not cols[11].strip():
+            continue
+        words.append((int(cols[6]), int(cols[7]), int(cols[8]), int(cols[9]),
+                      cols[11].strip()))
+    return words
+
+
+def detect_tempo_marks(omr_path: Path) -> list[tuple[int, int, int, int]]:
+    """(sheet ordinal, x, y, bpm) for every metronome mark on the pages,
+    read from the strip above each system. Audiveris's OCR does not
+    survive the note glyph in "♩ = 132"; the "= 132" after it reads
+    fine, and the mark stands over the bar it starts."""
+    import io
+
+    from PIL import Image
+
+    marks = []
+    with zipfile.ZipFile(omr_path) as z:
+        sheets = sorted(
+            {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+            key=lambda s: int(s.split("#")[1]))
+        for sheet_index, sheet in enumerate(sheets):
+            root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml")
+                                 .decode("utf-8", "replace"))
+            image = Image.open(io.BytesIO(z.read(f"{sheet}/BINARY.png"))) \
+                .convert("L")
+            for system in root.iter("system"):
+                staff = system.find(".//staff")
+                lines = staff.findall("lines/line") if staff is not None else []
+                stacks = system.findall("stack")
+                if len(lines) < 5 or not stacks:
+                    continue
+                sx0 = min(float(st.get("left")) for st in stacks)
+                sx1 = max(float(st.get("right")) for st in stacks)
+                top_l, bottom_l = _staff_at(lines, sx0)
+                top_r, _ = _staff_at(lines, sx1)
+                il = (bottom_l - top_l) / 4
+                y0 = max(int(min(top_l, top_r) - 7 * il), 0)
+                y1 = int(max(top_l, top_r) - 0.3 * il)
+                if y1 <= y0:
+                    continue
+                strip = image.crop((0, y0, image.width, y1))
+                words = _ocr_tsv(strip)
+                for i, (x, y, w, h, text) in enumerate(words):
+                    # The note glyph rides along in the token ("d=132",
+                    # "@=160") or the "=" stands alone before the number.
+                    m = re.search(r"[=]\s*(\d{2,3})\D*$", text)
+                    if m is None:
+                        if not re.fullmatch(r"\d{2,3}", text) or i == 0:
+                            continue
+                        px, _py, pw, _ph, ptext = words[i - 1]
+                        if not ptext.endswith("=") or x - (px + pw) > 2 * il:
+                            continue
+                        m = re.match(r"(\d{2,3})", text)
+                        x = px - int(1.5 * il)
+                    bpm = int(m.group(1))
+                    if not 40 <= bpm <= 240:
+                        continue
+                    marks.append((sheet_index, int(x), y0 + y + h // 2, bpm))
+    return marks
+
+
+def place_tempo_marks(omr_path: Path, result_path: Path, hbars: list[dict]) -> int:
+    """Metronome marks read off the pages, one per bar they stand over.
+    A bar that already carries one keeps it. The beat unit follows the
+    time signature in force: a dotted quarter in compound metre, a
+    quarter otherwise. Returns marks placed."""
+    marks = detect_tempo_marks(omr_path)
+    if not marks:
+        return 0
+    located = _locate_marks(omr_path, hbars, marks, band="above")
+    if not located:
+        return 0
+    tree = ET.parse(result_path)
+    part = tree.getroot().find("part")
+    measures = part.findall("measure")
+    by_number = _measure_index_by_number(measures)
+    beat_type_at = []
+    beats, beat_type = 4, 4
+    for measure in measures:
+        for attrs in measure.findall("attributes"):
+            time = attrs.find("time")
+            if time is not None:
+                beats = int(time.findtext("beats") or beats)
+                beat_type = int(time.findtext("beat-type") or beat_type)
+        beat_type_at.append((beats, beat_type))
+    placed = 0
+    for number, bpm in located:
+        bi = by_number.get(number)
+        if bi is None or measures[bi].find(".//metronome") is not None:
+            continue
+        beats, beat_type = beat_type_at[bi]
+        compound = beat_type == 8 and beats % 3 == 0 and beats > 3
+        d = ET.Element("direction", placement="above")
+        metronome = ET.SubElement(ET.SubElement(d, "direction-type"), "metronome")
+        ET.SubElement(metronome, "beat-unit").text = "quarter"
+        if compound:
+            ET.SubElement(metronome, "beat-unit-dot")
+        ET.SubElement(metronome, "per-minute").text = str(bpm)
+        ET.SubElement(d, "sound", tempo=str(int(bpm * 1.5) if compound else bpm))
+        measures[bi].insert(0, d)
+        placed += 1
+    if placed:
+        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    return placed
+
+
+# A mute or a cue read as a chord name ("Cup") is text over the bar all
+# the same, and on a single-line part a chord symbol is too.
+TEXT_ROLES = ("Direction", "UnknownRole", "ChordName")
+
+
+def _omr_text(omr_path: Path):
+    """(sheet ordinal, x, y, text) for every sentence Audiveris read as a
+    direction or could not classify - the tempo words, mutes and cues
+    it drops from its export - left of the sentence, at its height.
+    A sentence and its words are separate inters; the words are the
+    ones whose boxes lie inside the sentence's box."""
+    found = []
+    for sheet_index, root in _sheet_roots(omr_path):
+        words = []
+        for w in root.iter("word"):
+            box = _centre(w)
+            if box is not None and (w.get("value") or "").strip():
+                words.append((box, w.get("value").strip()))
+        for sentence in root.iter("sentence"):
+            if sentence.get("role") not in TEXT_ROLES:
+                continue
+            box = _centre(sentence)
+            if box is None:
+                continue
+            x, y, w, h = box
+            inside = sorted(
+                (bx, v) for (bx, by, bw, bh), v in words
+                if x - 2 <= bx + bw / 2 <= x + w + 2 and y - 2 <= by + bh / 2 <= y + h + 2)
+            if not inside:
+                continue
+            found.append((sheet_index, x, y + h // 2, " ".join(v for _, v in inside)))
+    return found
+
+
+def place_text(omr_path: Path, result_path: Path, hbars: list[dict]) -> int:
+    """Text directions from the project file: tempo words, mutes, cues,
+    song titles inside a medley. Above the staff a sentence names the
+    bar it starts over; below, the bar it lies in. Every word the
+    export carried is dropped first - it came from these same
+    sentences and moved with its drifting bar - and anything clean_word
+    calls debris or a bare number is not placed. Returns sentences
+    placed."""
+    try:
+        from app.postprocess import clean_word
+    except ImportError:
+        from postprocess import clean_word
+    sentences = _omr_text(omr_path)
+    if not sentences:
+        return 0
+    cleaned = []
+    for sheet, x, y, text in sentences:
+        value = clean_word(text)
+        if value is None or value.replace(".", "").isdigit():
+            continue
+        cleaned.append((sheet, x, y, value))
+    # Text between two systems is read as a direction over the lower
+    # one; only what no system has above it is taken as lying below.
+    indexed = [(sh, x, y, i) for i, (sh, x, y, _v) in enumerate(cleaned)]
+    located = _locate_marks(omr_path, hbars, indexed, band="above")
+    seen = {i for _, i in located}
+    located += _locate_marks(omr_path, hbars, [m for m in indexed if m[3] not in seen],
+                             band="below", containing=True)
+    if not located:
+        return 0
+    tree = ET.parse(result_path)
+    part = tree.getroot().find("part")
+    measures = part.findall("measure")
+    by_number = _measure_index_by_number(measures)
+    # The export's words came from these same sentences, attached to
+    # bars that have since drifted; the sentences' own positions
+    # replace them. The "?" over a bar the export lost is not text.
+    for measure in measures:
+        for d in list(measure.findall("direction")):
+            for dtype in list(d.findall("direction-type")):
+                for w in list(dtype.findall("words")):
+                    if (w.text or "").strip() != "?":
+                        dtype.remove(w)
+                if len(dtype) == 0:
+                    d.remove(dtype)
+            if d.find("direction-type") is None:
+                measure.remove(d)
+
+    def norm(t: str) -> str:
+        return " ".join((t or "").lower().split())
+
+    def texts_near(bi):
+        return {norm(w.text) for m in measures[max(bi - 1, 0):bi + 2]
+                for w in m.iter("words")} | {
+                    norm(r.text) for m in measures[max(bi - 1, 0):bi + 2]
+                    for r in m.iter("rehearsal")}
+
+    placed = 0
+    for number, i in located:
+        value = cleaned[i][3]
+        bi = by_number.get(number)
+        if bi is None:
+            continue
+        if norm(value) in texts_near(bi):
+            continue
+        d = ET.Element("direction", placement="above")
+        ET.SubElement(ET.SubElement(d, "direction-type"), "words").text = value
+        measures[bi].insert(0, d)
+        placed += 1
+    if placed:
+        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    return placed
+
+
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         sys.exit(__doc__)
@@ -776,6 +1507,11 @@ if __name__ == "__main__":
 # Audiveris also files bar numbers ("120") and OCR noise ("Tfs") under
 # <rehearsal>, and a bar number placed as a mark is worse than none.
 _REHEARSAL_VALUE = re.compile(r"^[A-Z]{1,2}\d?$")
+# A boxed bar number is a rehearsal mark too, placed by its ink like a
+# letter: the bar it stands over is the bar it stands over, whatever the
+# export attached it to. Its value stays as printed, so a number over a
+# bar the pipeline counts differently still tells the reader the truth.
+_REHEARSAL_NUMBER = re.compile(r"^\d{1,3}$")
 
 
 def _omr_rehearsal_marks(omr_path: Path) -> list[tuple[int, int, int, str]]:
@@ -808,32 +1544,34 @@ def _omr_rehearsal_marks(omr_path: Path) -> list[tuple[int, int, int, str]]:
     return marks
 
 
-def _place_marks(omr_path: Path, result_path: Path, hbars: list[dict],
-                 marks: list[tuple[int, int, int, str]], make_direction,
-                 replaces, band: str = "above", skip_if=None,
-                 containing: bool = False) -> int:
-    """Put page marks into the score by the printed bar they sit over.
+def _locate_marks(omr_path: Path, hbars: list[dict],
+                  marks: list[tuple[int, int, int, object]],
+                  band: str = "above", containing: bool = False,
+                  slack_il: float = 2.0) -> list[tuple[int, object]]:
+    """The printed measure number each page mark sits over.
 
-    `marks` are (sheet ordinal, x, y, value); `make_direction(value)`
-    builds the <direction> to insert; `replaces(direction)` says which
-    existing directions are earlier placements of the same kind and
-    must go first. A mark inside a stack the engine merged with its
+    `marks` are (sheet ordinal, x, y, value); the value is carried
+    through untouched. A mark inside a stack the engine merged with its
     neighbour is assigned to the printed bar it actually sits over,
-    counted off the interior barlines. Returns marks placed."""
+    counted off the interior barlines. `containing` names the bar the
+    mark lies inside (a dynamic under its note) rather than the bar
+    whose starting barline is nearest (a letter over the barline), with
+    `slack_il` interlines of tolerance for ink that begins a little
+    before its bar. Returns (printed number, value) in mark order."""
     if not marks:
-        return 0
+        return []
     # Two readers can see the same mark: same sheet and same place.
     deduped = []
     for m in marks:
         if any(d[0] == m[0] and abs(d[1] - m[1]) < 40 and abs(d[2] - m[2]) < 40
-               for d in deduped):
+               and d[3] == m[3] for d in deduped):
             continue
         deduped.append(m)
     marks = deduped
 
     numbers = stack_numbers(omr_path, hbars)
     by_stack = {h["stack"]: h for h in hbars}
-    placed_at = []  # (printed measure number, value)
+    located = []  # (printed measure number, value)
     with zipfile.ZipFile(omr_path) as z:
         sheets = sorted(
             {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
@@ -860,13 +1598,14 @@ def _place_marks(omr_path: Path, result_path: Path, hbars: list[dict],
                 stacks = system.findall("stack")
                 if len(lines) < 5:
                     continue  # mirrors _iter_stacks: these stacks have no ordinal
-                top = float(lines[0].find("point").get("y"))
-                bottom = float(lines[-1].find("point").get("y"))
-                il = (bottom - top) / 4
                 bounds = [(int(float(s.get("left"))), int(float(s.get("right"))))
                           for s in stacks]
+                boundaries = None
                 for _, mx, my, value in sheet_marks:
+                    top, bottom = _staff_at(lines, mx)
+                    il = (bottom - top) / 4
                     in_band = ((top - 8 * il < my < top) if band == "above"
+                               else (top - il < my < bottom + il) if band == "staff"
                                else (bottom < my < bottom + 6 * il))
                     if not in_band:
                         continue  # belongs to another system
@@ -877,17 +1616,20 @@ def _place_marks(omr_path: Path, result_path: Path, hbars: list[dict],
                     if (not bounds or mx > bounds[-1][1] + 2 * il
                             or mx < bounds[0][0] - 2 * il):
                         continue
-                    row_median = statistics.median(sx1 - sx0 for sx0, sx1 in bounds)
-                    boundaries = []  # (x, stack index, bar index within stack)
-                    for si, (sx0, sx1) in enumerate(bounds):
-                        boundaries.append((sx0, si, 0))
-                        for k, bx in enumerate(_merged_bar_xs(
-                                pixels, top, bottom, sx0, sx1, il, row_median), start=1):
-                            boundaries.append((bx, si, k))
+                    if boundaries is None:
+                        row_median = statistics.median(sx1 - sx0 for sx0, sx1 in bounds)
+                        boundaries = []  # (x, stack index, bar index within stack)
+                        for si, (sx0, sx1) in enumerate(bounds):
+                            boundaries.append((sx0, si, 0))
+                            s_top, s_bottom = _staff_at(lines, (sx0 + sx1) / 2)
+                            for k, bx in enumerate(_merged_bar_xs(
+                                    pixels, s_top, s_bottom, sx0, sx1, il, row_median,
+                                    head=si == 0), start=1):
+                                boundaries.append((bx, si, k))
                     if containing:
                         # A dynamic sits under the note it governs, inside
                         # its bar: the last boundary at or left of it.
-                        left = [b for b in boundaries if b[0] <= mx + 2 * il]
+                        left = [b for b in boundaries if b[0] <= mx + slack_il * il]
                         bx, si, k = max(left, key=lambda b: b[0]) if left else boundaries[0]
                     else:
                         # A letter or sign sits over the barline STARTING its bar.
@@ -898,23 +1640,44 @@ def _place_marks(omr_path: Path, result_path: Path, hbars: list[dict],
                     number = numbers[stack_idx]
                     if k:
                         h = by_stack.get(stack_idx)
-                        number += (h["count"] + k - 1) if h else k
-                    placed_at.append((number, value))
+                        number += k
+                        if h and h.get("bar_offset", 0) < k:
+                            number += h["count"] - 1  # the rest lies before this bar
+                    located.append((number, value))
                 ordinal += len(stacks)
+    return located
 
+
+def _measure_index_by_number(measures) -> dict[int, int]:
+    """XML measure index for each printed number the score covers."""
+    try:
+        from app.postprocess import _printed_numbers
+    except ImportError:  # local_bench puts app/ itself on sys.path
+        from postprocess import _printed_numbers
+    by_number = {}
+    for i, n in enumerate(_printed_numbers(measures)):
+        by_number.setdefault(n, i)
+    return by_number
+
+
+def _place_marks(omr_path: Path, result_path: Path, hbars: list[dict],
+                 marks: list[tuple[int, int, int, str]], make_direction,
+                 replaces, band: str = "above", skip_if=None,
+                 containing: bool = False, at_end: bool = False) -> int:
+    """Put page marks into the score by the printed bar they sit over.
+
+    `marks` are (sheet ordinal, x, y, value); `make_direction(value)`
+    builds the <direction> to insert; `replaces(direction)` says which
+    existing directions are earlier placements of the same kind and
+    must go first. The direction opens its bar, or closes it when
+    `at_end` (a hairpin's stop). Returns marks placed."""
+    placed_at = _locate_marks(omr_path, hbars, marks, band, containing)
     if not placed_at:
         return 0
     tree = ET.parse(result_path)
     part = tree.getroot().find("part")
     measures = part.findall("measure")
-    try:
-        from app.postprocess import _printed_numbers
-    except ImportError:  # local_bench puts app/ itself on sys.path
-        from postprocess import _printed_numbers
-    base_numbers = _printed_numbers(measures)
-    base_by_number = {}
-    for i, n in enumerate(base_numbers):
-        base_by_number.setdefault(n, i)
+    base_by_number = _measure_index_by_number(measures)
 
     for measure in measures:  # drop earlier placements of this kind
         for d in list(measure.findall("direction")):
@@ -927,7 +1690,10 @@ def _place_marks(omr_path: Path, result_path: Path, hbars: list[dict],
             continue
         if skip_if is not None and skip_if(measures, bi, value):
             continue
-        measures[bi].insert(0, make_direction(value))
+        if at_end:
+            measures[bi].append(make_direction(value))
+        else:
+            measures[bi].insert(0, make_direction(value))
         placed += 1
     if placed:
         tree.write(result_path, encoding="UTF-8", xml_declaration=True)
@@ -936,16 +1702,31 @@ def _place_marks(omr_path: Path, result_path: Path, hbars: list[dict],
 
 def place_rehearsals(omr_path: Path, result_path: Path, hbars: list[dict],
                      extra_marks: list[tuple[int, int, int, str]] = ()) -> int:
-    """Authoritative rehearsal-letter placement: each mark's pixel position
+    """Authoritative rehearsal-mark placement: each mark's pixel position
     falls in a printed bar, and the verified multirest numbering turns
     that into a printed measure number. Replaces any previously grafted
     rehearsal directions.
 
     Marks come from Audiveris's own recognition plus `extra_marks` in the
     same (sheet, x, y, value) shape - the circled letters it never reads.
-    Values that are not a letter are dropped."""
+    Letters and boxed bar numbers are placed; anything else is dropped."""
     marks = [m for m in list(_omr_rehearsal_marks(omr_path)) + list(extra_marks)
-             if _REHEARSAL_VALUE.match(m[3])]
+             if _REHEARSAL_VALUE.match(m[3]) or _REHEARSAL_NUMBER.match(m[3])]
+    # A boxed number the OCR mangled ("9:6", "14-4") is neither a letter
+    # nor a number and stands for nothing; it goes whatever else is placed.
+    tree = ET.parse(result_path)
+    dropped = 0
+    for measure in tree.getroot().iter("measure"):
+        for d in list(measure.findall("direction")):
+            for dtype in d.findall("direction-type"):
+                reh = dtype.find("rehearsal")
+                if reh is not None and not (_REHEARSAL_VALUE.match(reh.text or "")
+                                            or _REHEARSAL_NUMBER.match(reh.text or "")):
+                    measure.remove(d)
+                    dropped += 1
+                    break
+    if dropped:
+        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
 
     def make(value):
         direction = ET.Element("direction", placement="above")

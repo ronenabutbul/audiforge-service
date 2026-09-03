@@ -345,8 +345,9 @@ def _repair_structure(job_id: str, job_dir: Path, result: Path,
     it was rather than losing the conversion.
     """
     from app.fix_hbars import (detect_circled_letters, detect_hbars,
-                                place_dynamics, place_rehearsals, place_signs,
-                                stack_numbers)
+                                place_dynamics, place_endings, place_hairpins,
+                                place_rehearsals, place_repeats, place_signs,
+                                place_tempo_marks, place_text, stack_numbers)
     from app.fix_hbars import fix as fix_hbars
     from app.fix_multirests import fix as fix_multirest_counts
     from app.fix_structure import fix as fix_structure
@@ -424,6 +425,15 @@ def _repair_structure(job_id: str, job_dir: Path, result: Path,
                             job_id, dyn)
         except Exception:
             logger.exception("job %s: dynamics placement failed", job_id)
+        for label, place in (("hairpins", place_hairpins), ("repeats", place_repeats),
+                             ("endings", place_endings), ("tempo marks", place_tempo_marks),
+                             ("text", place_text)):
+            try:
+                n = place(omr, result, hbars)
+                if n:
+                    logger.info("job %s: %d %s placed from the page", job_id, n, label)
+            except Exception:
+                logger.exception("job %s: %s placement failed", job_id, label)
 
 
 def _process_job(job_id: str, source: Path):
@@ -480,13 +490,6 @@ def _process_job(job_id: str, source: Path):
                 logger.exception("job %s: fusion graft failed; keeping homr",
                                  job_id)
             try:
-                repaired, dropped = postprocess.clean_words(result_path)
-                if repaired or dropped:
-                    logger.info("job %s: words - %d repaired, %d debris dropped",
-                                job_id, repaired, dropped)
-            except Exception:
-                logger.exception("job %s: word cleanup failed", job_id)
-            try:
                 # Independent of the alignment above: the time symbol is
                 # keyed by the signature itself, so it survives a score
                 # the two engines could not align.
@@ -496,6 +499,16 @@ def _process_job(job_id: str, source: Path):
                                 job_id, stamped)
             except Exception:
                 logger.exception("job %s: time-symbol graft failed", job_id)
+
+        # Either base: Audiveris' own export carries the same OCR debris
+        # the graft would have brought in.
+        try:
+            repaired, dropped = postprocess.clean_words(result_path)
+            if repaired or dropped:
+                logger.info("job %s: words - %d repaired, %d debris dropped",
+                            job_id, repaired, dropped)
+        except Exception:
+            logger.exception("job %s: word cleanup failed", job_id)
 
         # Structure repair, which only became possible server-side once
         # Audiveris started running in this container: every step below

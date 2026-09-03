@@ -32,13 +32,18 @@ sys.path.insert(0, str(BENCH_DIR.parent / "benchmark"))
 sys.path.insert(0, str(BENCH_DIR.parent / "app"))
 import score as scorer  # noqa: E402
 from fix_hbars import (detect_circled_letters, detect_hbars,  # noqa: E402
-                       place_dynamics, place_rehearsals, place_signs, stack_numbers)
+                       place_dynamics, place_endings, place_hairpins,
+                       place_rehearsals, place_repeats, place_signs,
+                       place_tempo_marks, place_text, stack_numbers)
 from fix_hbars import fix as fix_hbars  # noqa: E402
 from fix_multirests import fix as fix_multirest_counts  # noqa: E402
 from fix_structure import fix as fix_structure  # noqa: E402
 from fix_tempo import fix as fix_tempo  # noqa: E402
 from fix_titles import fix as fix_titles  # noqa: E402
-from postprocess import app_compat, graft_features, graft_numbered, normalize_homr  # noqa: E402
+from postprocess import (app_compat, beam_by_beat, clean_words,  # noqa: E402
+                         drop_phantom_clef_changes, graft_features,
+                         graft_missing_measures, graft_numbered,
+                         graft_time_symbol, normalize_homr)
 from transpose import apply_transpose  # noqa: E402
 
 MSCORE = Path("/Applications/MuseScore 4.app/Contents/MacOS/mscore")
@@ -94,6 +99,13 @@ def convert(pdf: Path) -> Path:
     else:
         result.write_bytes(aud_out.read_bytes())
         role = f"audiveris base (validity {a_val:.0%} vs homr {h_val:.0%})"
+    repaired, dropped = clean_words(result)
+    if repaired or dropped:
+        print(f"  words: {repaired} repaired, {dropped} debris dropped", flush=True)
+    if role.startswith("homr") and aud_out:
+        stamped = graft_time_symbol(result, aud_out)
+        if stamped:
+            print(f"  {stamped} time signatures stamped C/cut", flush=True)
 
     if aud_out is not None:
         fixed = fix_multirest_counts(work, result)
@@ -105,25 +117,37 @@ def convert(pdf: Path) -> Path:
         if updated or inserted:
             print(f"  H-bar reconciliation: {updated} counts corrected, "
                   f"{inserted} missed multirests inserted", flush=True)
-        if result.read_bytes() != aud_out.read_bytes():
+        if True:  # every placement below reads the page, whichever engine won
             sec_numbers = None
             omr = next(work.rglob("*.omr"), None)
+            hbars = detect_hbars(omr) if omr is not None else []
             if omr is not None:
-                hbars = detect_hbars(omr)
-                if hbars:
-                    sec_numbers = stack_numbers(omr, hbars)
+                sec_numbers = stack_numbers(omr, hbars)
+            missing = graft_missing_measures(result, aud_out)
+            if missing:
+                print(f"  {missing} bar(s) the base engine skipped put back "
+                      f"from the other engine", flush=True)
             n = graft_numbered(result, aud_out, sec_numbers)
             if n:
                 print(f"  {n} rehearsal/lyric elements placed by printed "
                       f"number", flush=True)
-            if omr is not None and hbars:
+            if omr is not None:
                 p = place_rehearsals(omr, result, hbars,
                                      extra_marks=detect_circled_letters(omr))
-                place_signs(omr, result, hbars)
-                place_dynamics(omr, result, hbars)
                 if p:
                     print(f"  {p} rehearsal letters re-placed by pixel "
                           f"position", flush=True)
+                counts = {
+                    "signs": place_signs(omr, result, hbars),
+                    "dynamics": place_dynamics(omr, result, hbars),
+                    "hairpins": place_hairpins(omr, result, hbars),
+                    "repeats": place_repeats(omr, result, hbars),
+                    "endings": place_endings(omr, result, hbars),
+                    "tempo marks": place_tempo_marks(omr, result, hbars),
+                    "text": place_text(omr, result, hbars),
+                }
+                print("  placed from the page: " + ", ".join(
+                    f"{v} {k}" for k, v in counts.items()), flush=True)
     # Metadata first: fix_titles strips movement-title when it builds a
     # credit header, and apply_metadata must not re-create it afterwards.
     apply_metadata(result, name)
@@ -148,6 +172,9 @@ def convert(pdf: Path) -> Path:
                   f"(homr {h} vs audiveris {a}) — bars may be missing",
                   flush=True)
 
+    phantom = drop_phantom_clef_changes(result)
+    beamed = beam_by_beat(result)
+    print(f"  {beamed} notes beamed, {phantom} phantom clef/key/fermata removed", flush=True)
     app_compat(result)
 
     root = ET.parse(result).getroot()
@@ -197,6 +224,8 @@ def main():
                 summary.append((name, validity(result), notes))
             except Exception as exc:
                 print(f"  CONVERSION FAILED: {exc}", flush=True)
+                import traceback
+                traceback.print_exc()
                 summary.append((name, None, 0))
         print("\n== SUMMARY " + "=" * 40)
         for name, val, notes in summary:
@@ -212,6 +241,8 @@ def main():
             convert(pdf)
         except Exception as exc:  # keep the batch going
             print(f"  CONVERSION FAILED: {exc}", flush=True)
+            import traceback
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
