@@ -810,7 +810,8 @@ def _omr_rehearsal_marks(omr_path: Path) -> list[tuple[int, int, int, str]]:
 
 def _place_marks(omr_path: Path, result_path: Path, hbars: list[dict],
                  marks: list[tuple[int, int, int, str]], make_direction,
-                 replaces) -> int:
+                 replaces, band: str = "above", skip_if=None,
+                 containing: bool = False) -> int:
     """Put page marks into the score by the printed bar they sit over.
 
     `marks` are (sheet ordinal, x, y, value); `make_direction(value)`
@@ -865,7 +866,9 @@ def _place_marks(omr_path: Path, result_path: Path, hbars: list[dict],
                 bounds = [(int(float(s.get("left"))), int(float(s.get("right"))))
                           for s in stacks]
                 for _, mx, my, value in sheet_marks:
-                    if not (top - 8 * il < my < top):
+                    in_band = ((top - 8 * il < my < top) if band == "above"
+                               else (bottom < my < bottom + 6 * il))
+                    if not in_band:
                         continue  # belongs to another system
                     # Not this system's if it lies beyond either end: a
                     # coda fragment engraved beside the main system shares
@@ -881,8 +884,14 @@ def _place_marks(omr_path: Path, result_path: Path, hbars: list[dict],
                         for k, bx in enumerate(_merged_bar_xs(
                                 pixels, top, bottom, sx0, sx1, il, row_median), start=1):
                             boundaries.append((bx, si, k))
-                    # A mark sits over the barline STARTING its bar.
-                    bx, si, k = min(boundaries, key=lambda b: abs(b[0] - mx))
+                    if containing:
+                        # A dynamic sits under the note it governs, inside
+                        # its bar: the last boundary at or left of it.
+                        left = [b for b in boundaries if b[0] <= mx + 2 * il]
+                        bx, si, k = max(left, key=lambda b: b[0]) if left else boundaries[0]
+                    else:
+                        # A letter or sign sits over the barline STARTING its bar.
+                        bx, si, k = min(boundaries, key=lambda b: abs(b[0] - mx))
                     stack_idx = ordinal + si
                     if stack_idx >= len(numbers):
                         continue
@@ -915,6 +924,8 @@ def _place_marks(omr_path: Path, result_path: Path, hbars: list[dict],
     for number, value in placed_at:
         bi = base_by_number.get(number)
         if bi is None:
+            continue
+        if skip_if is not None and skip_if(measures, bi, value):
             continue
         measures[bi].insert(0, make_direction(value))
         placed += 1
@@ -1020,3 +1031,57 @@ def place_signs(omr_path: Path, result_path: Path, hbars: list[dict]) -> int:
 
     return _place_marks(omr_path, result_path, hbars, _omr_sign_marks(omr_path),
                         make, replaces)
+
+
+# Audiveris recognises many more dynamics than it exports: on the bench a
+# quartet part had 215 marked in the project file and 71 in the MusicXML.
+# The unexported ones are not all low grade, but the low-grade ones are
+# where the noise is.
+DYNAMICS_GRADE_MIN = 0.5
+
+
+def _omr_dynamics(omr_path: Path, grade_min: float = DYNAMICS_GRADE_MIN):
+    """(sheet ordinal, x, y, "mf"|"p"|...) for the dynamics Audiveris
+    recognised in the project file."""
+    marks = []
+    with zipfile.ZipFile(omr_path) as z:
+        sheets = sorted(
+            {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+            key=lambda s: int(s.split("#")[1]))
+        for sheet_index, sheet in enumerate(sheets):
+            root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml")
+                                 .decode("utf-8", "replace"))
+            for el in root.iter("dynamics"):
+                shape, bounds = el.get("shape") or "", el.find("bounds")
+                if not shape.startswith("DYNAMICS_") or bounds is None:
+                    continue
+                if float(el.get("grade") or 0) < grade_min:
+                    continue
+                x, y, w, h = (int(float(bounds.get(k))) for k in ("x", "y", "w", "h"))
+                marks.append((sheet_index, x + w // 2, y + h // 2,
+                              shape[len("DYNAMICS_"):].lower()))
+    return marks
+
+
+def place_dynamics(omr_path: Path, result_path: Path, hbars: list[dict],
+                   grade_min: float = DYNAMICS_GRADE_MIN) -> int:
+    """Put the dynamics Audiveris recognised but did not export on the
+    bars they are printed under. A bar that already carries that dynamic
+    (from the fusion graft) is left alone. Returns dynamics placed."""
+    def make(kind):
+        direction = ET.Element("direction", placement="below")
+        dtype = ET.SubElement(direction, "direction-type")
+        ET.SubElement(ET.SubElement(dtype, "dynamics"), kind)
+        return direction
+
+    def skip_if(measures, index, kind):
+        # The fusion graft may have put this same mark a bar off; a twin
+        # next door is a duplicate, not a second dynamic.
+        return any(c.tag == kind
+                   for i in range(max(index - 1, 0), min(index + 2, len(measures)))
+                   for d in measures[i].iter("dynamics") for c in d)
+
+    return _place_marks(omr_path, result_path, hbars,
+                        _omr_dynamics(omr_path, grade_min), make,
+                        replaces=lambda d: False, band="below", skip_if=skip_if,
+                        containing=True)

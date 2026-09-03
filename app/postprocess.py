@@ -663,41 +663,59 @@ def graft_missing_measures(base_path: Path, secondary_path: Path) -> int:
 
     homr can drop a printed bar outright - a single sparse bar of a note
     and rests between two busy ones - and every bar after it then sits
-    one early. When the secondary engine has a bar that aligns to nothing
-    in the base, with aligned bars on both sides of it, that bar is on
-    the page and missing here, and it goes right after the base bar its
-    predecessor aligned to. Not by printed number: the secondary's
-    measures do not always map one-to-one onto the page's bars, and a
-    number one off puts the bar on the wrong side of its neighbour.
-    Only short runs are trusted: a long unaligned stretch is the two
-    engines disagreeing, not one of them skipping. Returns inserted."""
+    one early. The two readings are aligned on their note-bearing bars
+    only: rest bars carry an empty signature, match any other rest bar,
+    and pull the alignment apart around a multirest one engine never
+    wrote. A secondary bar that aligns to nothing, with aligned bars on
+    both sides, is on the page and missing here. It goes right after the
+    base bar its predecessor aligned to - and past the base's rest bars
+    there when the secondary itself shows a rest between predecessor and
+    missing bar, since that is the printed order. Only short runs are
+    trusted: a long unaligned stretch is the two engines disagreeing,
+    not one of them skipping. Returns measures inserted."""
     base = ET.parse(base_path)
     part = base.getroot().find("part")
     base_measures = part.findall("measure")
     sec_measures = ET.parse(secondary_path).getroot().find("part").findall("measure")
-    ops = _best_alignment(base_measures, sec_measures).get_opcodes()
+
+    def rest_only(measure) -> bool:
+        notes = measure.findall("note")
+        return bool(notes) and all(n.find("rest") is not None for n in notes)
+
+    base_idx = [i for i, m in enumerate(base_measures) if not rest_only(m)]
+    sec_idx = [j for j, m in enumerate(sec_measures) if not rest_only(m)]
+    ops = _best_alignment([base_measures[i] for i in base_idx],
+                          [sec_measures[j] for j in sec_idx]).get_opcodes()
     aligned_op = lambda op: op[0] == "equal" or (op[0] == "replace" and op[2] - op[1] == op[4] - op[3])
 
-    inserts = []  # (base index to insert at, secondary indices)
+    placements = []  # (base position to insert at, secondary index)
     for k, (tag, i1, i2, j1, j2) in enumerate(ops):
         if tag != "insert" or j2 - j1 > 2:
             continue
         if not (k > 0 and aligned_op(ops[k - 1]) and k + 1 < len(ops) and aligned_op(ops[k + 1])):
             continue
-        inserts.append((i1, list(range(j1, j2))))
+        # The predecessor is the last bar of the aligned run before the
+        # gap, and it aligned one-to-one with the base bar before i1.
+        pred_base, pred_sec = base_idx[i1 - 1], sec_idx[j1 - 1]
+        for jj in range(j1, j2):
+            j = sec_idx[jj]
+            position = pred_base + 1
+            if any(rest_only(sec_measures[s]) for s in range(pred_sec + 1, j)):
+                while position < len(base_measures) and rest_only(base_measures[position]):
+                    position += 1
+            placements.append((position, j))
 
     inserted = 0
-    for at, js in sorted(inserts, reverse=True):
-        index = (list(part).index(base_measures[at]) if at < len(base_measures)
-                 else len(list(part)))
-        for offset, j in enumerate(js):
-            copy_ = copy.deepcopy(sec_measures[j])
-            # The bar's notes are the reading; its attributes belong to the
-            # secondary engine's own header and are not carried.
-            for attrs in copy_.findall("attributes"):
-                copy_.remove(attrs)
-            part.insert(index + offset, copy_)
-            inserted += 1
+    for position, j in sorted(placements, reverse=True):
+        index = (list(part).index(base_measures[position])
+                 if position < len(base_measures) else len(list(part)))
+        copy_ = copy.deepcopy(sec_measures[j])
+        # The bar's notes are the reading; its attributes belong to the
+        # secondary engine's own header and are not carried.
+        for attrs in copy_.findall("attributes"):
+            copy_.remove(attrs)
+        part.insert(index, copy_)
+        inserted += 1
 
     if inserted:
         for number, m in enumerate(part.findall("measure"), start=1):
@@ -743,6 +761,13 @@ def _spelling_agnostic(signature: tuple) -> tuple:
     return tuple((step, octave) for step, _, octave in signature)
 
 
+def _octave_agnostic(signature: tuple) -> tuple:
+    """A signature compared on step alone. One engine reading a passage
+    an octave off the other - a clef or an 8va misread - is a known
+    failure, and it takes every bar of the passage out of alignment."""
+    return tuple(step for step, _, _ in signature)
+
+
 def _best_alignment(base_measures, sec_measures) -> SequenceMatcher:
     """Align the two readings on whichever spelling agrees better.
 
@@ -763,9 +788,11 @@ def _best_alignment(base_measures, sec_measures) -> SequenceMatcher:
               [measure_signature(m) for m in sec_measures])
     loose = ([_spelling_agnostic(s) for s in strict[0]],
              [_spelling_agnostic(s) for s in strict[1]])
+    steps = ([_octave_agnostic(s) for s in strict[0]],
+             [_octave_agnostic(s) for s in strict[1]])
 
     best = None
-    for base_sigs, sec_sigs in (strict, loose):
+    for base_sigs, sec_sigs in (strict, loose, steps):
         matcher = SequenceMatcher(None, base_sigs, sec_sigs, autojunk=False)
         score = sum(i2 - i1 for op, i1, i2, j1, j2 in matcher.get_opcodes()
                     if op == "equal" or (op == "replace" and i2 - i1 == j2 - j1))

@@ -32,7 +32,7 @@ sys.path.insert(0, str(BENCH_DIR.parent / "benchmark"))
 sys.path.insert(0, str(BENCH_DIR.parent / "app"))
 import score as scorer  # noqa: E402
 from fix_hbars import (detect_circled_letters, detect_hbars,  # noqa: E402
-                       place_rehearsals, place_signs, stack_numbers)
+                       place_dynamics, place_rehearsals, place_signs, stack_numbers)
 from fix_hbars import fix as fix_hbars  # noqa: E402
 from fix_multirests import fix as fix_multirest_counts  # noqa: E402
 from fix_structure import fix as fix_structure  # noqa: E402
@@ -120,6 +120,7 @@ def convert(pdf: Path) -> Path:
                 p = place_rehearsals(omr, result, hbars,
                                      extra_marks=detect_circled_letters(omr))
                 place_signs(omr, result, hbars)
+                place_dynamics(omr, result, hbars)
                 if p:
                     print(f"  {p} rehearsal letters re-placed by pixel "
                           f"position", flush=True)

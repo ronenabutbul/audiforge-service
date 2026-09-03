@@ -345,7 +345,8 @@ def _repair_structure(job_id: str, job_dir: Path, result: Path,
     it was rather than losing the conversion.
     """
     from app.fix_hbars import (detect_circled_letters, detect_hbars,
-                                place_rehearsals, place_signs, stack_numbers)
+                                place_dynamics, place_rehearsals, place_signs,
+                                stack_numbers)
     from app.fix_hbars import fix as fix_hbars
     from app.fix_multirests import fix as fix_multirest_counts
     from app.fix_structure import fix as fix_structure
@@ -416,6 +417,13 @@ def _repair_structure(job_id: str, job_dir: Path, result: Path,
                 logger.info("job %s: %d coda/segno signs placed", job_id, signs)
         except Exception:
             logger.exception("job %s: sign placement failed", job_id)
+        try:
+            dyn = place_dynamics(omr, result, hbars)
+            if dyn:
+                logger.info("job %s: %d dynamics placed from the project file",
+                            job_id, dyn)
+        except Exception:
+            logger.exception("job %s: dynamics placement failed", job_id)
 
 
 def _process_job(job_id: str, source: Path):
