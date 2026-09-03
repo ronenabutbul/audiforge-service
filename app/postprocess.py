@@ -19,6 +19,7 @@ result.
 from __future__ import annotations
 
 import copy
+import re
 from fractions import Fraction
 import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
@@ -608,7 +609,10 @@ SCORE_TERMS = (
 # Systematic OCR confusions seen on the bench: the "ri" ligature reads as
 # "n", and a double l as two capital I's.
 OCR_CONFUSIONS = {"nt.": "rit.", "raII.": "rall.", "raIl.": "rall.",
-                  "pidff": "più f", "piuf": "più f"}
+                  "pidff": "più f", "piuf": "più f", "Menu": "Meno",
+                  "menacmg": "menacing", "Stra1ght": "Straight", "Swmg": "Swing",
+                  "Sali": "Soli", "fsub.": "f sub.", "psub.": "p sub.",
+                  "pSl/lb.": "p sub.", "Ac eler": "Accel.", "eler": "Accel."}
 
 
 def _one_edit_apart(a: str, b: str) -> bool:
@@ -882,8 +886,163 @@ def app_compat(result_path: Path) -> int:
             if len(attrs) == 0:
                 measure.remove(attrs)
     removed += _drop_renderer_traps(tree)
+    removed += drop_stray_lyrics(tree)
+    removed += tidy_credits(tree)
     if removed:
         tree.write(result_path, encoding="UTF-8", xml_declaration=True)
+    return removed
+
+
+def _credit_key(text: str) -> str:
+    """Letters and digits only, ligatures folded, for matching one
+    reading of a line against another."""
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFKC", text).lower()
+                   if c.isalnum())
+
+
+_CREDIT_NEVER = re.compile(
+    r"copyright|©|\(c\)|all rights|reserved|permission|\bbmi\b|ascap|\bllc\b|\binc\b",
+    re.IGNORECASE)
+
+
+def _credit_junk(text: str) -> bool:
+    """OCR debris rather than a title line: two scripts in one line, a
+    line mostly symbols, one without real words (a stray "rit." or
+    "t Bb"), or the copyright notice."""
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) < 3 or _CREDIT_NEVER.search(text):
+        return True
+    words = [t for t in re.split(r"[\s,;:]+", text) if sum(c.isalpha() for c in t) >= 3]
+    if len(letters) < 8 and len(words) < 2:
+        return True
+    hebrew = any("\u0590" <= c <= "\u05ff" for c in letters)
+    latin = any(c.isascii() for c in letters)
+    if hebrew and latin:
+        return True
+    symbols = sum(1 for c in text if not c.isalnum() and not c.isspace()
+                  and c not in ".,'\u2019\"\u201c\u201d()-/:=&")
+    return symbols / max(len(text), 1) > 0.25
+
+
+def tidy_credits(tree) -> int:
+    """One title block, not a page's worth of stray text. The engine
+    writes every text it could not classify as a credit: the part name
+    on every page, multirest counts, OCR debris, and the same title
+    line as fix_titles then positions - sometimes as a merged subtitle
+    whose parts repeat other credits. Page headers go (credits on later
+    pages, and page-1 text that repeats on them), so do junk, part
+    names and their misreadings, and duplicates keep the positioned
+    copy. Returns credits removed."""
+    root = tree.getroot()
+    credits = root.findall("credit")
+    if not credits:
+        return 0
+
+    def text_of(credit) -> str:
+        return " ".join(" ".join(w.text or "" for w in credit.findall("credit-words")).split())
+
+    def set_text(credit, text) -> None:
+        words = credit.findall("credit-words")
+        words[0].text = text
+        for extra in words[1:]:
+            credit.remove(extra)
+
+    later_pages = {_credit_key(text_of(c)) for c in credits if (c.get("page") or "1") != "1"}
+    part_names = {_credit_key(n.text or "") for n in root.iter("part-name")}
+    part_names.discard("")
+    title_key = _credit_key(root.findtext("work/work-title") or "")
+
+    def is_part_name(k: str) -> bool:
+        return any(pn and (pn in k or k in pn or _one_edit_apart(k, pn))
+                   for pn in part_names)
+
+    def skeleton(text: str) -> str:
+        return re.sub(r"[^\W\d_]+", "w", text)
+
+    kept = []  # (credit, key, positioned, text)
+    removed = 0
+
+    def duplicate_of(k, text):
+        for i, (c, ck, pos, t) in enumerate(kept):
+            same = (ck == k or (len(min(k, ck, key=len)) >= 8 and (k in ck or ck in k))
+                    or skeleton(t) == skeleton(text))
+            if same:
+                return i
+        return None
+
+    for credit in credits:
+        text = text_of(credit)
+        positioned = any(w.get("justify") for w in credit.findall("credit-words"))
+        if (credit.get("page") or "1") != "1":
+            root.remove(credit)
+            removed += 1
+            continue
+        # A merged subtitle: keep only the parts that are not junk,
+        # part names or lines already present.
+        if " \u2014 " in text:
+            parts = [p.strip() for p in text.split(" \u2014 ")]
+            parts = [p for p in parts if not _credit_junk(p) and not is_part_name(_credit_key(p))
+                     and duplicate_of(_credit_key(p), p) is None
+                     and _credit_key(p) not in later_pages]
+            text = " \u2014 ".join(parts)
+            if parts:
+                set_text(credit, text)
+        k = _credit_key(text)
+        # The work title is drawn from <work-title>; a credit that only
+        # repeats it (the same line in capitals) would show twice.
+        if not text or _credit_junk(text) or k in later_pages or is_part_name(k) \
+                or (title_key and k == title_key):
+            root.remove(credit)
+            removed += 1
+            continue
+        i = duplicate_of(k, text)
+        if i is None:
+            kept.append((credit, k, positioned, text))
+            continue
+        other, ok, opos, otext = kept[i]
+        # Between two readings of one line, keep the one that names the
+        # work, else the positioned one, else the first.
+        prefer_new = ((title_key and title_key in k and title_key not in ok)
+                      or (positioned and not opos and not (title_key and title_key in ok)))
+        if prefer_new:
+            root.remove(other)
+            kept[i] = (credit, k, positioned, text)
+        else:
+            root.remove(credit)
+        removed += 1
+    # The renderer draws the identification creators in the title block
+    # too: a creator that is a part name, junk, or the same line as a
+    # kept credit would show twice.
+    identification = root.find("identification")
+    if identification is not None:
+        kept_keys = {k for _, k, _, _ in kept}
+        for creator in list(identification.findall("creator")):
+            k = _credit_key(creator.text or "")
+            if (not k or _credit_junk(creator.text or "") or is_part_name(k)
+                    or k in kept_keys or k in later_pages):
+                identification.remove(creator)
+                removed += 1
+    return removed
+
+
+def drop_stray_lyrics(tree) -> int:
+    """Syllables on an instrumental part are the page's credit block,
+    read as lyrics by the engine and hung under whatever notes lay
+    nearest. A sung part carries syllables on most of its bars in long
+    runs (the graft's own thresholds); a part below them keeps none.
+    Returns syllables removed."""
+    removed = 0
+    for part in tree.getroot().findall("part"):
+        measures = part.findall("measure")
+        if (lyric_coverage(measures) >= LYRIC_COVERAGE_MIN
+                and lyric_run(measures) >= LYRIC_RUN_MIN):
+            continue
+        for measure in measures:
+            for note in measure.findall("note"):
+                for lyric in note.findall("lyric"):
+                    note.remove(lyric)
+                    removed += 1
     return removed
 
 

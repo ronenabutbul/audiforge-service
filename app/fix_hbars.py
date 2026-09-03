@@ -1393,14 +1393,58 @@ def place_tempo_marks(omr_path: Path, result_path: Path, hbars: list[dict]) -> i
 TEXT_ROLES = ("Direction", "UnknownRole", "ChordName")
 
 
+# Page furniture is never a direction: the credit block under the last
+# system, the title block over the first. Their language gives them
+# away when their position does not.
+_FURNITURE = re.compile(
+    r"copyright|©|\(c\)|all rights|reserved|used by permission|permission of|"
+    r"publish|\bltd\b|\binc\b|\bllc\b|\bbmi\b|ascap|words and music|"
+    r"words by|music by|lyrics by|arranged by|\barr\.|international|secured|"
+    r"catalog|administered|controlled|motion picture|\bfrom\b.*\b(the|by)\b|"
+    r"\b(19|20)\d\d\b|printed in|edition|\bmusic\b.*\b(co|company|corp)\b|"
+    r"\s-\s\d+$",
+    re.IGNORECASE)
+TEXT_MAX_CHARS = 48
+# Above the first system of a page lie the title and part name; below
+# the last lie the credits. A direction stands within these distances.
+HEADER_IL = 4.5
+FOOTER_IL = 3.0
+
+
+def is_furniture(text: str) -> bool:
+    """Credit, title or part-name text rather than a playing direction."""
+    t = " ".join((text or "").split())
+    if not t or len(t) > TEXT_MAX_CHARS or _FURNITURE.search(t):
+        return True
+    letters = [c for c in t if c.isalpha()]
+    # A part name is set in capitals, two words or more; a direction in
+    # capitals is a single word ("ANDANTE").
+    return len(letters) >= 6 and all(c.isupper() for c in letters) and " " in t
+
+
 def _omr_text(omr_path: Path):
     """(sheet ordinal, x, y, text) for every sentence Audiveris read as a
     direction or could not classify - the tempo words, mutes and cues
     it drops from its export - left of the sentence, at its height.
     A sentence and its words are separate inters; the words are the
-    ones whose boxes lie inside the sentence's box."""
+    ones whose boxes lie inside the sentence's box. Text in the page's
+    header or footer zone, or reading as credits, is not offered."""
     found = []
     for sheet_index, root in _sheet_roots(omr_path):
+        tops, bottoms, il = [], [], None
+        for system in root.iter("system"):
+            staff = system.find(".//staff")
+            lines = staff.findall("lines/line") if staff is not None else []
+            stacks = system.findall("stack")
+            if len(lines) < 5 or not stacks:
+                continue
+            sx0 = min(float(st.get("left")) for st in stacks)
+            top, bottom = _staff_at(lines, sx0)
+            tops.append(top)
+            bottoms.append(bottom)
+            il = il or (bottom - top) / 4
+        header = min(tops) - HEADER_IL * il if tops else None
+        footer = max(bottoms) + FOOTER_IL * il if bottoms else None
         words = []
         for w in root.iter("word"):
             box = _centre(w)
@@ -1418,8 +1462,34 @@ def _omr_text(omr_path: Path):
                 if x - 2 <= bx + bw / 2 <= x + w + 2 and y - 2 <= by + bh / 2 <= y + h + 2)
             if not inside:
                 continue
-            found.append((sheet_index, x, y + h // 2, " ".join(v for _, v in inside)))
+            cy = y + h // 2
+            if header is not None and (cy < header or cy > footer):
+                continue
+            text = " ".join(v for _, v in inside)
+            if is_furniture(text):
+                continue
+            found.append((sheet_index, x, cy, text))
     return found
+
+
+def _tidy_text(text: str) -> str:
+    """A sentence as the OCR should have read it: the boxed bar number
+    it swallowed at either end dropped, a dangling bracket fragment
+    dropped, and each token held against the known confusions."""
+    try:
+        from app.postprocess import OCR_CONFUSIONS
+    except ImportError:
+        from postprocess import OCR_CONFUSIONS
+    t = " ".join((text or "").split())
+    if any(c.isalpha() for c in t):
+        t = re.sub(r"^\d{1,3}\s+", "", t)
+        t = re.sub(r"\s*\d{1,3}$", "", t)
+        t = re.sub(r"\s*[(\[]\S{0,2}$", "", t)
+    lowered = {k.lower(): v for k, v in OCR_CONFUSIONS.items()}
+    if t.lower() in lowered:
+        return lowered[t.lower()]
+    tokens = [lowered.get(tok.lower(), tok) for tok in t.split(" ")]
+    return " ".join(tokens)
 
 
 def place_text(omr_path: Path, result_path: Path, hbars: list[dict]) -> int:
@@ -1439,8 +1509,8 @@ def place_text(omr_path: Path, result_path: Path, hbars: list[dict]) -> int:
         return 0
     cleaned = []
     for sheet, x, y, text in sentences:
-        value = clean_word(text)
-        if value is None or value.replace(".", "").isdigit():
+        value = clean_word(_tidy_text(text))
+        if value is None or not any(c.isalpha() for c in value):
             continue
         cleaned.append((sheet, x, y, value))
     # Text between two systems is read as a direction over the lower
