@@ -19,6 +19,7 @@ result.
 from __future__ import annotations
 
 import copy
+from fractions import Fraction
 import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -229,6 +230,9 @@ def _set_beams(note, marks: dict[int, str]) -> None:
         tail += 1
 
 
+_BEAM_LEVEL_OF_TYPE = {"eighth": 1, "16th": 2, "32nd": 3, "64th": 4, "128th": 5}
+
+
 def beam_by_beat(result_path: Path) -> int:
     """Join eighths and shorter into beamed groups, one group per beat.
 
@@ -276,6 +280,14 @@ def beam_by_beat(result_path: Path) -> int:
                 if el.find("grace") is not None:
                     continue
                 level = _beam_level(duration, divisions)
+                # The printed value decides, not the length: a quarter in
+                # a triplet lasts two thirds of a quarter and is still a
+                # quarter, and a renderer refuses a beam on it.
+                note_type = el.findtext("type")
+                if note_type in ("quarter", "half", "whole", "breve", "long"):
+                    level = 0
+                elif note_type in _BEAM_LEVEL_OF_TYPE:
+                    level = _BEAM_LEVEL_OF_TYPE[note_type]
                 is_rest = el.find("rest") is not None
                 if position // span != span_index:
                     close()
@@ -869,6 +881,180 @@ def app_compat(result_path: Path) -> int:
                     removed += 1
             if len(attrs) == 0:
                 measure.remove(attrs)
+    removed += _drop_renderer_traps(tree)
     if removed:
         tree.write(result_path, encoding="UTF-8", xml_declaration=True)
     return removed
+
+
+def _drop_renderer_traps(tree) -> int:
+    """What OSMD refuses to draw and throws on instead of skipping: an
+    octave shift that never closes (the engine saw the "8va" and not
+    its end), and a beam on a note printed as a quarter or longer (a
+    quarter-note triplet's beam). Returns elements removed."""
+    removed = 0
+    for part in tree.getroot().findall("part"):
+        measures = part.findall("measure")
+        # The opening declaration belongs to the first bar. A bar of
+        # silence put in before the engine's first bar sits ahead of the
+        # divisions and time signature, and its rest is then read with
+        # the defaults - four whole notes long.
+        first_declared = next((m for m in measures
+                               if m.find("attributes/divisions") is not None), None)
+        if first_declared is not None and first_declared is not measures[0]:
+            attrs = first_declared.find("attributes")
+            first_declared.remove(attrs)
+            measures[0].insert(0, attrs)
+            removed += 1
+        # Octave shifts: every start needs a later stop of its number.
+        shifts = []  # (measure, direction, shift element)
+        for measure in measures:
+            for direction in measure.findall("direction"):
+                for dtype in direction.findall("direction-type"):
+                    for shift in dtype.findall("octave-shift"):
+                        shifts.append((measure, direction, dtype, shift))
+        open_by_number = {}
+        keep = set()
+        for entry in shifts:
+            shift = entry[3]
+            number = shift.get("number") or "1"
+            if shift.get("type") in ("up", "down"):
+                open_by_number[number] = entry
+            elif shift.get("type") == "stop" and number in open_by_number:
+                keep.add(id(open_by_number.pop(number)[3]))
+                keep.add(id(shift))
+        for measure, direction, dtype, shift in shifts:
+            if id(shift) in keep:
+                continue
+            dtype.remove(shift)
+            if len(dtype) == 0:
+                direction.remove(dtype)
+            if direction.find("direction-type") is None:
+                measure.remove(direction)
+            removed += 1
+        # Beams belong to eighths and shorter.
+        for measure in measures:
+            for note in measure.findall("note"):
+                if note.findtext("type") in ("quarter", "half", "whole", "breve", "long"):
+                    for beam in note.findall("beam"):
+                        note.remove(beam)
+                        removed += 1
+        # A whole-bar rest is the bar's length by definition. One that
+        # was copied from an overfull or odd bar carries a length like
+        # nine eighths in 4/4, which the renderer cannot name.
+        divisions, beats, beat_type = 1, 4, 4
+        for measure in measures:
+            for attrs in measure.findall("attributes"):
+                divisions = int(attrs.findtext("divisions") or divisions)
+                time = attrs.find("time")
+                if time is not None:
+                    beats = int(time.findtext("beats") or beats)
+                    beat_type = int(time.findtext("beat-type") or beat_type)
+            bar = max(1, round(divisions * beats * 4 / beat_type))
+            for note in measure.findall("note"):
+                rest = note.find("rest")
+                duration = note.find("duration")
+                if rest is None or rest.get("measure") != "yes" or duration is None:
+                    continue
+                if (duration.text or "").strip() != str(bar):
+                    duration.text = str(bar)
+                    removed += 1
+                # The renderer names a whole-bar rest by its length too,
+                # and a bar of 9/8 or 5/8 has no single note value: such
+                # a rest is written as the rests that add up to it.
+                pieces = _rest_pieces(Fraction(beats * 4, beat_type))
+                if len(pieces) > 1:
+                    at = list(measure).index(note)
+                    measure.remove(note)
+                    for k, (quarters, note_type, dots) in enumerate(pieces):
+                        piece = ET.Element("note")
+                        ET.SubElement(piece, "rest")
+                        ET.SubElement(piece, "duration").text = str(
+                            max(1, round(quarters * divisions)))
+                        ET.SubElement(piece, "type").text = note_type
+                        for _ in range(dots):
+                            ET.SubElement(piece, "dot")
+                        measure.insert(at + k, piece)
+                    removed += 1
+                # And it is no part of a tuplet, whatever the engine
+                # attached to it.
+                for tm in note.findall("time-modification"):
+                    note.remove(tm)
+                    removed += 1
+                for notations in note.findall("notations"):
+                    for tuplet in notations.findall("tuplet"):
+                        notations.remove(tuplet)
+                        removed += 1
+                    if len(notations) == 0:
+                        note.remove(notations)
+            removed += _close_tuplets(measure)
+    return removed
+
+
+_REST_VALUES = [  # quarters, type, dots - largest first
+    (Fraction(6), "whole", 1), (Fraction(4), "whole", 0), (Fraction(3), "half", 1),
+    (Fraction(2), "half", 0), (Fraction(3, 2), "quarter", 1), (Fraction(1), "quarter", 0),
+    (Fraction(3, 4), "eighth", 1), (Fraction(1, 2), "eighth", 0),
+    (Fraction(3, 8), "16th", 1), (Fraction(1, 4), "16th", 0), (Fraction(1, 8), "32nd", 0)]
+
+
+def _rest_pieces(quarters: Fraction) -> list[tuple[Fraction, str, int]]:
+    """A bar's worth of silence as nameable rests: one when the bar is
+    itself a note value, else the fewest that add up to it."""
+    for value in _REST_VALUES:
+        if value[0] == quarters:
+            return [value]
+    pieces, left = [], quarters
+    for value in _REST_VALUES:
+        while left >= value[0]:
+            pieces.append(value)
+            left -= value[0]
+    return pieces or [_REST_VALUES[1]]
+
+
+def _close_tuplets(measure) -> int:
+    """Tuplet brackets made consistent with the time-modifications: the
+    engines leave a start without its stop, a stop on a rest that has
+    since gone, or a triplet note with no bracket at all, and the
+    renderer then names the note by its real length (a third of a
+    quarter) and has no name for it. Every existing bracket on the
+    measure goes; consecutive notes of one ratio are bracketed
+    `actual-notes` at a time. Returns notations changed."""
+    changed = 0
+    notes = [n for n in measure.findall("note")
+             if n.find("grace") is None and n.find("chord") is None]
+    for note in measure.findall("note"):
+        for notations in note.findall("notations"):
+            for tuplet in notations.findall("tuplet"):
+                notations.remove(tuplet)
+                changed += 1
+            if len(notations) == 0:
+                note.remove(notations)
+
+    def bracket(group):
+        nonlocal changed
+        for note, kind in ((group[0], "start"), (group[-1], "stop")):
+            notations = note.find("notations")
+            if notations is None:
+                notations = ET.SubElement(note, "notations")
+            ET.SubElement(notations, "tuplet", type=kind)
+            changed += 1
+
+    run, ratio = [], None
+    for note in notes:
+        tm = note.find("time-modification")
+        this = (tm.findtext("actual-notes"), tm.findtext("normal-notes")) if tm is not None else None
+        if this != ratio and run:
+            bracket(run)
+            run = []
+        ratio = this
+        if this is None:
+            continue
+        run.append(note)
+        if len(run) == int(this[0] or 0):
+            bracket(run)
+            run = []
+    if run:
+        bracket(run)
+    return changed
+
