@@ -626,7 +626,12 @@ def _ending_number(sheet: _Sheet, words, x: int, y: int, floor: float, il: float
             return None
         text = max(votes.items(), key=lambda kv: kv[1])[0]
     numbers = [d for d in re.findall(r"\d", text) if d != "0"]
-    return ", ".join(numbers) if numbers and len(numbers) <= 4 else None
+    # an ending is taken on passes counted up from one: "1", "2", "1, 2",
+    # "3"; digits that repeat or run backwards are a misreading
+    if not numbers or len(numbers) > 4 \
+            or any(int(b) <= int(a) for a, b in zip(numbers, numbers[1:])):
+        return None
+    return ", ".join(numbers)
 
 
 def _closed_below(sheet: _Sheet, line: dict, hooks, il: float) -> bool:
@@ -723,10 +728,17 @@ def _ending_marks(sheets: list[_Sheet], per_sheet: list[list[dict]]) -> list[Mar
             if b["left"]:
                 number = b["number"]
                 previous = open_bracket
-                if number is None and previous is not None and previous["sheet"] == sheet.index \
-                        and previous["system"] == b["system"] \
-                        and abs(previous["x1"] - b["x0"]) < 1.5 * il \
-                        and abs(previous["y"] - b["y"]) < il:
+                if number is None and previous is not None and (
+                        previous["sheet"] == sheet.index
+                        and previous["system"] == b["system"]
+                        and abs(previous["x1"] - b["x0"]) < 1.5 * il
+                        and abs(previous["y"] - b["y"]) < il
+                        # or closed at its system's end, this one opening
+                        # the next system
+                        or previous["right"]
+                        and previous["x1"] >= previous["edge"] - 2 * previous["il"]
+                        and b["x0"] <= system.x0 + 2 * il
+                        and _next_system(sheets, previous) == (sheet.index, b["system"])):
                     last = max(int(n) for n in previous["number"].split(", "))
                     number = str(last + 1)
                 if number is None:
@@ -820,7 +832,7 @@ def _read_phrase(phrase: dict) -> str | None:
     "to coda", "coda" (a coda mark whose side is settled later), "fine",
     "segno", "times:N", or None when it says something else."""
     raw = " ".join(phrase["texts"])
-    letters = re.sub(r"[^a-z]", "", raw.lower().replace("$", "s").replace("5", "s")
+    letters = re.sub(r"[^a-z]", "", raw.lower().replace("$", "s").replace("5", "s").replace("8", "s")
                      .replace("0", "o"))
     kinds = [sign[0] for sign in phrase["signs"]]
     has_coda_sign = CODA in kinds
@@ -857,6 +869,12 @@ def _read_phrase(phrase: dict) -> str | None:
         return CODA
     if _close(letters, "fine") and re.fullmatch(r"\W*[Ff][A-Za-z]{2,4}\W*", raw.strip()):
         return FINE
+    if SEGNO in kinds and not has_coda_sign \
+            and all(len(re.sub(r"\W", "", t)) <= 3 for t in phrase["texts"]):
+        # the segno's shape (S, slash, two dots) is proof enough; a short
+        # word beside it that says nothing of the road map (a boxed
+        # letter, a bar number) does not unmake it
+        return SEGNO
     return None
 
 
@@ -987,7 +1005,9 @@ def _attach_times(sheets: list[_Sheet], marks: list[Mark]) -> list[Mark]:
 # anchor (`_acts_at`) lies in.
 _BAR_OF = {
     REPEAT_START: (True, 1.0), REPEAT_END: (True, -1.0),
-    ENDING_START: (True, 1.5), ENDING_STOP: (True, -1.0), ENDING_OPEN: (True, -1.0),
+    # an open bracket's line often runs on past its last barline; a bar
+    # is never as narrow as the two interlines allowed for that
+    ENDING_START: (True, 1.5), ENDING_STOP: (True, -1.0), ENDING_OPEN: (True, -2.0),
     SEGNO: (False, 0.0), CODA: (False, 0.0),
     TO_CODA: (True, 0.0), FINE: (True, 0.0),
     **{jump: (True, 0.0) for jump in JUMPS},
