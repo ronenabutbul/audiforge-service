@@ -714,6 +714,8 @@ def test_audiveris_failures_come_back_with_a_reason():
     missing = audiveris_local.convert(job / "input.pdf", dest, binary="/no/such/audiveris")
     assert missing.path is None and "no Audiveris binary" in missing.failure
     assert audiveris_local.convert_musicxml.__defaults__ == (1800,)
+    # The structure-only endpoint keeps the limit it had.
+    assert audiveris_local.transcribe.__defaults__ == (600,)
 
 
 def test_every_movement_is_joined_on_the_bench_as_on_the_service():

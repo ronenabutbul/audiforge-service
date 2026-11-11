@@ -72,9 +72,10 @@ def _run(source: Path, output_dir: Path, timeout: int,
     with _lock:
         proc = subprocess.run(
             # -swap releases each sheet after its step, which keeps a
-            # dense multi-page scan inside the container's memory. It does
-            # not change what is read: the same PDF exports the same file
-            # with and without it.
+            # dense multi-page scan inside the container's memory. The
+            # bench runs with it too now, so both sides start Audiveris
+            # the same way; on the one part compared, the export with and
+            # without it was the same file.
             [str(binary or AUDIVERIS_BIN), "-batch", "-export", "-swap",
              "-output", str(output_dir), str(source)],
             capture_output=True, text=True, timeout=timeout, env=env)
@@ -102,8 +103,10 @@ def transcribe(pdf: Path, work_dir: Path, timeout: int = 600) -> Path:
                     or "too high interline" in log)
         raise PageUnreadable(
             "Audiveris could not read any page", one_line=one_line)
-    if _ocr_was_skipped(log, work_dir):
-        # refuse quietly degraded results, same guard as the local bench
+    if "Could not initialize TessBaseAPI" in log:
+        # legacy-mode tessdata missing: transcription continues but every
+        # text (titles, tempo words) is silently dropped — refuse quietly
+        # degraded results, same guard as the local bench
         raise AudiverisUnavailable(
             "tesseract legacy traineddata missing — OCR skipped")
     return omr
@@ -350,6 +353,9 @@ def convert(pdf: Path, dest: Path, timeout: int = BOOK_TIMEOUT_SECONDS, *,
     already rendered at RENDER_DPI, for the page-by-page fallback; without
     them it renders its own. Never raises: a run that produced nothing
     says why in `failure`, so the caller can report it."""
+    # A folder of its own holds nothing but what Audiveris wrote; one the
+    # caller chose (the bench shares it with homr's pages) may not.
+    own_folder = work is None
     work = work or dest.parent / "audiveris-work"
     work.mkdir(parents=True, exist_ok=True)
     if not Path(binary or AUDIVERIS_BIN).exists():
@@ -363,6 +369,13 @@ def convert(pdf: Path, dest: Path, timeout: int = BOOK_TIMEOUT_SECONDS, *,
                                   "traineddata missing or unusable)")
     paged_dir = work / "paged"
     exported = [m for m in sorted(work.rglob("*.mxl")) if paged_dir not in m.parents]
+    if not exported and own_folder:
+        # An export written uncompressed, as the service has always accepted.
+        loose = next((x for x in sorted(work.rglob("*.xml"))
+                      if "META-INF" not in str(x)), None)
+        if loose is not None:
+            dest.write_bytes(loose.read_bytes())
+            return Conversion(path=dest)
     if not exported:
         outcome = _convert_paged(pdf, dest, work, pages, binary, tessdata)
         if outcome.path is None and "does not seem to contain multi-line staves" in log:
