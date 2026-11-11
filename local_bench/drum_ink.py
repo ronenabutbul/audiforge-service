@@ -544,16 +544,20 @@ class Sheet:
 
     def _rests(self, root: ET.Element):
         self.voids = []
+        # whole notes: a hollow oval with no stem (a snare roll held over
+        # bars, "Z" on its stem-less head); Audiveris finds them, the ink
+        # confirms the paper inside
+        self.wholes = []
         for el in root.iter("head"):
             b = el.find("bounds")
-            if b is None or el.get("shape") != "NOTEHEAD_VOID":
+            if b is None or el.get("shape") not in ("NOTEHEAD_VOID", "WHOLE_NOTE"):
                 continue
             cx = float(b.get("x")) + float(b.get("w")) / 2
             cy = float(b.get("y")) + float(b.get("h")) / 2
             ring = self.ink[int(cy - 0.15 * self.il):int(cy + 0.15 * self.il) + 1,
                             int(cx - 0.2 * self.il):int(cx + 0.2 * self.il) + 1]
             if ring.size and ring.mean() < 0.35:   # a ring, paper in the middle
-                self.voids.append((cx, cy))
+                (self.voids if el.get("shape") == "NOTEHEAD_VOID" else self.wholes).append((cx, cy))
         self.rests = []
         for el in root.iter("rest"):
             b = el.find("bounds")
@@ -671,6 +675,10 @@ class Sheet:
                               "time-number") for el in root.iter(tag)
                   if el.find("bounds") is not None]
         self.words = [b for b in barred]
+        self.word_values = [(float(el.find("bounds").get("x")) + float(el.find("bounds").get("w")) / 2,
+                             float(el.find("bounds").get("y")) + float(el.find("bounds").get("h")) / 2,
+                             el.get("value") or "")
+                            for el in root.iter("word") if el.find("bounds") is not None]
         n, _lab, stats, cents = cv2.connectedComponentsWithStats(small)
         upright = cv2.morphologyEx(self.nolines.astype(np.uint8), cv2.MORPH_OPEN,
                                    np.ones((max(int(1.1 * il), 5), 1), np.uint8))
@@ -772,6 +780,17 @@ class Sheet:
                 self.crosses = [(x, y) for x, y in self.crosses
                                 if not (a[0] - 0.5 * il <= x <= b[0] + 0.5 * il
                                         and top - 0.6 * il <= y <= top + 0.8 * il)]
+
+    def whole_tremolo(self, x: float, y: float) -> int:
+        """Roll marks on a stem-less note: slashes printed over the head
+        (a buzz roll's "Z" counts as three)."""
+        il = self.il
+        for wx, wy, value in getattr(self, "word_values", []):
+            # (Audiveris' OCR reads the italic Z as "2" as often as not)
+            if value.strip(".").lower() in ("z", "2") and abs(wx - x) < 1.6 * il \
+                    and 0.8 * il < y - wy < 6 * il:
+                return 3
+        return 0
 
     def home_bar(self, x: float, y: float) -> int | None:
         """Index of the printed bar a mark at (x, y) belongs to: the one it
@@ -1252,6 +1271,13 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
             continue
         events.append({"x": hx, "voice": 0, "value": None,
                        "heads": [(hx, hy, kind)], "marks": None})
+    for wx, wy in sheet.wholes:
+        if inside(wx, wy) and not any(abs(wx - hx) < 0.8 * il and abs(wy - hy) < 0.6 * il
+                                      for hx, hy in hung):
+            events.append({"x": wx, "voice": 1 if wy < top + 2.5 * il else 2,
+                           "value": Fraction(16), "heads": [(wx, wy, "normal")],
+                           "marks": 0, "tremolo": sheet.whole_tremolo(wx, wy), "tip": None,
+                           "sx": wx})
     for rx, ry, n, edge, *_box in sheet.rests:
         if x0 <= rx <= x1 and top - 3 * il <= ry <= top + 7 * il:
             value = Fraction(n).limit_denominator(4)
