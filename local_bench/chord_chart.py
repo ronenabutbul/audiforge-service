@@ -365,7 +365,7 @@ def _read_run(names: Names, parts: list[dict], cap: float, alone: bool = False) 
         nonlocal text, chunk
         if chunk:
             if alone:
-                for g in _glyphs(chunk):
+                for g in _glyphs(chunk, touch=0):    # overlapping, not merely near (the 1s of 11)
                     text += ocr(names.image(g, close=True), True, WHITE)
             else:
                 broken = any(len(g) > 1 for g in _glyphs(chunk))
@@ -427,17 +427,21 @@ def _e_or_f(names: Names, g: list[dict]) -> str:
     return "E" if foot > 0.8 else "F"
 
 
-def _glyphs(tok: list[dict]) -> list[list[dict]]:
+def _glyphs(tok: list[dict], touch: float = -1) -> list[list[dict]]:
     """Ink parts grouped into letters: a letter printed in more than one
     piece (the bar and the stem of a thin 7) is its pieces one above the
-    other. Stacked 6/9 figures stay alone."""
+    other. touch: also pieces side by side with no more than this gap (an
+    m whose first stem came loose). Stacked 6/9 figures stay alone."""
     glyphs: list[list[dict]] = []
     for p in tok:
         if glyphs and "stacked" not in p and "stacked" not in glyphs[-1][-1]:
             gx0 = min(q["x"] for q in glyphs[-1])
             gx1 = max(q["x"] + q["w"] for q in glyphs[-1])
+            gy0 = min(q["y"] for q in glyphs[-1])
+            gy1 = max(q["y"] + q["h"] for q in glyphs[-1])
             over = min(gx1, p["x"] + p["w"]) - max(gx0, p["x"])
-            if over > 0.5 * min(p["w"], gx1 - gx0):
+            same_rows = min(gy1, p["y"] + p["h"]) - max(gy0, p["y"]) > 0.8 * min(p["h"], gy1 - gy0)
+            if over > 0.5 * min(p["w"], gx1 - gx0) or (touch >= 0 and -2 <= p["x"] - gx1 <= touch and same_rows):
                 glyphs[-1].append(p)
                 continue
         glyphs.append([p])
