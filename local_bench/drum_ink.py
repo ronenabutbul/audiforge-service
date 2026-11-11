@@ -283,6 +283,18 @@ class Sheet:
         # (rings are not checked against dynamics: Audiveris takes a row of
         # circled crosses for a "p" four interlines tall)
         self._stems()
+        # A "dynamic" a stem runs straight through is not one: Audiveris
+        # reads the slashes of a roll on a stem as "p", and a row of
+        # circled crosses as a giant "p". Its ink is given back.
+        fake = []
+        for bx, by, bw, bh in self.dynamics:
+            if any(bx + bw / 3 <= sx <= bx + 2 * bw / 3 and y0 < by + bh / 2 < y1
+                   for sx, y0, y1 in self.stems):
+                fake.append((bx, by, bw, bh))
+                x, y = int(bx), int(by)
+                ys, xs = slice(max(y, 0), y + int(bh) + 1), slice(max(x, 0), x + int(bw) + 1)
+                self.marksink[ys, xs] = (self.nolines & ~self.thinlines)[ys, xs]
+        self.dynamics = [b for b in self.dynamics if b not in fake]
         self._rests(root)
         # an eighth rest's hook and a quarter rest's zigzag cross like an x;
         # inside a rest Audiveris recognised, no cross is a head
@@ -857,6 +869,51 @@ class Sheet:
                 best = (beams, slashes)
         return best
 
+    def stem_slashes(self, x: float, tip: float, toward: int, inside: float = 0.6,
+                     outside: float = 2.6) -> int:
+        """Roll slashes at the tip end of a stem: short strokes rising to
+        the right that cross the stem, each about an interline wide and
+        under one tall, standing apart from each other, in the band from
+        two and a half interlines past the tip to half an interline inside
+        it. A beam or a flag runs on past the band's sides or hangs on one
+        side; a slash does neither."""
+        il = self.il
+        ya, yb = sorted((tip - toward * outside * il, tip + toward * inside * il))
+        xa, xb = int(x - 1.2 * il), int(x + 1.2 * il)
+        ya, yb = max(int(ya), 0), int(yb)
+        box = self.marksink[ya:yb, max(xa, 0):xb].astype(np.uint8).copy()
+        if not box.size:
+            return 0
+        c = int(round(x)) - max(xa, 0)
+        box[:, max(c - 2, 0):c + 3] = 0       # the stem itself
+        n, lab, st, _cc = cv2.connectedComponentsWithStats(box)
+        pieces = []
+        for i in range(1, n):
+            px, py, pw, ph, pa = st[i]
+            if pa < 0.08 * il * il:
+                continue
+            pieces.append((px, py, pw, ph, i))
+        # each slash shows as two halves, one either side of the stem (the
+        # stem column was taken out), the right half higher as it rises
+        left = [p for p in pieces if p[0] + p[2] >= c - 4 and p[0] + p[2] <= c - 1]
+        right = [p for p in pieces if c + 1 <= p[0] <= c + 4]
+        if any(p[0] == 0 for p in left) or any(p[0] + p[2] >= box.shape[1] for p in right):
+            return 0                           # runs on sideways: a beam
+        count = 0
+        for px, py, pw, ph, i in left:
+            if ph > 1.3 * il or pw < 0.3 * il:
+                continue
+            partner = [q for q in right if 0 <= (py + ph / 2) - (q[1] + q[3] / 2) <= 1.0 * il]
+            g = lab[py:py + ph, px:px + pw] == i
+            cols = np.nonzero(g.any(axis=0))[0]
+            if not partner or len(cols) < 2:
+                continue
+            lft = np.nonzero(g[:, cols[0]])[0].mean()
+            rgt = np.nonzero(g[:, cols[-1]])[0].mean()
+            if lft > rgt:
+                count += 1
+        return count if count <= 4 else 0
+
     def in_dynamic(self, x: float, y: float) -> bool:
         return any(bx <= x <= bx + bw and by <= y <= by + bh
                    for bx, by, bw, bh in getattr(self, "dynamics", []))
@@ -1241,6 +1298,21 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
             ys = [hy for _, hy, _ in members]
         reach = max(min(abs(tip - (min(ys) if up else max(ys))) - 0.9 * il, 2.6 * il), 0.5 * il)
         marks, tremolo = sheet.tip_marks(sx, tip, 1 if up else -1, reach)
+        # (a beamed stem is no roll's: a beam runs on sideways from the tip)
+        rows = slice(max(int(tip - 0.6 * il), 0), int(tip + 0.6 * il) + 1)
+        beamed = any(sheet.marksink[rows, int(sx + sg * f * il)].any()
+                     for sg in (-1, 1) for f in (1.25, 1.65)
+                     if 0 <= int(sx + sg * f * il) < sheet.marksink.shape[1])
+        if marks <= 1 and not beamed:
+            # a roll's slashes may stand at and past the end of its stem
+            # (the stem stops inside them, and the lowest reads as a flag
+            # stub): count the slashes there. Two or more and no beam is a
+            # roll on an unbeamed note, not a flag.
+            # (inside the stem down to an interline short of its head)
+            span = abs((sy1 - sy0)) / il
+            t2 = sheet.stem_slashes(sx, tip, 1 if up else -1, max(0.6, min(2.4, span - 1.2)))
+            if t2 >= 2 and t2 > tremolo:
+                tremolo, marks = t2, 0
         # a "head" centred on the stem itself is a roll slash through it
         through = [m for m in members if abs(m[0] - sx) < 0.3 * il and m[2] == "normal"]
         if through and len(through) < len(members):
@@ -1249,6 +1321,11 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
         tremolo += sum(1 for bx, by in sheet.small
                        if abs(bx - sx) < 0.3 * il and sy0 + 0.3 * il < by < sy1 - 0.3 * il
                        and all(abs(by - hy) > 0.8 * il for _, hy, _ in members))
+        # roll slashes stand between the tip and the heads: a stem whose
+        # tip is at a head (the piece of stem between the two heads of a
+        # second, read as its own stem) has room for none
+        if tremolo and min(abs(tip - hy) for _, hy, _ in members) < 1.0 * il:
+            tremolo = 0
         value = {0: Fraction(4), 1: Fraction(2), 2: Fraction(1)}.get(marks, Fraction(1, 2))
         if any(k == "void" for _, _, k in members):
             value, tremolo, marks = Fraction(8), tremolo + marks, 0
