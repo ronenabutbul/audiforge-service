@@ -871,6 +871,35 @@ def test_a_signature_standing_alone_is_not_a_bar():
     assert starts == printed, starts
 
 
+def test_barline_crossed_by_a_slur_is_still_a_barline():
+    """A slur or tie drawn through a barline widens the stroke for a few
+    rows, ink running out on both sides. That bar line still divides two
+    bars (Adele Alto Sax 1 (MS) bar 18|19: the missed barline put every
+    later number one low). A stem with its notehead hung on one side is
+    not a barline, and neither is a column crossed twice (a time
+    signature's digits)."""
+    import numpy as np
+    from app import fix_hbars
+
+    il, top = 20, 100
+    bottom = top + 4 * il
+    page = np.zeros((300, 400), dtype=bool)
+    for k in range(5):
+        page[top + k * il:top + k * il + 2, 0:400] = True     # staff lines
+    page[top:bottom + 2, 200:203] = True                       # the barline
+    slur = page.copy()
+    slur[top + 6:top + 9, 180:225] = True                      # slur through it
+    assert fix_hbars._interior_barline_xs(slur, top, bottom, 0, 400, il) == [200]
+
+    stem = page.copy()
+    stem[top + 30:top + 46, 182:202] = True                    # head on one side
+    assert fix_hbars._interior_barline_xs(stem, top, bottom, 0, 400, il) == []
+
+    digits = slur.copy()
+    digits[top + 50:top + 53, 180:225] = True                  # a second crossing
+    assert fix_hbars._interior_barline_xs(digits, top, bottom, 0, 400, il) == []
+
+
 def test_rest_expanded_from_a_misread_count_is_cut_to_the_page():
     """homr read an "8" over a rest the page prints as "4" and expanded it
     to 8 bars; the count is corrected to 4 but the bars stayed 8. The page

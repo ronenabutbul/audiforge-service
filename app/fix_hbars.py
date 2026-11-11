@@ -147,6 +147,10 @@ def _run_width(pixels, r: int, x: int) -> int:
     return g - l + 1
 
 
+# Tallest run of wide rows a slur or tie may add where it crosses a barline.
+SLUR_CROSSING_MAX_IL = 0.35
+
+
 def _interior_barline_xs(pixels, top: float, bottom: float, x0: int, x1: int,
                          interline: float) -> list[int]:
     """x of every barline strictly inside a stack, i.e. the boundaries of
@@ -167,9 +171,15 @@ def _interior_barline_xs(pixels, top: float, bottom: float, x0: int, x1: int,
         never exceeds two - rather than by where the lines should be:
         on a skewed scan they sit pixels from the predicted row."""
         notehead, staff_line = 0.75 * interline, 3 * interline
+        # A slur or tie crossing the barline widens a few rows only: the
+        # curve is a thin line. A notehead joined to a stem is wide for
+        # most of an interline, a beam for half of one.
+        crossing = SLUR_CROSSING_MAX_IL * interline
         skip_until = 0
+        wide_run = crossings = 0
         for r in range(t + 3, b - 2):
             if not pixels[r, x] or r < skip_until:
+                wide_run = 0
                 continue
             l = x
             while l > 0 and pixels[r, l - 1]:
@@ -190,7 +200,18 @@ def _interior_barline_xs(pixels, top: float, bottom: float, x0: int, x1: int,
                 skip_until = r + 3
                 continue
             if width > notehead:
-                return False
+                # A slur passes THROUGH the stroke: ink runs well out on
+                # both sides. A notehead hangs on one side of its stem.
+                # One slur, once: two crossings in one column are the
+                # cross-bars of a stacked time signature's digits.
+                through = min(x - l, rgt - x) > 0.25 * interline
+                if wide_run == 0:
+                    crossings += 1
+                wide_run += 1
+                if not through or wide_run > crossing or crossings > 1:
+                    return False
+            else:
+                wide_run = 0
         return True
 
     def continuous(seg) -> bool:
