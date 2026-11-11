@@ -236,21 +236,38 @@ def _barlines(ink: np.ndarray, staves: list[Staff]) -> list[dict]:
     y0 = top.top(top.left)
     runs = [_staff_uprights(ink, s, lean, left, right) for s in five]
     tol = 0.22 * il
+    # In a tall system (a conductor score of twenty staves) a scan bends
+    # the barlines a little: the lean of the staff lines predicts the
+    # barline well over a few staves but drifts by half an interline over
+    # twenty. So the barline is followed from staff to staff, each staff
+    # predicted from where it stood on the staff above. A scan can also
+    # break a barline inside a staff (a faded stroke, or the bottom staff
+    # cut by the page edge). In a system of eight staves or more a
+    # quarter of them may miss it: no other stroke fills a whole staff
+    # in line with that many others. A small system must hold it on
+    # every staff, as before.
+    may_miss = len(five) // 4 if len(five) >= 8 else 0
     out = []
     for a, b in runs[0]:
         x = (a + b - 1) / 2
         xs = min(max(x, top.left), top.right)
         ya = top.top(xs)
-        lo, hi = a, b
+        at, at_y = x, ya
+        missed = 0
         ok = True
         for s, mine in zip(five[1:], runs[1:]):
-            want = x + lean * (s.top(min(max(x, s.left), s.right)) - ya)
+            sy = s.top(min(max(at, s.left), s.right))
+            want = at + lean * (sy - at_y)
             near = [(c, d) for c, d in mine if c - tol <= want <= d - 1 + tol]
             if not near:
-                ok = False
-                break
-            lo = min(lo, min(c for c, _ in near) - (want - x))
-            hi = max(hi, max(d for _, d in near) - (want - x))
+                missed += 1
+                if missed > may_miss:
+                    ok = False
+                    break
+                at, at_y = want, sy
+                continue
+            c, d = min(near, key=lambda r: abs((r[0] + r[1] - 1) / 2 - want))
+            at, at_y = (c + d - 1) / 2, sy
         if not ok:
             continue
         if len(five) == 1:
@@ -271,6 +288,27 @@ def _barlines(ink: np.ndarray, staves: list[Staff]) -> list[dict]:
         else:
             merged.append(dict(bar))
     return merged
+
+
+def _gaps_joined(ink: np.ndarray, staves: list[Staff], b: dict) -> int:
+    """How many gaps between neighbouring five-line staves the upright
+    stroke `b` crosses (a barline does within a bracket; a stem or a
+    time signature never does)."""
+    five = [s for s in staves if s.count == 5]
+    n = 0
+    ya = five[0].top(min(max(b["x"], five[0].left), five[0].right))
+    for a, c in zip(five, five[1:]):
+        xa = min(max(b["x"], a.left), a.right)
+        x = b["x"] + b.get("lean", 0.0) * (a.bottom(xa) - ya)
+        n += _column_run(ink, x, a.bottom(xa), c.top(xa), 3) > 0.9
+    return n
+
+
+def _joined_score(ink: np.ndarray, staves: list[Staff], lines: list[dict]) -> bool:
+    """Most of these barlines join at least one gap between staves."""
+    if len(lines) < 2:
+        return False
+    return 2 * sum(_gaps_joined(ink, staves, b) > 0 for b in lines) > len(lines)
 
 
 def _repeat_dots(ink: np.ndarray, staff: Staff, x: float, side: int) -> bool:
@@ -327,6 +365,63 @@ def read_layout(omr: Path) -> tuple[list[System], dict]:
     return systems, pages
 
 
+def _ink_interline(ink: np.ndarray) -> float | None:
+    """Median gap between neighbouring staff lines on a page, read from the
+    ink (rows that are mostly black across the page)."""
+    rows = ink.mean(axis=1) > 0.4
+    ys, y = [], 0
+    while y < len(rows):
+        if rows[y]:
+            a = y
+            while y < len(rows) and rows[y]:
+                y += 1
+            ys.append((a + y) / 2)
+        y += 1
+    gaps = np.diff(ys)
+    gaps = gaps[gaps < 40]                   # within a staff, not between staves
+    return float(np.median(gaps)) if len(gaps) >= 4 else None
+
+
+class NoSystems(Exception):
+    """The Audiveris project holds no system to read."""
+
+
+def no_systems_reason(omr: Path) -> str:
+    """Why Audiveris left every sheet without a system. The usual cause is a
+    dense score engraved so small that its staff lines are under 10 pixels
+    apart: Audiveris' scale step refuses such a sheet ("too low interline"),
+    so nothing at all is read and no ink reader has staves to work on."""
+    from PIL import Image
+    gaps = []
+    with zipfile.ZipFile(omr) as z:
+        for name in _sheets(z):
+            png = f"{name}/BINARY.png"
+            if png in z.namelist():
+                ink = np.asarray(Image.open(io.BytesIO(z.read(png))).convert("L")) < 128
+                il = _ink_interline(ink)
+                if il:
+                    gaps.append(il)
+    if not gaps:
+        import chart_kind
+        staves = chart_kind._ink_staves(omr)
+        if staves and all(n <= 2 for n, _y in staves):
+            return (f"Audiveris found no systems; the pages hold only one- or two-line staves "
+                    f"({len(staves)}), which Audiveris reads only with its "
+                    f"org.audiveris.omr.sheet.ProcessingSwitches.oneLineStaves switch on "
+                    f"(without it, it takes the staff spacing for one huge interline)")
+        return "Audiveris found no systems and the pages show no staff lines"
+    il = float(np.median(gaps))
+    msg = (f"Audiveris found no systems on any sheet; the ink shows staff lines "
+           f"{il:.1f} px apart on {len(gaps)} sheets")
+    if il < 12:
+        msg += (f". That is below what Audiveris accepts as an interline, so it dropped every "
+                f"sheet at its scale step. Re-run Audiveris with the PDF rendered about "
+                f"{int(np.ceil(20 / il))}x finer (interline near 20 px), e.g. "
+                f"-option org.audiveris.omr.image.ImageLoading.pdfResolution=600 "
+                f"for a page now at 300 dpi")
+    return msg
+
+
 def _bars_of(ink: np.ndarray, system: System) -> None:
     """Bars between the barlines; the barline that opens the system and
     the gap after a closing one are not bars."""
@@ -350,6 +445,15 @@ def _bars_of(ink: np.ndarray, system: System) -> None:
     stops = [float(h.get("stop")) for h in system.element.iter("header") if h.get("stop")]
     if edges and stops and edges[0]["x0"] < max(stops) + 3.0 * il and len(edges[0]["kind"].split("-")) > 1:
         prev = edges.pop(0)
+    elif edges and stops and edges[0]["x0"] < max(stops) + 3.0 * il and opening is not None \
+            and _gaps_joined(ink, system.staves, opening) and not _gaps_joined(ink, system.staves, edges[0]) \
+            and _joined_score(ink, system.staves, edges[1:]):
+        # just past the clefs and key: an upright that fills every staff but,
+        # unlike the system's opening barline, joins none of the gaps between
+        # them is a time signature's stroke (a hand-drawn 4), not a barline.
+        # Only in a score whose other barlines join the gaps: a piano
+        # score may draw its barlines staff by staff (Bacchanale)
+        edges.pop(0)
     for b in edges:
         bars.append({"x0": prev["x1"], "x1": b["x0"], "left": prev, "right": b})
         prev = b
@@ -395,6 +499,31 @@ def _margin_names(system: System, root: ET.Element) -> list[tuple[float, str]]:
     return [(y, " ".join(v for _, v in sorted(ws))) for y, ws in rows]
 
 
+CLEF_SHAPES = {"G_CLEF": "G", "G_CLEF_SMALL": "G", "G_CLEF_8VB": "G", "F_CLEF": "F",
+               "F_CLEF_SMALL": "F", "C_CLEF": "C", "PERCUSSION_CLEF": "PERC"}
+
+
+def _carry_clefs(system: System, last: dict[int, str]) -> None:
+    """Update `last` (slot -> clef) with the clef each staff of the system
+    ends with: its header clef, then the rightmost clef change on it."""
+    by_sid = {s.sid: s for s in system.staves if s.sid}
+    for s in system.staves:
+        if s.clef:
+            last[s.slot] = s.clef
+    inters = system.element.find("sig/inters")
+    seen: dict[int, tuple[float, str]] = {}
+    for el in inters if inters is not None else []:
+        b = el.find("bounds")
+        kind = CLEF_SHAPES.get(el.get("shape") or "")
+        if el.tag != "clef" or b is None or not kind or el.get("staff") not in by_sid:
+            continue
+        slot, x = by_sid[el.get("staff")].slot, float(b.get("x"))
+        if slot not in seen or x > seen[slot][0]:
+            seen[slot] = (x, kind)
+    for slot, (_x, kind) in seen.items():
+        last[slot] = kind
+
+
 def number_staves(systems: list[System], pages: dict) -> list[Part]:
     """Give every staff its slot in the score and group the slots into
     parts. The first system that shows the most staves is the model; a
@@ -403,11 +532,17 @@ def number_staves(systems: list[System], pages: dict) -> list[Part]:
     model = max(systems, key=lambda s: len(s.staves))
     model = next(s for s in systems if len(s.staves) == len(model.staves))
     kinds = [(s.count, s.clef) for s in model.staves]
+    # the clef each slot ended the previous system with: a system that
+    # hides staves is matched against that, not against the model's first
+    # clefs, since a part may have changed clef (timpani to castanets in
+    # treble) and a staff left alone on a line keeps the clef it had
+    last = {k: c for k, (_n, c) in enumerate(kinds)}
     for system in systems:
         mine = [(s.count, s.clef) for s in system.staves]
         if len(mine) == len(kinds):
             for k, s in enumerate(system.staves):
                 s.slot = k
+            _carry_clefs(system, last)
             continue
         # order-preserving match: fewest disagreements
         best: tuple[int, list[int]] | None = None
@@ -420,12 +555,14 @@ def number_staves(systems: list[System], pages: dict) -> list[Part]:
                 best = (cost, picked)
                 return
             for jj in range(j, len(kinds) - (len(mine) - i) + 1):
-                miss = (mine[i][0] != kinds[jj][0]) * 4 + (bool(mine[i][1]) and bool(kinds[jj][1])
-                                                           and mine[i][1] != kinds[jj][1])
+                was = last.get(jj) or kinds[jj][1]
+                miss = (mine[i][0] != kinds[jj][0]) * 4 + (bool(mine[i][1]) and bool(was)
+                                                           and mine[i][1] != was)
                 walk(i + 1, jj + 1, cost + miss, picked + [jj])
         walk(0, 0, 0, [])
         for s, k in zip(system.staves, best[1] if best else range(len(mine))):
             s.slot = k
+        _carry_clefs(system, last)
     # names from the margin of the model system
     names = _margin_names(model, pages[model.name][1])
     left = min(s.left for s in model.staves)
@@ -455,13 +592,28 @@ def number_staves(systems: list[System], pages: dict) -> list[Part]:
     while k < len(model.staves):
         group = next((g for g in groups if g[0] == k and owner.get(k)), [k])
         staff = model.staves[k]
-        kind = "line" if staff.count == 1 else "drums" if staff.clef == "PERC" else "pitched"
-        parts.append(Part(owner.get(k, ""), group, kind))
+        name = owner.get(k, "")
+        kind = "line" if staff.count == 1 else "drums" if staff.clef == "PERC" \
+            or (len(group) == 1 and _unpitched_name(name)) else "pitched"
+        parts.append(Part(name, group, kind))
         k = group[-1] + 1
     for n, p in enumerate(parts):
         if not p.name:
             p.name = _ocr_margin(model, model.staves[p.slots[0]], pages[model.name][0]) or f"Part {n + 1}"
     return parts
+
+
+# Instruments that play no pitch. Older band parts write them on a bass
+# staff with a bass clef (snare in a space, bass drum below), so the clef
+# alone does not tell; the printed name does. Timpani are pitched.
+UNPITCHED = re.compile(r"\b(drums?|drum\s*set|drumset|snare|s\.\s*d\.|bass\s*drum|b\.\s*d\.|"
+                       r"percussion|perc\.?|cymbals?|tom-?toms?|bongos?|congas?|batterie|schlagzeug)\b",
+                       re.I)
+
+
+def _unpitched_name(name: str) -> bool:
+    return bool(name) and bool(UNPITCHED.search(name)) and not re.search(r"timp|glock|xyl|vib|marimba|bell",
+                                                                         name, re.I)
 
 
 def _ocr_margin(system: System, staff: Staff, ink: np.ndarray) -> str:
@@ -528,7 +680,7 @@ def layout_debug(work: Path, out_dir: Path) -> None:
     omr = next(work.glob("*.omr"))
     systems, pages = read_layout(omr)
     if not systems:
-        print("no systems in the Audiveris project (it never got as far as the staves)")
+        print(no_systems_reason(omr))
         return
     parts = number_staves(systems, pages)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -990,6 +1142,19 @@ def time_pitched(events: list[Event], bar_len: Fraction, il: float,
                 streams[2] = free
             else:
                 streams[3] = free
+        # A long note (a quarter or more) whose stem points the same way
+        # as a note standing right after it, closer than any value that
+        # long is ever spaced, is not in that voice: two voices start
+        # together, the long one held under the moving one (a half note
+        # with a dotted eighth on the same beat). Chained in one voice it
+        # would push the whole moving line late.
+        for v in (1, 2):
+            evs = sorted(streams.get(v, []), key=lambda e: e.x)
+            held = [a for a, b in zip(evs, evs[1:])
+                    if a.value >= 1 and b.x - a.x < 1.6 * il and abs(b.y - a.y) < 3 * il]
+            if held and len(evs) - len(held) >= 2:
+                streams[v] = [e for e in evs if e not in held]
+                streams[max(streams) + 1] = held
         best = None
         mean_y = {v: float(np.mean([e.y for e in evs])) for v, evs in streams.items() if evs}
         voices = [v for v in streams if streams[v]] or [1]
@@ -1174,8 +1339,8 @@ def _roll_slashes(sheet, events: list[dict], il: float) -> None:
     its sides on the same rows). Its tail right of the stem was taken for
     the head's dot; it makes the note a roll instead."""
     for e in events:
-        if e.get("rest") or not e.get("heads") or "sx" not in e:
-            continue
+        if e.get("rest") or not e.get("heads") or e.get("sx") is None or e.get("tip") is None:
+            continue                         # a stem-less note has no roll slash to cross
         sx, tip = e["sx"], e["tip"]
         ys = [h[1] for h in e["heads"]]
         up = tip < min(ys)
@@ -1306,7 +1471,9 @@ def _simile(sheet, bar: dict) -> bool:
         _x, _y, w, h, area = stats[i]
         if 1.4 * il <= w <= 3.3 * il and 1.4 * il <= h <= 2.8 * il and area <= 0.5 * w * h:
             slash += 1
-        elif 0.15 * il <= w <= 0.6 * il and 0.15 * il <= h <= 0.6 * il and area >= 0.55 * w * h:
+        # the dots are up to most of a space across in older engraving,
+        # and taller where a staff line through them was taken out
+        elif 0.15 * il <= w <= 0.85 * il and 0.15 * il <= h <= 1.0 * il and area >= 0.5 * w * h:
             dots += 1
     return slash == 1 and dots >= 2
 
@@ -1516,9 +1683,72 @@ class Locator:
         return min(system.staves, key=gap)
 
 
-def read_signatures(systems: list[System]) -> tuple[list[tuple[int, int]], list[dict], dict]:
+def _sectional(barline: dict) -> bool:
+    """A double or final barline (or a repeat): where a new section, and
+    so a meter change in mid line, begins."""
+    return len(str(barline.get("kind", "")).split("-")) > 1
+
+
+def _stack_durations(system: System) -> list[Fraction | None]:
+    """Per bar of the system, the length Audiveris measured for the notes
+    of its stack (the stack whose span holds the bar's middle)."""
+    stacks = []
+    for st in system.element.iter("stack"):
+        if st.get("left") and st.get("right") and st.get("duration"):
+            stacks.append((float(st.get("left")), float(st.get("right")), Fraction(st.get("duration"))))
+    out = []
+    for bar in system.bars:
+        mid = (bar["x0"] + bar["x1"]) / 2
+        out.append(next((d for a, b, d in stacks if a <= mid <= b), None))
+    return out
+
+
+def _held_meter(systems: list[System], system: System, k: int,
+                meter: tuple[int, int]) -> tuple[int, int] | None:
+    """The meter the bars of a new section hold, when its printed time
+    signature was read by neither Audiveris nor the ink reader (a blurred
+    3 read as 4 or 8). The section runs from bar k to the next double
+    barline. Audiveris measures how long the notes of every bar are; when
+    at least three bars of the section say one length other than the
+    meter in force, and two thirds of the section agree on it, that is
+    the meter. A single bar's count is often wrong (a missed rest, a
+    tuplet), so only an agreeing majority counts."""
+    lens = []
+    start = systems.index(system)
+    for sy in systems[start:start + 2]:
+        durs = _stack_durations(sy)
+        for j, bar in enumerate(sy.bars):
+            if sy is system and j < k:
+                continue
+            if lens and _sectional(bar["left"]):
+                break
+            lens.append(durs[j])
+        else:
+            continue
+        break
+    lens = [d for d in lens if d]
+    if len(lens) < 3:
+        return None
+    best = max(set(lens), key=lens.count)
+    if lens.count(best) < 3 or 3 * lens.count(best) < 2 * len(lens):
+        return None
+    if best == Fraction(meter[0], meter[1]) or not Fraction(1, 2) <= best <= Fraction(3, 2):
+        return None
+    beat = meter[1]
+    while (best * beat).denominator != 1 and beat < 16:
+        beat *= 2
+    if (best * beat).denominator != 1:
+        return None
+    return int(best * beat), beat
+
+
+def read_signatures(systems: list[System], pages: dict | None = None
+                    ) -> tuple[list[tuple[int, int]], list[dict], dict]:
     """Per measure the meter; per measure {slot: fifths}; and per system
-    id {slot: [(x, clef)]} for the clef in force along the staff."""
+    id {slot: [(x, clef)]} for the clef in force along the staff. With
+    `pages`, a mid-line bar that opens past a double barline and has no
+    time signature from Audiveris takes the meter its section's bars hold
+    (`_held_meter`)."""
     meters, keys, clefs = [], [], {}
     meter = (4, 4)
     key: dict[int, int] = {}
@@ -1570,13 +1800,25 @@ def read_signatures(systems: list[System]) -> tuple[list[tuple[int, int]], list[
                 meter, pending_meter = pending_meter, None
             key.update(pending_key)
             pending_key = {}
-            for x, m in sigs:
-                kk, late = home(x)
-                if kk == k:
-                    if late:
-                        pending_meter = m
-                    else:
-                        meter = m
+            # a time signature stands just after a barline, or just before
+            # one as a warning; a "meter" in the middle of a bar is some
+            # other sign misread (a bar-repeat "%" read as 3/4)
+            mine = [(x, m) for x, m in sigs if home(x)[0] == k
+                    and (k == 0 or x < bar["x0"] + 4 * il or x > bar["x1"] - 4 * il)]
+            for x, m in mine:
+                if home(x)[1]:
+                    pending_meter = m
+                else:
+                    meter = m
+            if pages is not None and k > 0 and not mine and _sectional(bar["left"]):
+                # The digits are not read here: Tesseract on small engraved
+                # digits misread both test scores (3/4 as 4/4, 2/4 as 9/4),
+                # and a wrong meter spoils every bar after it.
+                held = _held_meter(systems, system, k, meter)
+                if held:
+                    print(f"  time signature from what the bars hold: bar {len(meters) + 1} "
+                          f"{held[0]}/{held[1]}")
+                    meter = held
             for x, slot, fifths in kys:
                 kk, late = home(x)
                 if kk == k:
@@ -1840,8 +2082,10 @@ def _link_open_ties(per_measure: list[list[Event]], bar_lens: list[Fraction]) ->
 def convert(work: Path, out: Path) -> dict:
     omr = next(work.glob("*.omr"))
     systems, pages = read_layout(omr)
+    if not systems:
+        raise NoSystems(no_systems_reason(omr))
     parts = number_staves(systems, pages)
-    meters, keys, clefs = read_signatures(systems)
+    meters, keys, clefs = read_signatures(systems, pages)
     locator = Locator(systems)
     n_measures = sum(len(s.bars) for s in systems)
     bar_lens = [Fraction(m[0] * 4, m[1]) for m in meters]
@@ -2165,7 +2409,11 @@ def main():
     if "--layout" in sys.argv:
         layout_debug(work, Path(sys.argv[sys.argv.index("--layout") + 1]))
         return
-    convert(work, Path(sys.argv[2]))
+    try:
+        convert(work, Path(sys.argv[2]))
+    except NoSystems as e:
+        print(f"cannot convert: {e}")
+        sys.exit(3)
 
 
 if __name__ == "__main__":
