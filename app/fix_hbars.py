@@ -114,6 +114,28 @@ def _ink_through(pixels, x: int, centre: int, lo: int, hi: int) -> int:
     return d - u + 1
 
 
+# Off by default. When on, a barline may carry the hook of an ending
+# bracket above it: the stroke goes on past the top staff line and ends in
+# a long flat line. The drum pipeline turns this on (drum_grid.main), so
+# its own bar splitting and stack_numbers() agree on the bar count.
+VOLTA_HOOK_BARLINES = False
+
+
+def _hook_above(pixels, x: int, top_row: int, interline: float) -> bool:
+    """The ink above a barline is the downstroke of an ending bracket: a
+    thin stroke that stops, within a few interlines, at a flat line
+    running on to the right."""
+    r = top_row
+    limit = max(top_row - int(6 * interline), 1)
+    while r > limit and pixels[r - 1, x - 1:x + 2].any():
+        r -= 1
+    if top_row - r < interline or r <= limit:
+        return False
+    span = int(2.5 * interline)
+    band = pixels[max(r - 2, 0):r + 4, x + 2:x + 2 + span]
+    return bool(band.size) and float(band.any(axis=0).mean()) > 0.9
+
+
 def _interior_barline_xs(pixels, top: float, bottom: float, x0: int, x1: int,
                          interline: float) -> list[int]:
     """x of every barline strictly inside a stack, i.e. the boundaries of
@@ -171,7 +193,9 @@ def _interior_barline_xs(pixels, top: float, bottom: float, x0: int, x1: int,
     for x in range(x0 + inset, x1 - inset):
         col = pixels[:, x]
         is_bar = (continuous(col[t + 2:b - 1])
-                  and not col[max(t - 4, 0)] and not col[min(b + 4, len(col) - 1)]
+                  and (not col[max(t - 4, 0)]
+                       or VOLTA_HOOK_BARLINES and _hook_above(pixels, x, t, interline))
+                  and not col[min(b + 4, len(col) - 1)]
                   and thin_all_the_way(x))
         if is_bar and (last is None or x - last > interline):
             found.append(x)
@@ -1619,7 +1643,8 @@ def _omr_rehearsal_marks(omr_path: Path) -> list[tuple[int, int, int, str]]:
 def _locate_marks(omr_path: Path, hbars: list[dict],
                   marks: list[tuple[int, int, int, object]],
                   band: str = "above", containing: bool = False,
-                  slack_il: float = 2.0) -> list[tuple[int, object]]:
+                  slack_il: float = 2.0,
+                  numbers: list[int] | None = None) -> list[tuple[int, object]]:
     """The printed measure number each page mark sits over.
 
     `marks` are (sheet ordinal, x, y, value); the value is carried
@@ -1629,7 +1654,9 @@ def _locate_marks(omr_path: Path, hbars: list[dict],
     mark lies inside (a dynamic under its note) rather than the bar
     whose starting barline is nearest (a letter over the barline), with
     `slack_il` interlines of tolerance for ink that begins a little
-    before its bar. Returns (printed number, value) in mark order."""
+    before its bar. `numbers` is the printed number of every stack when
+    the caller counts its measures another way than `stack_numbers`.
+    Returns (printed number, value) in mark order."""
     if not marks:
         return []
     # Two readers can see the same mark: same sheet and same place.
@@ -1641,7 +1668,8 @@ def _locate_marks(omr_path: Path, hbars: list[dict],
         deduped.append(m)
     marks = deduped
 
-    numbers = stack_numbers(omr_path, hbars)
+    if numbers is None:
+        numbers = stack_numbers(omr_path, hbars)
     by_stack = {h["stack"]: h for h in hbars}
     located = []  # (printed measure number, value)
     with zipfile.ZipFile(omr_path) as z:

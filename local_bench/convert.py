@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """Convert a PDF to MusicXML with the full local pipeline — the same steps
-production runs: homr v0.7.0 + Audiveris, homr normalizers, rhythm-validity
-routing, feature fusion, metadata and transpose.
+production runs, from the same module (app/pipeline.py): homr v0.7.0 +
+Audiveris, homr normalizers, rhythm-validity routing, feature fusion,
+structure repair, metadata and transpose.
 
 Usage:
     .venv-homr/bin/python convert.py "<input.pdf>" [more.pdf ...]
@@ -21,37 +22,24 @@ from pathlib import Path
 BENCH_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BENCH_DIR))
 
-from run_bench import (  # noqa: E402
+from run_bench import (  # noqa: E402 - also puts the repo root on sys.path
     HOMR_070_BIN,
-    apply_metadata,
     run_audiveris,
     run_homr,
 )
 
-sys.path.insert(0, str(BENCH_DIR.parent / "benchmark"))
-sys.path.insert(0, str(BENCH_DIR.parent / "app"))
-import score as scorer  # noqa: E402
-from fix_hbars import (detect_circled_letters, detect_hbars,  # noqa: E402
-                       place_dynamics, place_endings, place_hairpins,
-                       place_rehearsals, place_repeats, place_signs,
-                       place_tempo_marks, place_text, stack_numbers)
-from fix_hbars import fix as fix_hbars  # noqa: E402
-from fix_multirests import fix as fix_multirest_counts  # noqa: E402
-from fix_structure import fix as fix_structure  # noqa: E402
-from fix_tempo import fix as fix_tempo  # noqa: E402
-from fix_titles import fix as fix_titles  # noqa: E402
-from postprocess import (app_compat, beam_by_beat, clean_words,  # noqa: E402
-                         drop_phantom_clef_changes, graft_features,
-                         graft_missing_measures, graft_numbered,
-                         graft_time_symbol, normalize_homr)
-from transpose import apply_transpose  # noqa: E402
+from app import pipeline  # noqa: E402 - the pipeline the service runs
 
 MSCORE = Path("/Applications/MuseScore 4.app/Contents/MacOS/mscore")
 
 
 def validity(path: Path) -> float:
-    valid, total = scorer.rhythm_validity(ET.parse(path).getroot())
+    valid, total = pipeline.rhythm_validity(ET.parse(path).getroot())
     return valid / max(total, 1)
+
+
+def _measure_count(path: Path) -> int:
+    return len(ET.parse(path).getroot().find("part").findall("measure"))
 
 
 def convert(pdf: Path) -> Path:
@@ -61,128 +49,45 @@ def convert(pdf: Path) -> Path:
 
     homr_out = aud_out = None
     try:
-        homr_out = run_homr(pdf, work, HOMR_070_BIN)
-        normalize_homr(homr_out)
+        merged = run_homr(pdf, work, HOMR_070_BIN)
+        pipeline.prepare_homr(merged)
+        homr_out = merged  # only a normalised score counts, as on the service
     except Exception as exc:
         print(f"  homr failed: {exc}", flush=True)
     try:
         aud_out = run_audiveris(pdf, work)
+        restored = pipeline.prepare_audiveris(aud_out, work)
+        if any(restored.values()):
+            print(f"  audiveris rests put back: {restored}", flush=True)
     except Exception as exc:
         print(f"  audiveris failed: {exc}", flush=True)
     if homr_out is None and aud_out is None:
         raise RuntimeError(f"both engines failed on {name}")
 
+    # Everything from the engine choice to the finished file is the
+    # pipeline the service runs (app/pipeline.py): same choice, same steps
+    # in the same order, so the Mac and the server agree by construction.
     result = work / f"{name}.musicxml"
-
-    def measures_of(path):
-        return len(ET.parse(path).getroot().find("part").findall("measure"))
-
-    def lyrics_of(path):
-        return sum(1 for _ in ET.parse(path).getroot().iter("lyric"))
-
-    # Completeness-weighted validity: a truncated engine cannot outrank a
-    # complete one. Lyrics force the Audiveris base for vocal parts.
-    most = max((measures_of(p) for p in (homr_out, aud_out) if p), default=1)
-    h_val = (validity(homr_out) * measures_of(homr_out) / most
-             if homr_out else -1.0)
-    a_val = (validity(aud_out) * measures_of(aud_out) / most
-             if aud_out else -1.0)
-    if (homr_out and aud_out and lyrics_of(aud_out) >= 10 > lyrics_of(homr_out)
-            and a_val >= h_val - 0.05):
-        h_val = -1.0  # vocal part: the engine that read the words wins
-    if homr_out and h_val >= a_val:
-        result.write_bytes(homr_out.read_bytes())
-        role = f"homr base (validity {h_val:.0%} vs audiveris {a_val:.0%})"
-        if aud_out:
-            aligned, grafted = graft_features(result, aud_out)
-            role += f", {grafted} features grafted over {aligned} measures"
-    else:
-        result.write_bytes(aud_out.read_bytes())
-        role = f"audiveris base (validity {a_val:.0%} vs homr {h_val:.0%})"
-    repaired, dropped = clean_words(result)
-    if repaired or dropped:
-        print(f"  words: {repaired} repaired, {dropped} debris dropped", flush=True)
-    if role.startswith("homr") and aud_out:
-        stamped = graft_time_symbol(result, aud_out)
-        if stamped:
-            print(f"  {stamped} time signatures stamped C/cut", flush=True)
-
-    if aud_out is not None:
-        fixed = fix_multirest_counts(work, result)
-        if fixed:
-            print(f"  {fixed} multirest counts repaired via crop-OCR",
-                  flush=True)
-        fix_structure(work, result)
-        updated, inserted = fix_hbars(work, result)
-        if updated or inserted:
-            print(f"  H-bar reconciliation: {updated} counts corrected, "
-                  f"{inserted} missed multirests inserted", flush=True)
-        if True:  # every placement below reads the page, whichever engine won
-            sec_numbers = None
-            omr = next(work.rglob("*.omr"), None)
-            hbars = detect_hbars(omr) if omr is not None else []
-            if omr is not None:
-                sec_numbers = stack_numbers(omr, hbars)
-            missing = graft_missing_measures(result, aud_out)
-            if missing:
-                print(f"  {missing} bar(s) the base engine skipped put back "
-                      f"from the other engine", flush=True)
-            n = graft_numbered(result, aud_out, sec_numbers)
-            if n:
-                print(f"  {n} rehearsal/lyric elements placed by printed "
-                      f"number", flush=True)
-            if omr is not None:
-                p = place_rehearsals(omr, result, hbars,
-                                     extra_marks=detect_circled_letters(omr))
-                if p:
-                    print(f"  {p} rehearsal letters re-placed by pixel "
-                          f"position", flush=True)
-                counts = {
-                    "signs": place_signs(omr, result, hbars),
-                    "dynamics": place_dynamics(omr, result, hbars),
-                    "hairpins": place_hairpins(omr, result, hbars),
-                    "repeats": place_repeats(omr, result, hbars),
-                    "endings": place_endings(omr, result, hbars),
-                    "tempo marks": place_tempo_marks(omr, result, hbars),
-                    "text": place_text(omr, result, hbars),
-                }
-                print("  placed from the page: " + ", ".join(
-                    f"{v} {k}" for k, v in counts.items()), flush=True)
-    # Metadata first: fix_titles strips movement-title when it builds a
-    # credit header, and apply_metadata must not re-create it afterwards.
-    apply_metadata(result, name)
-    apply_transpose(result, name.rsplit(" - ", 1)[-1])
-
-    page1 = work / "page_001.png"
-    if page1.exists():
-        bpm = fix_tempo(page1, result)
-        if bpm:
-            print(f"  tempo recovered: {bpm} BPM", flush=True)
-        for line in fix_titles(page1, result):
-            print(f"  title text recovered: {line}", flush=True)
+    report = pipeline.finish(work, homr_out, aud_out, result, name,
+                             say=lambda line: print(f"  {line}", flush=True))
 
     # Engines disagreeing on the bar count means one of them dropped or
     # invented measures (Audiveris is known to lose bar 1 sometimes).
-    # Surfaced for now; structure voting is the planned fix.
     if homr_out is not None and aud_out is not None:
-        h = len(ET.parse(homr_out).getroot().find("part").findall("measure"))
-        a = len(ET.parse(aud_out).getroot().find("part").findall("measure"))
+        h, a = _measure_count(homr_out), _measure_count(aud_out)
         if h != a:
             print(f"  WARNING: engines disagree on measure count "
                   f"(homr {h} vs audiveris {a}) — bars may be missing",
                   flush=True)
 
-    phantom = drop_phantom_clef_changes(result)
-    beamed = beam_by_beat(result)
-    print(f"  {beamed} notes beamed, {phantom} phantom clef/key/fermata removed", flush=True)
-    app_compat(result)
-
     root = ET.parse(result).getroot()
     measures = len(root.find("part").findall("measure"))
     notes = sum(1 for n in root.iter("note") if n.find("rest") is None)
-    print(f"  {name}: {role}")
+    print(f"  {name}: {report['reason']}")
     print(f"  {measures} measures, {notes} notes, "
           f"final rhythm validity {validity(result):.1%}", flush=True)
+    for warning in report["warnings"]:
+        print(f"  WARNING: {warning}", flush=True)
 
     render = work / f"{name} (converted).pdf"
     subprocess.run([str(MSCORE), "--force", "-o", str(render), str(result)],

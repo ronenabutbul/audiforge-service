@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import base64
 import io
+import math
+from fractions import Fraction
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
@@ -46,6 +48,22 @@ KIT = {
     "tom_high":  ("E", 5, None, 50, 1),
     "tom_mid":   ("D", 5, None, 47, 1),
     "tom_low":   ("A", 4, None, 45, 1),
+    # The rest of the app editor's kit (drum_note.dart `standardDrumNotes`,
+    # GM keys from drum_note_midi.dart), so every piece a chart can print
+    # has an instrument that sounds right. Names keep the scorer's
+    # categories: "hh_*" is a hi-hat, "*crash*"/"splash"/"china" a crash.
+    "tom_floor":   ("G", 4, None, 43, 1),         # editor tom5
+    "tom_mid_high": ("D", 5, None, 48, 1),        # editor tom2
+    "kick2":       ("E", 4, None, 35, 2),
+    "hh_splash":   ("D", 4, "diamond", 46, 2),    # editor hi_hat_splash
+    "crash_choke": ("A", 5, "circle-x", 49, 1),
+    "china":       ("B", 5, "x", 52, 1),
+    "splash":      ("G", 5, "x", 55, 1),
+    "cowbell":     ("E", 5, "triangle", 56, 1),
+    # A ride struck like a crash: an x on the ride line with a dash over
+    # the stem. The editor's table has no such piece; GM's nearest is the
+    # second ride cymbal.
+    "ride_crash":  ("F", 5, "x", 59, 1),
     # one-line percussion parts (see one_line.py)
     "bongo_high": ("E", 5, None, 60, 1),
     "bongo_low":  ("C", 5, None, 61, 1),
@@ -63,17 +81,20 @@ KIT = {
 STEP_MAP = {
     -3: {"x": "crash", "normal": "crash"},
     -2: {"x": "crash", "normal": "crash"},
-    -1: {"x": "hh_closed", "circled_x": "hh_open", "normal": "hh_closed"},
-    0:  {"x": "ride", "circled_x": "ride_bell", "normal": "tom_high"},
-    1:  {"x": "ride", "circled_x": "ride", "normal": "tom_high"},
-    2:  {"x": "ride", "normal": "tom_high"},
+    -1: {"x": "hh_closed", "circled_x": "hh_open", "normal": "hh_closed",
+         "diamond": "ride_bell"},
+    0:  {"x": "ride", "circled_x": "ride_bell", "normal": "tom_high",
+         "diamond": "ride_bell"},
+    1:  {"x": "ride", "circled_x": "ride", "normal": "tom_high",
+         "diamond": "ride_bell"},
+    2:  {"x": "ride", "normal": "tom_high", "diamond": "ride_bell"},
     3:  {"x": "rim", "normal": "snare"},
     4:  {"x": "rim", "normal": "tom_mid"},
     5:  {"x": "ride", "normal": "tom_low"},
     6:  {"x": "rim", "normal": "tom_low"},
-    7:  {"x": "hh_pedal", "normal": "kick"},
-    8:  {"x": "hh_pedal", "normal": "kick"},
-    9:  {"x": "hh_pedal", "normal": "kick"},
+    7:  {"x": "hh_pedal", "normal": "kick", "diamond": "hh_splash"},
+    8:  {"x": "hh_pedal", "normal": "kick", "diamond": "hh_splash"},
+    9:  {"x": "hh_pedal", "normal": "kick", "diamond": "hh_splash"},
 }
 
 PROMPT = """You are reading ONE BAR of a printed drum-set chart.
@@ -146,6 +167,18 @@ class Strike(BaseModel):
     # of each kit piece and the longest value that fits.
     voice: int | None = None
     value: int | None = None
+    # How the note is struck, read from the signs printed over or under
+    # it: "accent", "marcato", "marcato_down", "open", "closed" (hi-hat).
+    marks: list[str] = []
+    # A grace note (a flam's small slashed note): it takes no time and is
+    # written just before the strike in the same slot and voice.
+    grace: bool = False
+    # The exact onset in 16th slots when it is not a whole slot (a note
+    # inside a triplet: "16/3"). `slot` then holds the slot it falls in.
+    onset: str | None = None
+    # The kit piece, when the page names it in words ("Cym. Dome" makes
+    # the cymbal notes that follow a ride bell) rather than by position.
+    inst: str | None = None
 
 
 class BarReading(BaseModel):
@@ -156,6 +189,9 @@ class BarReading(BaseModel):
     measure_number: int | None = None
     multirest_count: int | None = None
     tempo_bpm: int | None = None
+    # Tuplet brackets: {"voice", "start", "end" (16th slots, as fraction
+    # strings), "actual", "normal"} - three notes in the time of two.
+    tuplets: list[dict] = []
 
 
 class Hit(BaseModel):
@@ -172,6 +208,9 @@ class Hit(BaseModel):
     voices: list[int] = []      # 0 = not known
     values: list[int] = []      # 0 = not known
     tremolos: list[int] = []
+    marks: list[str] = []       # per instrument, signs joined by a space
+    graces: list[bool] = []
+    onset: str | None = None    # exact onset when it is not a whole slot
 
 
 def calibrate(readings: list["BarReading"]) -> dict:
@@ -216,7 +255,11 @@ def calibrate(readings: list["BarReading"]) -> dict:
             row = step_map.setdefault(step, {})
             row["x"] = inst
             row["circled_x"] = ("hh_open" if inst == "hh_closed"
-                                else "ride_bell" if inst == "ride" else inst)
+                                else "ride_bell" if inst == "ride"
+                                else "crash_choke" if inst == "crash" else inst)
+            # a filled diamond among the cymbals is the bell of the ride,
+            # whichever cymbal line the chart draws it on
+            row["diamond"] = "hh_splash" if inst == "hh_pedal" else "ride_bell"
 
     # Kick and snare are stable across publishers (bottom space, middle
     # space) — but if this chart's two busiest plain lines sit elsewhere,
@@ -233,43 +276,59 @@ def calibrate(readings: list["BarReading"]) -> dict:
     return step_map
 
 
+def instrument_for(step: int, head: str, step_map: dict | None = None) -> str | None:
+    """The kit piece a head at this staff position is, on this chart."""
+    row = (step_map or STEP_MAP).get(max(-4, min(10, step)))
+    if row is None:
+        return None
+    return row.get(head) or row.get("normal")
+
+
 def reading_to_grid(reading: "BarReading",
                     step_map: dict | None = None) -> "BarGrid":
     """Map seen positions to kit pieces via POSITION_MAP."""
-    by_slot: dict[int, list[tuple]] = {}
-    long: dict[int, tuple[int | None, int]] = {}
+    by_slot: dict[tuple, list[tuple]] = {}
+    long: dict[tuple, tuple[int | None, int]] = {}
     for strike in reading.strikes:
-        table = step_map or STEP_MAP
-        row = table.get(max(-4, min(10, strike.step)))
-        if row is None:
-            continue
-        inst = row.get(strike.head) or row.get("normal")
+        inst = strike.inst or instrument_for(strike.step, strike.head, step_map)
         if inst is None:
             continue
-        by_slot.setdefault(strike.slot, []).append(
+        # The sign over a hi-hat note says how it sounds, whatever its
+        # head: "o" open, "+" closed. An unmarked note is closed.
+        if "open" in strike.marks and inst == "hh_closed":
+            inst = "hh_open"
+        elif "closed" in strike.marks and inst == "hh_open":
+            inst = "hh_closed"
+        key = (strike.slot, strike.onset)
+        by_slot.setdefault(key, []).append(
             (inst, strike.accent, strike.step, strike.head,
-             strike.voice or 0, strike.value or 0, strike.tremolo))
+             strike.voice or 0, strike.value or 0, strike.tremolo,
+             " ".join(strike.marks), strike.grace))
         if strike.length or strike.tremolo:
-            long[strike.slot] = (strike.length, strike.tremolo)
+            long[key] = (strike.length, strike.tremolo)
     return BarGrid(
         is_repeat_of_previous=reading.is_repeat_of_previous,
-        hits=[Hit(slot=s, instruments=[t[0] for t in v],
+        hits=[Hit(slot=s[0], onset=s[1], instruments=[t[0] for t in v],
                   accent=any(t[1] for t in v),
                   steps=[t[2] for t in v],
                   heads=[t[3] for t in v],
                   voices=[t[4] for t in v] if any(t[4] for t in v) else [],
                   values=[t[5] for t in v] if any(t[5] for t in v) else [],
                   tremolos=[t[6] for t in v] if any(t[4] for t in v) else [],
+                  marks=[t[7] for t in v] if any(t[7] for t in v) else [],
+                  graces=[t[8] for t in v] if any(t[8] for t in v) else [],
                   length=long.get(s, (None, 0))[0],
                   tremolo=long.get(s, (None, 0))[1])
-              for s, v in sorted(by_slot.items())],
-        dynamic=reading.dynamic)
+              for s, v in sorted(by_slot.items(),
+                                 key=lambda kv: (kv[0][0], kv[0][1] or ""))],
+        dynamic=reading.dynamic, tuplets=reading.tuplets)
 
 
 class BarGrid(BaseModel):
     is_repeat_of_previous: bool = False
     hits: list[Hit] = []
     dynamic: str | None = None
+    tuplets: list[dict] = []
 
 
 def _signature_only(image, x0: float, x1: float, top: float, bottom: float,
@@ -1084,15 +1143,41 @@ def _strike_slots(gap: int, cap: int = 4) -> int:
     return 1
 
 
-def _add_rest(measure, slots: int, voice: int):
+def _add_rest(measure, slots: int, voice: int, unit: int = 1):
     for name, dots, value in _split(slots):
         rest = ET.SubElement(measure, "note")
         ET.SubElement(rest, "rest")
-        ET.SubElement(rest, "duration").text = str(value)
+        ET.SubElement(rest, "duration").text = str(value * unit)
         ET.SubElement(rest, "voice").text = str(voice)
         ET.SubElement(rest, "type").text = name
         for _ in range(dots):
             ET.SubElement(rest, "dot")
+
+
+# sign read from the page -> MusicXML articulation
+_ARTICULATIONS = {
+    "accent": ("accent", {}),
+    "marcato": ("strong-accent", {"type": "up"}),
+    "marcato_down": ("strong-accent", {"type": "down"}),
+    "tenuto": ("tenuto", {}),
+    "staccato": ("staccato", {}),
+}
+
+
+def _rest_values(start: int | None, length: int, bar: int) -> list[int]:
+    """Rests that fill `length` slots from slot `start`, the way an
+    engraver writes them: each rest starts on a beat of its own size
+    (an eighth rest up to the beat, then a quarter rest, then a half
+    rest), so the beats of the bar stay visible. Bars not in quarters
+    (6/8) keep the plain largest-first split."""
+    if start is None or bar % 4:
+        return [value for _, _, value in _split(length)]
+    out, t, end = [], start, start + length
+    while t < end:
+        value = next(v for v in (16, 8, 4, 2, 1) if t % v == 0 and t + v <= end)
+        out.append(value)
+        t += value
+    return out
 
 
 def grids_from_musicxml(path: Path) -> list[BarGrid]:
@@ -1149,27 +1234,28 @@ def _apply_beams(notes: list, bar_slots_n: int):
     else:
         group = 4
     runs, run = [], []
-    for note, slot, duration in notes:
+    for note, slot, actual, duration, tup in notes:
         if run:
-            _, prev_slot, prev_dur = run[-1]
-            contiguous = slot == prev_slot + prev_dur
+            _, prev_slot, prev_actual, _d, prev_tup = run[-1]
+            contiguous = slot == prev_slot + prev_actual
             same_group = slot // group == run[0][1] // group
-            if not (contiguous and same_group):
+            # a tuplet is beamed on its own, as it is bracketed
+            if not (contiguous and same_group and tup is prev_tup):
                 runs.append(run)
                 run = []
-        run.append((note, slot, duration))
+        run.append((note, slot, actual, duration, tup))
     if run:
         runs.append(run)
     for run in runs:
         if len(run) < 2:
             continue
-        for i, (note, slot, duration) in enumerate(run):
+        for i, (note, slot, _actual, duration, _tup) in enumerate(run):
             state = ("begin" if i == 0
                      else "end" if i == len(run) - 1 else "continue")
             beams = [state]
             if duration == 1:  # sixteenth: second beam level
-                prev_16 = i > 0 and run[i - 1][2] == 1
-                next_16 = i < len(run) - 1 and run[i + 1][2] == 1
+                prev_16 = i > 0 and run[i - 1][3] == 1
+                next_16 = i < len(run) - 1 and run[i + 1][3] == 1
                 if prev_16 and next_16:
                     beams.append("continue")
                 elif next_16:
@@ -1261,8 +1347,16 @@ def write_musicxml(grids: list[BarGrid], out: Path,
     tempos maps a grid index to a metronome marking printed above it.
     printed maps a grid index to the rests the page prints in that bar
     (16th slots, left to right), used when the bar has no strikes."""
-    divisions = slots_per_beat
-    printed = printed or {}  # slot = one division of a quarter
+    # A slot is a 16th. A chart with triplets needs a finer ruler: every
+    # slot is then `unit` divisions, so a triplet eighth (2/3 of an eighth)
+    # is still a whole number. Charts without tuplets are written exactly
+    # as before, one division per slot.
+    unit = 1
+    for g in grids:
+        for t in g.tuplets:
+            unit = unit * t["actual"] // math.gcd(unit, t["actual"])
+    divisions = slots_per_beat * unit
+    printed = printed or {}
     pickups = pickups or set()
     meters = meters or []
     tempos = dict(tempos or {})
@@ -1276,10 +1370,16 @@ def write_musicxml(grids: list[BarGrid], out: Path,
     plist = ET.SubElement(score, "part-list")
     sp = ET.SubElement(plist, "score-part", id="P1")
     ET.SubElement(sp, "part-name").text = "Drum Set"
-    for key, (_, _, _, midi, _) in KIT.items():
+    # Only the kit pieces this chart plays are declared. Two pieces can
+    # share one GM key (crash and choked crash, open hi-hat and hi-hat
+    # splash), and MuseScore keeps one drum per key: an unused twin
+    # declared after the played one took its notehead away.
+    played = {i for g in grids for h in g.hits for i in h.instruments}
+    kit = {k: v for k, v in KIT.items() if k in played} or KIT
+    for key, (_, _, _, midi, _) in kit.items():
         si = ET.SubElement(sp, "score-instrument", id=f"P1-{key}")
         ET.SubElement(si, "instrument-name").text = key
-    for key, (_, _, _, midi, _) in KIT.items():
+    for key, (_, _, _, midi, _) in kit.items():
         mi = ET.SubElement(sp, "midi-instrument", id=f"P1-{key}")
         ET.SubElement(mi, "midi-channel").text = "10"
         ET.SubElement(mi, "midi-unpitched").text = str(midi)
@@ -1340,7 +1440,7 @@ def write_musicxml(grids: list[BarGrid], out: Path,
                     ET.SubElement(style, "multiple-rest").text = str(span)
                 note = ET.SubElement(m, "note")
                 ET.SubElement(note, "rest", measure="yes")
-                ET.SubElement(note, "duration").text = str(slots)
+                ET.SubElement(note, "duration").text = str(slots * unit)
                 ET.SubElement(note, "voice").text = "1"
             continue
         measure = open_measure(gi)
@@ -1352,11 +1452,11 @@ def write_musicxml(grids: list[BarGrid], out: Path,
             shown = printed.get(gi) or []
             if shown and sum(shown) <= slots:
                 for n in shown:
-                    _add_rest(measure, n, 1)
+                    _add_rest(measure, n, 1, unit)
             else:
                 note = ET.SubElement(measure, "note")
                 ET.SubElement(note, "rest", measure="yes")
-                ET.SubElement(note, "duration").text = str(slots)
+                ET.SubElement(note, "duration").text = str(slots * unit)
                 ET.SubElement(note, "voice").text = "1"
             if grid.dynamic:
                 direction = ET.SubElement(measure, "direction",
@@ -1372,17 +1472,28 @@ def write_musicxml(grids: list[BarGrid], out: Path,
             dyn = ET.SubElement(dtype, "dynamics")
             ET.SubElement(dyn, grid.dynamic)
 
-        by_voice: dict[int, dict[int, list]] = {1: {}, 2: {}}
-        long_at: dict[tuple[int, int], tuple[int | None, int]] = {}
+        tuplets = [dict(t, start=Fraction(t["start"]), end=Fraction(t["end"]))
+                   for t in grid.tuplets]
+
+        def tuplet_at(voice: int, onset: Fraction) -> dict | None:
+            for t in tuplets:
+                if t["voice"] == voice and t["start"] <= onset < t["end"]:
+                    return t
+            return None
+
+        by_voice: dict[int, dict[Fraction, list]] = {1: {}, 2: {}}
+        graces: dict[tuple[int, Fraction], list] = {}
+        long_at: dict[tuple[int, Fraction], tuple[int | None, int]] = {}
         for hit in grid.hits:
             if not 0 <= hit.slot < slots:
                 continue
+            onset = Fraction(hit.onset) if hit.onset else Fraction(hit.slot)
             if hit.length or hit.tremolo:
                 # the void head is one note of the chord: the upper
                 # voice's (snare roll over a kick), never the kick
                 for inst in hit.instruments:
                     if inst in KIT and KIT[inst][4] == 1:
-                        long_at[(1, hit.slot)] = (hit.length, hit.tremolo)
+                        long_at[(1, onset)] = (hit.length, hit.tremolo)
             for j, inst in enumerate(hit.instruments):
                 if inst not in KIT:
                     continue
@@ -1393,8 +1504,80 @@ def write_musicxml(grids: list[BarGrid], out: Path,
                 seen_head = hit.heads[j] if j < len(hit.heads) else None
                 value = hit.values[j] if j < len(hit.values) else 0
                 trem = hit.tremolos[j] if j < len(hit.tremolos) else 0
-                by_voice[voice].setdefault(hit.slot, []).append(
-                    (inst, hit.accent, seen_step, seen_head, value, trem))
+                marks = hit.marks[j].split() if j < len(hit.marks) else []
+                entry = (inst, hit.accent, seen_step, seen_head, value, trem, marks)
+                if j < len(hit.graces) and hit.graces[j]:
+                    graces.setdefault((voice, onset), []).append(entry)
+                else:
+                    by_voice[voice].setdefault(onset, []).append(entry)
+        # a grace note leans on a real note: its own voice's, or failing
+        # that the other voice's note at the same instant
+        for (voice, onset), entries in list(graces.items()):
+            if onset not in by_voice[voice]:
+                del graces[(voice, onset)]
+                other = 3 - voice
+                if onset in by_voice[other]:
+                    graces.setdefault((other, onset), []).extend(entries)
+
+        def write_note(entry, voice, kind, dots, duration, chord, grace=False,
+                       tup=None, tremolo=0, lead_accent=False):
+            inst, _accent, seen_step, seen_head, _v, _t, marks = entry
+            step, octave, head, midi, _ = KIT[inst]
+            # engrave where the ORIGINAL put the note, so the output
+            # reads like the source chart (Ronen: the notes must look
+            # like the PDF to compare them)
+            if seen_step is not None:
+                step, octave = _display_from_step(seen_step)
+            if seen_head is not None:
+                head = {"x": "x", "circled_x": "circle-x", "diamond": "diamond",
+                        "triangle": "triangle", "normal": None}.get(seen_head, head)
+            note = ET.SubElement(measure, "note")
+            if grace:
+                ET.SubElement(note, "grace", slash="yes")
+            if chord:
+                ET.SubElement(note, "chord")
+            unp = ET.SubElement(note, "unpitched")
+            ET.SubElement(unp, "display-step").text = step
+            ET.SubElement(unp, "display-octave").text = str(octave)
+            if not grace:
+                ET.SubElement(note, "duration").text = str(duration)
+            ET.SubElement(note, "instrument", id=f"P1-{inst}")
+            ET.SubElement(note, "voice").text = str(voice)
+            ET.SubElement(note, "type").text = kind
+            for _ in range(dots):
+                ET.SubElement(note, "dot")
+            if tup is not None:
+                mod = ET.SubElement(note, "time-modification")
+                ET.SubElement(mod, "actual-notes").text = str(tup["actual"])
+                ET.SubElement(mod, "normal-notes").text = str(tup["normal"])
+            ET.SubElement(note, "stem").text = "up" if voice == 1 else "down"
+            if head:
+                ET.SubElement(note, "notehead").text = head
+            signs = list(marks)
+            if lead_accent and "accent" not in signs:
+                signs.append("accent")
+            if signs or tremolo:
+                notations = ET.SubElement(note, "notations")
+                if tremolo:
+                    orn = ET.SubElement(notations, "ornaments")
+                    ET.SubElement(orn, "tremolo", type="single").text = str(tremolo)
+                # The page's own sign over a hi-hat note: "o" and "+".
+                # MuseScore draws <open-string/> as o and <stopped/> as +.
+                tech = [m for m in signs if m in ("open", "closed")]
+                if tech:
+                    el = ET.SubElement(notations, "technical")
+                    for m in tech:
+                        ET.SubElement(el, "open-string" if m == "open" else "stopped")
+                arts = [m for m in signs if m.split("@")[0] in _ARTICULATIONS]
+                if arts:
+                    el = ET.SubElement(notations, "articulations")
+                    for m in arts:
+                        name, _, where = m.partition("@")
+                        tag, attrs = _ARTICULATIONS[name]
+                        if where in ("above", "below"):
+                            attrs = dict(attrs, placement=where)
+                        ET.SubElement(el, tag, **attrs)
+            return note
 
         # An empty voice is not written: a bar of kick alone was getting
         # a whole rest hung in the hi-hat voice that the page never
@@ -1404,69 +1587,127 @@ def write_musicxml(grids: list[BarGrid], out: Path,
             events = by_voice[voice]
             if vi == 1:
                 backup = ET.SubElement(measure, "backup")
-                ET.SubElement(backup, "duration").text = str(slots)
-            cursor = 0
+                ET.SubElement(backup, "duration").text = str(slots * unit)
             onsets = sorted(events)
-            beamable = []  # (lead note element, slot, duration) this voice
-            for k, slot in enumerate(onsets):
-                if slot > cursor:
-                    _add_rest(measure, slot - cursor, voice)
-                    cursor = slot
-                nxt = onsets[k + 1] if k + 1 < len(onsets) else slots
-                duration = _strike_slots(max(nxt - slot, 1))
-                held = long_at.get((voice, slot))
-                if held and held[0] and slot + held[0] <= nxt:
-                    duration = held[0]
+            # 1. lay the voice out: notes and the rests between them
+            items: list[dict] = []
+
+            def fill(a: Fraction, b: Fraction):
+                t = a
+                while t < b:
+                    tup = tuplet_at(voice, t)
+                    if tup:
+                        ratio = Fraction(tup["normal"], tup["actual"])
+                        end = min(b, tup["end"])
+                        value = next((v for v in (8, 4, 2, 1) if v * ratio <= end - t), None)
+                        if value is None:
+                            items.append({"forward": end - t})
+                            t = end
+                            continue
+                        items.append({"onset": t, "actual": value * ratio,
+                                      "nominal": value, "tup": tup})
+                        t += value * ratio
+                        continue
+                    end = min([b] + [x["start"] for x in tuplets
+                                     if x["voice"] == voice and x["start"] > t])
+                    whole = int(end - t)
+                    if whole < 1:
+                        items.append({"forward": end - t})
+                        t = end
+                        continue
+                    for value in _rest_values(int(t) if t.denominator == 1 else None,
+                                              whole, slots):
+                        items.append({"onset": t, "actual": Fraction(value),
+                                      "nominal": value, "tup": None})
+                        t += value
+                    if t < end:
+                        items.append({"forward": end - t})
+                        t = end
+
+            cursor = Fraction(0)
+            for k, onset in enumerate(onsets):
+                if onset > cursor:
+                    fill(cursor, onset)
+                    cursor = onset
+                nxt = onsets[k + 1] if k + 1 < len(onsets) else Fraction(slots)
+                tup = tuplet_at(voice, onset)
+                ratio = Fraction(tup["normal"], tup["actual"]) if tup else Fraction(1)
+                room = (min(nxt, tup["end"]) if tup else nxt) - onset
+                held = long_at.get((voice, onset))
                 tremolo = held[1] if held else 0
-                page_values = [e[4] for e in events[slot] if e[4]]
-                if page_values:
-                    # the value the page prints; what is left is its rests
-                    value = min(page_values)
-                    if value in _DUR_TYPES and slot + value <= nxt:
-                        duration = value
-                    tremolo = max(e[5] for e in events[slot])
-                name, dots = _DUR_TYPES[duration]
-                for j, (inst, accent, seen_step, seen_head, _v, _t) in \
-                        enumerate(events[slot]):
-                    step, octave, head, midi, _ = KIT[inst]
-                    # engrave where the ORIGINAL put the note, so the
-                    # output reads like the source chart (Ronen: the
-                    # notes must look like the PDF to compare them)
-                    if seen_step is not None:
-                        step, octave = _display_from_step(seen_step)
-                    if seen_head is not None:
-                        head = {"x": "x", "circled_x": "circle-x",
-                                "normal": None}.get(seen_head, head)
-                    note = ET.SubElement(measure, "note")
-                    if j > 0:
-                        ET.SubElement(note, "chord")
-                    unp = ET.SubElement(note, "unpitched")
-                    ET.SubElement(unp, "display-step").text = step
-                    ET.SubElement(unp, "display-octave").text = str(octave)
-                    ET.SubElement(note, "duration").text = str(duration)
-                    ET.SubElement(note, "instrument", id=f"P1-{inst}")
-                    ET.SubElement(note, "voice").text = str(voice)
-                    ET.SubElement(note, "type").text = name
-                    for _ in range(dots):
-                        ET.SubElement(note, "dot")
-                    ET.SubElement(note, "stem").text = \
-                        "up" if voice == 1 else "down"
-                    if head:
-                        ET.SubElement(note, "notehead").text = head
-                    if (accent or tremolo) and j == 0:
-                        notations = ET.SubElement(note, "notations")
-                        if accent:
-                            artic = ET.SubElement(notations, "articulations")
-                            ET.SubElement(artic, "accent")
-                        if tremolo:
-                            orn = ET.SubElement(notations, "ornaments")
-                            ET.SubElement(orn, "tremolo", type="single").text = \
-                                str(tremolo)
-                    if j == 0 and duration < 4:
-                        beamable.append((note, slot, duration))
-                cursor = slot + duration
+                page_values = [e[4] for e in events[onset] if e[4]]
+                if tup or onset.denominator != 1:
+                    want = min(page_values) if page_values else 4
+                    nominal = next((v for v in (8, 4, 2, 1)
+                                    if v <= want and v * ratio <= room), None)
+                    if nominal is None:
+                        continue        # no room for even a 16th: unreadable
+                    if page_values:
+                        tremolo = max(e[5] for e in events[onset])
+                else:
+                    nominal = _strike_slots(max(int(room), 1))
+                    if held and held[0] and onset + held[0] <= nxt:
+                        nominal = held[0]
+                    if page_values:
+                        # the value the page prints; what is left is its rests
+                        value = min(page_values)
+                        if value in _DUR_TYPES and onset + value <= nxt:
+                            nominal = value
+                        tremolo = max(e[5] for e in events[onset])
+                items.append({"onset": onset, "actual": nominal * ratio, "nominal": nominal,
+                              "tup": tup, "notes": events[onset], "tremolo": tremolo,
+                              "graces": graces.get((voice, onset), [])})
+                cursor = onset + nominal * ratio
             if cursor < slots:
-                _add_rest(measure, slots - cursor, voice)
+                fill(cursor, Fraction(slots))
+            # 2. write it
+            timed = [it for it in items if "forward" not in it]
+            beamable = []  # (lead note element, onset, actual, nominal, tuplet)
+            for it in items:
+                if "forward" in it:
+                    forward = ET.SubElement(measure, "forward")
+                    ET.SubElement(forward, "duration").text = str(int(it["forward"] * unit))
+                    continue
+                tup = it["tup"]
+                name, dots = _DUR_TYPES[it["nominal"]]
+                duration = int(it["actual"] * unit)
+                edge = None
+                if tup is not None:
+                    inside = [x for x in timed if x["tup"] is tup]
+                    edge = "start" if it is inside[0] else "stop" if it is inside[-1] else None
+                    if len(inside) == 1:
+                        edge = None
+                if "notes" not in it:
+                    rest = ET.SubElement(measure, "note")
+                    ET.SubElement(rest, "rest")
+                    ET.SubElement(rest, "duration").text = str(duration)
+                    ET.SubElement(rest, "voice").text = str(voice)
+                    ET.SubElement(rest, "type").text = name
+                    for _ in range(dots):
+                        ET.SubElement(rest, "dot")
+                    lead = rest
+                    if tup is not None:
+                        mod = ET.SubElement(rest, "time-modification")
+                        ET.SubElement(mod, "actual-notes").text = str(tup["actual"])
+                        ET.SubElement(mod, "normal-notes").text = str(tup["normal"])
+                else:
+                    for j, entry in enumerate(it["graces"]):
+                        write_note(entry, voice, "eighth", 0, 0, j > 0, grace=True)
+                    lead = None
+                    for j, entry in enumerate(it["notes"]):
+                        note = write_note(entry, voice, name, dots, duration, j > 0,
+                                          tup=tup, tremolo=it["tremolo"] if j == 0 else 0,
+                                          lead_accent=entry[1] and j == 0)
+                        lead = lead if lead is not None else note
+                    if it["nominal"] < 4:
+                        beamable.append((lead, it["onset"], it["actual"], it["nominal"], tup))
+                if edge:
+                    notations = lead.find("notations")
+                    if notations is None:
+                        notations = ET.SubElement(lead, "notations")
+                    ET.SubElement(notations, "tuplet", type=edge, number="1",
+                                  **({"bracket": "yes"} if edge == "start"
+                                     and tup.get("bracket") else {}))
             _apply_beams(beamable, slots)
     ET.ElementTree(score).write(out, encoding="UTF-8", xml_declaration=True)
 
@@ -1656,7 +1897,7 @@ def place_words(omr_path: Path, out: Path, crops: list[dict],
     measure_of: dict[int, int] = {}
     measure = 0 if crops and crops[0].get("pickup") else 1
     for i, crop in enumerate(crops):
-        measure_of[crop["stack"]] = measure
+        measure_of.setdefault(crop["stack"], measure)
         measure += rest_bars.get(i, 1)
 
     found: list[tuple[int, str]] = []  # (stack ordinal, text)
@@ -1760,7 +2001,7 @@ def place_fermatas(omr_path: Path, out: Path, crops: list[dict],
     measure_of: dict[int, int] = {}
     measure = 0 if crops and crops[0].get("pickup") else 1
     for i, crop in enumerate(crops):
-        measure_of[crop["stack"]] = measure
+        measure_of.setdefault(crop["stack"], measure)
         measure += rest_bars.get(i, 1)
     tree = ET.parse(out)
     part = tree.getroot().find("part")
@@ -1818,7 +2059,33 @@ def apply_structure(work_dir: Path, out: Path, omr: Path,
             print(f"  tempo recovered: {bpm} BPM", flush=True)
 
     engine = work_dir / "audiveris.musicxml"
-    if engine.exists():
+    if ink_marks is not None:
+        # The ink path: repeats, voltas, Segno, Coda and the jump texts
+        # are read off the page and placed by their pixel position, so
+        # they land on the right bars whatever the engine's measure list
+        # looks like (multirests expanded, slivers dropped, a pickup).
+        from drum_ink import sliver_bars
+        from structure_marks import numbers_for_bars, place as place_road_map
+        # The measures written are the bars main() kept: no half of a
+        # split multirest, no sliver. The marks count by the same list.
+        rests = {h["stack"] for h in hbars
+                 if h.get("read") and 2 <= h["count"] <= 150}
+        dropped = {h["stack"] + k for h in hbars
+                   for k in range(1, h.get("span", 1))} \
+            | (sliver_bars(omr) - rests)
+        written = len(ET.parse(out).getroot().find("part").findall("measure"))
+        numbers = numbers_for_bars(
+            omr, hbars, [c["stack"] for c in bar_crops(omr)
+                         if c["stack"] not in dropped], written)
+        if numbers is None:
+            print("  road map: the bars written do not add up to the page's "
+                  "stacks; marks placed by the multirest count alone",
+                  flush=True)
+        marks = place_road_map(omr, out, hbars, numbers=numbers)
+        if marks:
+            print(f"  {marks} road-map marks placed (repeats, endings, "
+                  f"signs, jumps)", flush=True)
+    elif engine.exists():
         # Repeats and voltas: the engine reads barlines fine even on drum
         # staves, and its measures follow the same printed bars we do.
         tree = ET.parse(out)
@@ -1886,11 +2153,22 @@ def main():
     absorbed = {h["stack"] + k for h in hbars
                 for k in range(1, h.get("span", 1))}
     crops = [c for c in crops if c["stack"] not in absorbed]
+    inner: dict[int, list[int]] = {}
     if "--ink" in sys.argv:
         from drum_ink import boxed_marks, boxed_numbers, sliver_bars
         ink_marks = boxed_marks(omr)
         slivers = sliver_bars(omr) - set(rest_counts)
         crops = [c for c in crops if c["stack"] not in slivers]
+        # A stack that holds two printed bars is two measures. Which of
+        # them a multirest in that stack is, fix_hbars has counted.
+        from drum_ink import merged_bars
+        inner = merged_bars(omr)
+        rest_part = {h["stack"]: h.get("bar_offset", 0) for h in hbars}
+        crops = [dict(c, part=k, rest_part=rest_part.get(c["stack"], 0))
+                 for c in crops for k in range(len(inner.get(c["stack"], [])) + 1)]
+        if inner:
+            print(f"  {len(inner)} stacks hold more than one printed bar: "
+                  f"{sorted(inner)}", flush=True)
         from drum_ink import spans_from_numbers, system_numbers
         before = dict(rest_counts)
         rest_counts = spans_from_numbers(
@@ -1905,7 +2183,12 @@ def main():
         for h in hbars:
             if h["stack"] in rest_counts:
                 h["count"], h["read"] = rest_counts[h["stack"]], True
-    total_measures = sum(rest_counts.get(c["stack"], 1) for c in crops)
+    def measures_in(crop: dict) -> int:
+        if crop.get("part", 0) != crop.get("rest_part", 0):
+            return 1
+        return rest_counts.get(crop["stack"], 1)
+
+    total_measures = sum(measures_in(c) for c in crops)
     print(f"{len(crops)} printed bars = {total_measures} measures "
           f"({len(rest_counts)} multirests)", flush=True)
     if limit:
@@ -1980,7 +2263,7 @@ def main():
                   flush=True)
     if "--ink" in sys.argv:
         rest_bars = {i: rest_counts[c["stack"]] for i, c in enumerate(crops)
-                     if c["stack"] in rest_counts}
+                     if c["stack"] in rest_counts and measures_in(c) > 1}
     elif raw and len(raw) == len(grids):
         rest_bars = {i: n for i, n in spans_from_readings(raw).items()
                      if n > 1}
@@ -2011,7 +2294,7 @@ def main():
                   f"{sorted(set(tempos.values()))}", flush=True)
     by_stack = printed_rests(omr)
     printed = {gi: by_stack[c["stack"]] for gi, c in enumerate(crops)
-               if c["stack"] in by_stack}
+               if c["stack"] in by_stack and c["stack"] not in inner}
     pickups = {gi for gi, c in enumerate(crops) if c.get("pickup")}
     write_musicxml(grids, out, title=out.stem, rest_bars=rest_bars,
                    meters=meters, tempos=tempos, printed=printed,

@@ -46,9 +46,12 @@ curl -L -o tools/tessdata/eng.traineddata \
 
 ## Notes
 
-- Post-processing mirrors production (`app/main.py`): filename → title/part
-  name, then `app/transpose.py` Newzik-convention transpose. The server's
-  `_fix_rhythm` step is NOT applied yet.
+- `convert.py` and production (`app/main.py`) run the same pipeline from the
+  same module, `app/pipeline.py`: engine choice, fusion, structure repair,
+  title, transpose. `../tests/test_pipeline.py` checks that the two give the
+  same file on every cached piece (about half a minute, offline), and
+  `../tests/replay.py --check` does it with the page-reading steps too
+  (several minutes). Neither pads a short bar with a rest any more.
 - `pitch_sim` is the headline metric (written-pitch line only, rests and
   durations dropped) — same convention as `benchmark/score.py`. Durations
   can't be compared tuple-wise across engines because `divisions` differ.

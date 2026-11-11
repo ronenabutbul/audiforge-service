@@ -24,26 +24,28 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
-import zipfile
 from difflib import SequenceMatcher
 from pathlib import Path
 
 BENCH_DIR = Path(__file__).resolve().parent
 REPO_DIR = BENCH_DIR.parent
 sys.path.insert(0, str(REPO_DIR / "benchmark"))
-sys.path.insert(0, str(REPO_DIR / "app"))
+# The repo root, so `app` imports as the package the service runs: one
+# copy of each module, the same one in both places.
+sys.path.insert(0, str(REPO_DIR))
 
 import score as scorer  # benchmark/score.py
-from transpose import apply_transpose  # app/transpose.py
-from postprocess import (  # app/postprocess.py — shared with production
+from app import audiveris_local, pipeline  # shared with production
+from app.pipeline import apply_metadata  # noqa: F401 - re-exported
+from app.postprocess import (  # app/postprocess.py - shared with production
     graft_features,
     graft_time_symbol,
     clean_words,
     beam_by_beat,
     drop_phantom_clef_changes,
     measure_signature,
-    normalize_homr,
 )
+from app.transpose import apply_transpose  # app/transpose.py
 
 RENDER_DPI = 300  # same as the production service
 PAGE_TIMEOUT_SECONDS = 900
@@ -96,44 +98,25 @@ def run_homr(pdf: Path, work_dir: Path, homr_bin: Path = None) -> Path:
 
 
 def run_audiveris(pdf: Path, work_dir: Path) -> Path:
-    import os
+    """Audiveris through the same runner as the service
+    (app/audiveris_local.py), with the Mac app and the bench's tessdata:
+    every movement joined, a page-by-page fallback when one unreadable
+    sheet makes it refuse the whole book, and a loud failure when OCR was
+    silently skipped.
 
-    # The bundled app has no tessdata; without it OCR is SILENTLY skipped and
-    # all text output (words, tempo, rehearsal marks) vanishes. Audiveris
-    # runs Tesseract in legacy mode, so brew's LSTM-only traineddata won't
-    # do — tools/tessdata holds the full file from tesseract-ocr/tessdata.
-    env = {**os.environ,
-           "TESSDATA_PREFIX": str(BENCH_DIR / "tools" / "tessdata")}
-    # NOTE: do NOT add heb to the language spec — Audiveris 5.11's
-    # WordScanner throws IndexOutOfBounds on RTL text and the whole TEXTS
-    # step dies for the page, losing the English words too.
-    result = subprocess.run(
-        [str(AUDIVERIS_BIN), "-batch", "-export", "-output", str(work_dir), str(pdf)],
-        capture_output=True, text=True, timeout=PAGE_TIMEOUT_SECONDS * 2,
-        env=env,
-    )
-    for log in work_dir.rglob("*.log"):
-        text = log.read_text(errors="replace")
-        if ("Missing support for 'eng'" in text
-                or "Could not initialize TessBaseAPI" in text):
-            raise RuntimeError(
-                "Audiveris ran without OCR (tessdata missing or unusable) — "
-                "refusing the silently text-less result"
-            )
-    mxl_files = sorted(work_dir.rglob("*.mxl"))
-    if not mxl_files:
-        # One unreadable sheet makes Audiveris refuse to export the whole
-        # book ("No system found"). Salvage: transcribe page by page and
-        # merge the pages that work.
-        return _run_audiveris_paged(pdf, work_dir, env)
-    # A multi-movement book may export several .mxl; take the largest.
-    mxl = max(mxl_files, key=lambda p: p.stat().st_size)
-    out = work_dir / "audiveris.musicxml"
-    with zipfile.ZipFile(mxl) as z:
-        inner = [n for n in z.namelist()
-                 if n.endswith((".xml", ".musicxml")) and not n.startswith("META-INF")]
-        out.write_bytes(z.read(inner[0]))
-    return out
+    The bundled app has no tessdata; without it all text output (words,
+    tempo, rehearsal marks) vanishes. Audiveris runs Tesseract in legacy
+    mode, so brew's LSTM-only traineddata won't do: tools/tessdata holds
+    the full file from tesseract-ocr/tessdata."""
+    outcome = audiveris_local.convert(
+        pdf, work_dir / "audiveris.musicxml", work=work_dir,
+        pages=sorted(work_dir.glob("page_???.png")) or None,
+        binary=str(AUDIVERIS_BIN), tessdata=str(BENCH_DIR / "tools" / "tessdata"))
+    for page in outcome.pages_skipped:
+        print(f"  audiveris: page {page} unreadable, skipped", flush=True)
+    if outcome.path is None:
+        raise RuntimeError(f"Audiveris: {outcome.failure}")
+    return outcome.path
 
 
 def run_fusion(pdf: Path, work_dir: Path) -> Path:
@@ -149,79 +132,20 @@ def run_fusion(pdf: Path, work_dir: Path) -> Path:
             raise RuntimeError(f"fusion needs cached result: {p.name} missing")
 
     out = work_dir / "fusion.musicxml"
-    # Mirror production routing: homr is the base only when its rhythm
-    # validity holds up (it collapses on grand staff); otherwise the result
-    # is Audiveris as-is. Lyrics tip the scale: homr never reads them, so a
-    # vocal part goes to Audiveris unless its notes are clearly worse.
-    def validity(path):
-        valid, total = scorer.rhythm_validity(ET.parse(path).getroot())
-        return valid / max(total, 1)
-
-    def measure_count(path):
-        return len(ET.parse(path).getroot().find("part").findall("measure"))
-
-    def lyric_count(path):
-        return sum(1 for _ in ET.parse(path).getroot().iter("lyric"))
-
-    aud_is_vocal = lyric_count(aud_path) >= 10 > lyric_count(homr_path)
-    # Validity alone rewards an engine that silently truncated the piece —
-    # the surviving fraction can be internally consistent while most of the
-    # music is gone. Weight by completeness.
-    most = max(measure_count(homr_path), measure_count(aud_path), 1)
-    h_val = validity(homr_path) * measure_count(homr_path) / most
-    a_val = validity(aud_path) * measure_count(aud_path) / most
-    if aud_is_vocal and a_val >= h_val - 0.05:
-        shutil.copy(aud_path, out)
-        print("  fusion: audiveris base (vocal part with lyrics)", flush=True)
-        return out
-    if h_val >= a_val:
-        shutil.copy(homr_path, out)
+    # The same routing as production and convert.py (app/pipeline.py).
+    choice = pipeline.select_engine(homr_path, aud_path)
+    shutil.copy(choice.path, out)
+    if choice.base == "homr":
         aligned, grafted = graft_features(out, aud_path)
         clean_words(out)
         drop_phantom_clef_changes(out)
         beam_by_beat(out)
         stamped = graft_time_symbol(out, aud_path)
-        print(f"  fusion: homr base, {aligned} measures aligned, "
+        print(f"  fusion: {choice.reason}, {aligned} measures aligned, "
               f"{grafted} grafted, {stamped} time symbols", flush=True)
     else:
-        shutil.copy(aud_path, out)
-        print("  fusion: audiveris base (homr rhythm validity lost)",
-              flush=True)
+        print(f"  fusion: {choice.reason}", flush=True)
     return out
-
-
-def _run_audiveris_paged(pdf: Path, work_dir: Path, env: dict) -> Path:
-    from pdf2image import convert_from_path
-
-    paged_dir = work_dir / "paged"
-    paged_dir.mkdir(exist_ok=True)
-    page_outputs = []
-    for i, image in enumerate(convert_from_path(str(pdf), dpi=RENDER_DPI),
-                              start=1):
-        page = paged_dir / f"page_{i:03d}.png"
-        image.save(page, "PNG")
-        subprocess.run(
-            [str(AUDIVERIS_BIN), "-batch", "-export", "-output",
-             str(paged_dir), str(page)],
-            capture_output=True, text=True, timeout=PAGE_TIMEOUT_SECONDS,
-            env=env,
-        )
-        mxls = sorted(paged_dir.rglob(f"page_{i:03d}*.mxl"))
-        if not mxls:
-            print(f"  audiveris: page {i} unreadable, skipped", flush=True)
-            if i >= 3 and not page_outputs:
-                raise RuntimeError(
-                    "first pages have no readable music — not a score?")
-            continue
-        out = paged_dir / f"page_{i:03d}.musicxml"
-        with zipfile.ZipFile(mxls[0]) as z:
-            inner = [n for n in z.namelist() if n.endswith((".xml", ".musicxml"))
-                     and not n.startswith("META-INF")]
-            out.write_bytes(z.read(inner[0]))
-        page_outputs.append(out)
-    if not page_outputs:
-        raise RuntimeError("Audiveris failed on every page")
-    return merge_musicxml(page_outputs, work_dir / "audiveris.musicxml")
 
 
 ENGINES = {
@@ -253,34 +177,6 @@ def merge_musicxml(outputs: list[Path], result_path: Path) -> Path:
             measure.set("number", str(number))
     base_tree.write(result_path, encoding="UTF-8", xml_declaration=True)
     return result_path
-
-
-def apply_metadata(result_path: Path, piece_title: str):
-    title, part_name = piece_title, None
-    if " - " in piece_title:
-        title, part_name = (s.strip() for s in piece_title.rsplit(" - ", 1))
-    tree = ET.parse(result_path)
-    root = tree.getroot()
-    if root.tag != "score-partwise":
-        return
-    for tag in ("work/work-title", "movement-title"):
-        el = root.find(tag)
-        if el is None:
-            parent, leaf = root, tag
-            if "/" in tag:
-                parent_tag, leaf = tag.split("/")
-                parent = root.find(parent_tag)
-                if parent is None:
-                    parent = ET.Element(parent_tag)
-                    root.insert(0, parent)
-            el = ET.SubElement(parent, leaf)
-        el.text = title
-    # Only a single-part file takes its part name from the filename; a
-    # multi-part score keeps the names the engine read.
-    if part_name and len(root.findall("part")) == 1:
-        for name_el in root.findall("part-list/score-part/part-name"):
-            name_el.text = part_name
-    tree.write(result_path, encoding="UTF-8", xml_declaration=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -514,12 +410,13 @@ def main():
                     apply_metadata(cached, piece)
                     apply_transpose(cached, piece.rsplit(" - ", 1)[-1])
                     if engine.startswith("homr"):
-                        fixes = normalize_homr(cached)
-                        if any(fixes):
-                            print(f"  normalized: {fixes[0]} ties, "
-                                  f"{fixes[1]} chord orders, "
-                                  f"{fixes[2]} multirest measures",
-                                  flush=True)
+                        fixes = pipeline.prepare_homr(cached)
+                    elif engine == "audiveris":
+                        fixes = pipeline.prepare_audiveris(cached, work_dir)
+                    else:
+                        fixes = {}
+                    if any(fixes.values()):
+                        print(f"  prepared: {fixes}", flush=True)
                     status = f"{elapsed:.0f}s"
                 except Exception as exc:  # keep the bake-off going
                     elapsed = time.monotonic() - start
