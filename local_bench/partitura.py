@@ -640,6 +640,21 @@ def _whole_heads(ink: np.ndarray, system: System, taken: list[tuple[float, float
     out = []
     il = system.il
     u8 = ink.astype(np.uint8)
+    # the loop of a clef and a common-time "C" are holes with walls too
+    stops = [float(h.get("stop")) for h in system.element.iter("header") if h.get("stop")]
+    header = max(stops) if stops else 0.0
+    signs = []
+    inters_el = system.element.find("sig/inters")
+    for el in inters_el if inters_el is not None else []:
+        if el.tag in ("clef", "key") or el.tag.startswith("time-"):
+            b = el.find("bounds")
+            if b is not None:
+                x, y, w, h = (float(b.get(k)) for k in ("x", "y", "w", "h"))
+                signs.append((x - 0.3 * il, y - 0.3 * il, x + w + 0.3 * il, y + h + 0.3 * il))
+
+    def on_sign(cx, cy):
+        return cx - system.shift(cy) < header + 0.3 * il or any(
+            a <= cx <= c and b <= cy <= d for a, b, c, d in signs)
     for st in system.staves:
         if st.count != 5 or st.clef == "PERC":
             continue
@@ -684,6 +699,8 @@ def _whole_heads(ink: np.ndarray, system: System, taken: list[tuple[float, float
             if bot_ - top_ > 0.95 * il:
                 continue
             cx, cy = xa + cx_, ya + cy_
+            if on_sign(cx, cy):
+                continue
             if any(abs(cx - tx) < 0.9 * il and abs(cy - ty) < 0.45 * il for tx, ty in taken):
                 continue
             if _thin_upright(band, int(cx_ - 1.15 * il), int(cx_ + 1.15 * il),
