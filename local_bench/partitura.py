@@ -290,6 +290,20 @@ def _barlines(ink: np.ndarray, staves: list[Staff]) -> list[dict]:
     return merged
 
 
+def _gaps_joined(ink: np.ndarray, staves: list[Staff], b: dict) -> int:
+    """How many gaps between neighbouring five-line staves the upright
+    stroke `b` crosses (a barline does within a bracket; a stem or a
+    time signature never does)."""
+    five = [s for s in staves if s.count == 5]
+    n = 0
+    ya = five[0].top(min(max(b["x"], five[0].left), five[0].right))
+    for a, c in zip(five, five[1:]):
+        xa = min(max(b["x"], a.left), a.right)
+        x = b["x"] + b.get("lean", 0.0) * (a.bottom(xa) - ya)
+        n += _column_run(ink, x, a.bottom(xa), c.top(xa), 3) > 0.9
+    return n
+
+
 def _repeat_dots(ink: np.ndarray, staff: Staff, x: float, side: int) -> bool:
     """Two dots in the middle spaces beside a barline, on `side` of it."""
     il = staff.il
@@ -424,6 +438,12 @@ def _bars_of(ink: np.ndarray, system: System) -> None:
     stops = [float(h.get("stop")) for h in system.element.iter("header") if h.get("stop")]
     if edges and stops and edges[0]["x0"] < max(stops) + 3.0 * il and len(edges[0]["kind"].split("-")) > 1:
         prev = edges.pop(0)
+    elif edges and stops and edges[0]["x0"] < max(stops) + 3.0 * il and opening is not None \
+            and _gaps_joined(ink, system.staves, opening) and not _gaps_joined(ink, system.staves, edges[0]):
+        # just past the clefs and key: an upright that fills every staff but,
+        # unlike the system's opening barline, joins none of the gaps between
+        # them is a time signature's stroke (a hand-drawn 4), not a barline
+        edges.pop(0)
     for b in edges:
         bars.append({"x0": prev["x1"], "x1": b["x0"], "left": prev, "right": b})
         prev = b
