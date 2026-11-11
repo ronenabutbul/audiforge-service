@@ -803,7 +803,25 @@ class Sheet:
             if value.strip(".").lower() in ("z", "2") and abs(wx - x) < 1.6 * il \
                     and 0.8 * il < y - wy < 6 * il:
                 return 3
-        return 0
+        # Audiveris may not have read the letter at all: one glyph about an
+        # interline tall standing alone over the head, read as a letter
+        box = self.marksink[max(int(y - 6 * il), 0):int(y - 1.2 * il),
+                            max(int(x - 1.6 * il), 0):int(x + 1.6 * il)].astype(np.uint8)
+        if not box.size:
+            return 0
+        n, lab, st, _c = cv2.connectedComponentsWithStats(box)
+        glyphs = [i for i in range(1, n) if 0.6 * il <= st[i][3] <= 1.6 * il
+                  and 0.4 * il <= st[i][2] <= 1.4 * il]
+        if len(glyphs) != 1:
+            return 0
+        from chord_chart import ocr
+        from PIL import Image
+        bx, by, bw, bh, _a = st[glyphs[0]]
+        g = (lab[by:by + bh, bx:bx + bw] == glyphs[0]).astype(np.uint8)
+        g = np.pad(g, max(int(0.5 * il), 4))
+        img = Image.fromarray(((1 - g) * 255).astype(np.uint8))
+        img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
+        return 3 if ocr(img, True, "Zz").strip().lower() == "z" else 0
 
     def home_bar(self, x: float, y: float) -> int | None:
         """Index of the printed bar a mark at (x, y) belongs to: the one it
