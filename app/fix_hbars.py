@@ -1773,7 +1773,8 @@ def _place_marks(omr_path: Path, result_path: Path, hbars: list[dict],
 
 
 def place_rehearsals(omr_path: Path, result_path: Path, hbars: list[dict],
-                     extra_marks: list[tuple[int, int, int, str]] = ()) -> int:
+                     extra_marks: list[tuple[int, int, int, str]] = (),
+                     use_omr: bool = True) -> int:
     """Authoritative rehearsal-mark placement: each mark's pixel position
     falls in a printed bar, and the verified multirest numbering turns
     that into a printed measure number. Replaces any previously grafted
@@ -1782,7 +1783,8 @@ def place_rehearsals(omr_path: Path, result_path: Path, hbars: list[dict],
     Marks come from Audiveris's own recognition plus `extra_marks` in the
     same (sheet, x, y, value) shape - the circled letters it never reads.
     Letters and boxed bar numbers are placed; anything else is dropped."""
-    marks = [m for m in list(_omr_rehearsal_marks(omr_path)) + list(extra_marks)
+    own = list(_omr_rehearsal_marks(omr_path)) if use_omr else []
+    marks = [m for m in own + list(extra_marks)
              if _REHEARSAL_VALUE.match(m[3]) or _REHEARSAL_NUMBER.match(m[3])]
     # A boxed number the OCR mangled ("9:6", "14-4") is neither a letter
     # nor a number and stands for nothing; it goes whatever else is placed.

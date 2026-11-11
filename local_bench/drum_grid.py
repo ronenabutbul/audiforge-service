@@ -1778,7 +1778,7 @@ def place_fermatas(omr_path: Path, out: Path, crops: list[dict],
 
 
 def apply_structure(work_dir: Path, out: Path, omr: Path,
-                    hbars: list[dict]) -> None:
+                    hbars: list[dict], ink_marks: list | None = None) -> None:
     """Give the drum score the same structure the melodic pipeline builds:
     printed tempo, repeat barlines and voltas, and rehearsal letters placed
     by their pixel position."""
@@ -1809,7 +1809,11 @@ def apply_structure(work_dir: Path, out: Path, omr: Path,
             tree.write(out, encoding="UTF-8", xml_declaration=True)
             print(f"  {grafted} repeat/ending barlines grafted", flush=True)
 
-    placed = place_rehearsals(omr, out, hbars)
+    if ink_marks is not None:
+        placed = place_rehearsals(omr, out, hbars, extra_marks=ink_marks,
+                                  use_omr=False)
+    else:
+        placed = place_rehearsals(omr, out, hbars)
     # Drum charts engrave hairpins above the staff, under the dynamics
     # line; a part below. Both bands are tried, duplicates are skipped.
     wedges = place_hairpins(omr, out, hbars, band="above") \
@@ -1859,19 +1863,24 @@ def main():
                 for k in range(1, h.get("span", 1))}
     crops = [c for c in crops if c["stack"] not in absorbed]
     if "--ink" in sys.argv:
-        from drum_ink import sliver_bars
+        from drum_ink import boxed_marks, boxed_numbers, sliver_bars
+        ink_marks = boxed_marks(omr)
         slivers = sliver_bars(omr) - set(rest_counts)
         crops = [c for c in crops if c["stack"] not in slivers]
         from drum_ink import spans_from_numbers, system_numbers
         before = dict(rest_counts)
         rest_counts = spans_from_numbers(
-            system_numbers(omr), crops, rest_counts,
+            {**system_numbers(omr), **boxed_numbers(omr, ink_marks)}, crops, rest_counts,
             {h["stack"] for h in hbars}, bool(crops and crops[0].get("pickup")))
         changed = {k: (before.get(k), v) for k, v in rest_counts.items()
                    if before.get(k) != v}
         if changed:
             print(f"  multirests corrected by the printed numbers: {changed}",
                   flush=True)
+        # the marks placed later count measures off these same lengths
+        for h in hbars:
+            if h["stack"] in rest_counts:
+                h["count"], h["read"] = rest_counts[h["stack"]], True
     total_measures = sum(rest_counts.get(c["stack"], 1) for c in crops)
     print(f"{len(crops)} printed bars = {total_measures} measures "
           f"({len(rest_counts)} multirests)", flush=True)
@@ -1983,7 +1992,8 @@ def main():
     write_musicxml(grids, out, title=out.stem, rest_bars=rest_bars,
                    meters=meters, tempos=tempos, printed=printed,
                    pickups=pickups)
-    apply_structure(work_dir, out, omr, hbars)
+    apply_structure(work_dir, out, omr, hbars,
+                    ink_marks if "--ink" in sys.argv else None)
     words = place_words(omr, out, crops, rest_bars)
     fermatas = place_fermatas(omr, out, crops, rest_bars)
     if fermatas:

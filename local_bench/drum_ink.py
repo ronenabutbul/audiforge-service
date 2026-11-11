@@ -127,6 +127,13 @@ class Sheet:
             x, y = int(float(b.get("x"))), int(float(b.get("y")))
             self.marksink[max(y, 0):y + int(float(b.get("h"))) + 1,
                           max(x, 0):x + int(float(b.get("w"))) + 1] = False
+        # a dynamic under the staff is not a flag on a down-stem
+        for el in root.iter("dynamics"):
+            b = el.find("bounds")
+            if b is not None:
+                x, y = int(float(b.get("x"))), int(float(b.get("y")))
+                self.marksink[max(y, 0):y + int(float(b.get("h"))) + 1,
+                              max(x, 0):x + int(float(b.get("w"))) + 1] = False
         self.timesigs = []
         for el in root.iter():
             if el.tag.startswith("time-"):
@@ -315,8 +322,13 @@ class Sheet:
             col = int(round(x + dx))
             if not 0 <= col < self.ink.shape[1]:
                 return []
+            # a run cut off by the far edge of the window lies beyond the
+            # stem's tip: an open/closed mark over the beam, not a beam
             return [((a + b) / 2 + y0) for a, b in _runs(self.marksink[y0:y1, col])
-                    if 0.16 * il <= b - a <= 1.0 * il]
+                    if 0.16 * il <= b - a <= 1.35 * il
+                    and not (toward > 0 and a == 0) and not (toward < 0 and b == y1 - y0)
+                    # a beam lies at the tip or inside it, never beyond
+                    and toward * ((a + b) / 2 + y0 - tip) >= -0.12 * il]
 
         def ink_near(dx, y):
             col = int(round(x + dx))
@@ -331,7 +343,7 @@ class Sheet:
             for y in side:
                 if ink_near(sign * 1.25 * il, y) and ink_near(sign * 1.65 * il, y):
                     beams += 1          # goes on: a beam (or a long flag)
-                elif any(abs(y - oy) < 0.75 * il for oy in other) \
+                elif any(abs(y - oy) < 1.1 * il for oy in other) \
                         and not ink_near(-sign * 1.65 * il, y):
                     slashes += 1
                 else:
@@ -340,7 +352,8 @@ class Sheet:
                 best = (beams, slashes)
         return best
 
-    def stem_blobs(self, sx: float, y0: float, y1: float, side: int) -> list[tuple[float, float, str]]:
+    def stem_blobs(self, sx: float, y0: float, y1: float, side: int,
+                   narrow: bool = False) -> list[tuple[float, float, str]]:
         """Heads the shape detectors missed, found the way a reader finds
         them: something about one interline tall sitting against the
         stem. side -1 = left of the stem (up-stem), +1 = right."""
@@ -351,7 +364,7 @@ class Sheet:
             return []
         idx = np.arange(band.shape[1])
         span = np.array([(idx[r][-1] - idx[r][0] + 1) if r.any() else 0 for r in band])
-        rows = span >= 0.5 * il
+        rows = span >= (0.3 if narrow else 0.5) * il
         out = []
         for a, b in _runs(rows):
             # bridge the paper inside a ring or between the arms of a cross
@@ -374,9 +387,47 @@ class Sheet:
                 continue
             fill = float(blob[:, cols[0]:cols[-1] + 1].mean())
             kind = "normal" if fill >= 0.62 else ("circled_x" if h >= 1.25 * il else "x")
+            if narrow and kind != "x":
+                continue
+            if kind == "x":
+                # a hollow diamond (a cymbal roll): paper closed in by ink,
+                # where a cross has none
+                g = blob[:, cols[0]:cols[-1] + 1].astype(np.uint8)
+                g = cv2.dilate(g, np.ones((3, 3), np.uint8))
+                paper = np.pad(1 - g, 1, constant_values=1)
+                cv2.floodFill(paper, None, (0, 0), 0)
+                if paper.sum() >= 0.1 * g.size:
+                    kind = "void"
+                elif narrow:
+                    continue
             found.append((max(int(xa), 0) + (cols[0] + cols[-1]) / 2,
                           max(int(y0), 0) + (a + b) / 2, kind))
         return found
+
+    def frame_sides(self) -> set[int]:
+        """Stems that are the two uprights of a box (a boxed letter or bar
+        number): joined to each other by a thin line at both ends."""
+        if getattr(self, "_frames", None) is not None:
+            return self._frames
+        il, out = self.il, set()
+
+        def joined(xa, xb, y):
+            band = self.nolines[max(int(y - 0.3 * il), 0):int(y + 0.3 * il) + 1, int(xa):int(xb) + 1]
+            if not band.size:
+                return False
+            rows = band.all(axis=1)
+            # one thin line all the way across; a beam is thicker
+            return bool(rows.any()) and band[:, band.shape[1] // 2].sum() <= 0.3 * il
+        for i, (xa, a0, a1) in enumerate(self.stems):
+            for j, (xb, b0, b1) in enumerate(self.stems):
+                if not 1.2 * il < xb - xa < 7 * il:
+                    continue
+                if abs(a0 - b0) > 0.3 * il or abs(a1 - b1) > 0.3 * il:
+                    continue
+                if joined(xa, xb, a0) and joined(xa, xb, a1):
+                    out.update((i, j))
+        self._frames = out
+        return out
 
     def in_time(self, x: float, y: float) -> bool:
         return any(tx - 2 <= x <= tx + tw + 2 and ty - 2 <= y <= ty + th + 2
@@ -426,8 +477,9 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
         + [(x, y, "void") for x, y in sheet.voids if inside(x, y)] \
         + [(x, y, "circled_x") for x, y in sheet.rings if inside(x, y)
            and not any(abs(x - vx) < il and abs(y - vy) < il for vx, vy in sheet.voids)]
-    stems = [s for s in sheet.stems
-             if x0 + 0.3 * il < s[0] < x1 - 0.3 * il and s[2] > ylo and s[1] < yhi
+    frames = sheet.frame_sides()
+    stems = [s for k, s in enumerate(sheet.stems)
+             if k not in frames and x0 + 0.3 * il < s[0] < x1 - 0.3 * il and s[2] > ylo and s[1] < yhi
              # a stem touches the staff's neighbourhood; the sides of a
              # boxed rehearsal letter float above it
              and s[2] >= top - 1.8 * il and s[1] <= top + 5.8 * il
@@ -435,6 +487,10 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
              and not (bar.get("first") and s[0] < x0 + 2.6 * il
                       and s[1] > top - 0.4 * il and s[2] < top + 4.4 * il)
              and not sheet.in_time(s[0], (s[1] + s[2]) / 2)
+             # a line from the top staff line to the bottom one, at the
+             # end of the bar, is half of a double barline
+             and not (s[0] > x1 - 1.6 * il and abs(s[1] - top) < 0.35 * il
+                      and abs(s[2] - top - 4 * il) < 0.35 * il)
              # the little note of a metronome mark ("note = 136")
              and not any(0 < ex - s[0] < 4.5 * il and s[1] - 1.5 * il < ey < s[2] + 1.5 * il
                          and s[2] < top for ex, ey in sheet.equals)]
@@ -469,6 +525,11 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
                 chords.setdefault(k, []).append((bx, by, kind))
             if chords.get(k):
                 break
+        if not chords.get(k):
+            # the thin outline of a diamond head, drawn below an up-stem
+            for bx, by, kind in sheet.stem_blobs(sx, sy0 + 1.3 * il, sy1 + 0.7 * il, -1,
+                                                 narrow=True):
+                chords.setdefault(k, []).append((bx, by, kind))
     events = []
     for k, members in chords.items():
         sx, sy0, sy1 = stems[k]
@@ -722,6 +783,118 @@ def _time_once(read: dict, il: float, mode: str) -> tuple[list[dict], str | None
            for e in events if not e.get("rest")):
         problem = (problem or "") + " off-grid"
     return events, problem
+
+
+def boxed_marks(omr: Path) -> list[tuple[int, int, int, str]]:
+    """(sheet ordinal, x, y, text) of every boxed letter or number above a
+    staff, read from the ink. Audiveris finds the boxes but reads the
+    letter inside through the frame, and gets it wrong one time in four.
+    Where no clean frame is found (a broken scan) its reading is kept."""
+    from chord_chart import Names, ocr
+    from fix_hbars import _omr_rehearsal_marks
+    theirs = _omr_rehearsal_marks(omr)
+    out, doubtful = [], set()
+    with zipfile.ZipFile(omr) as z:
+        from PIL import Image
+        import io
+        for index, name in enumerate(_sheets(z)):
+            root = ET.fromstring(z.read(f"{name}/{name}.xml").decode("utf-8", "replace"))
+            ink = np.asarray(Image.open(io.BytesIO(
+                z.read(f"{name}/BINARY.png"))).convert("L")) < 128
+            found = []
+            for system in root.iter("system"):
+                staff = system.find(".//staff")
+                lines = staff.findall("lines/line") if staff is not None else []
+                if len(lines) < 5:
+                    continue
+                left, right = float(staff.get("left")), float(staff.get("right"))
+                top = _line_y(lines[0], (left + right) / 2)
+                il = (_line_y(lines[-1], left) - _line_y(lines[0], left)) / 4
+                x0, y0 = max(int(left - 2 * il), 0), max(int(top - 7 * il), 0)
+                names = Names(ink, x0, int(right), y0, int(top - 0.2 * il), il)
+                for box in names.boxes():
+                    f = box["frame"]
+                    if not box["inside"] or f["w"] > 6 * il or f["h"] > 4 * il:
+                        continue
+                    text = ocr(names.image(box["inside"]), len(box["inside"]) == 1,
+                               "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+                    if text:
+                        found.append((index, x0 + f["x"] + f["w"] // 2,
+                                      y0 + f["y"] + f["h"] // 2, text))
+            out.extend(found)
+            il = Sheet(ink, root).il
+            for m in theirs:
+                if m[0] != index or any(abs(m[1] - f[1]) < 80 and abs(m[2] - f[2]) < 80
+                                        for f in found):
+                    continue
+                # a frame that touches a barline or a tie: cut the box out,
+                # rub out its straight sides, read what is left
+                r = int(1.9 * il)
+                ya, xa = max(m[2] - r, 0), max(m[1] - r, 0)
+                crop = ink[ya:m[2] + r, xa:m[1] + r].astype(np.uint8)
+                long = max(int(1.7 * il), 3)
+                flat = cv2.morphologyEx(crop, cv2.MORPH_OPEN, np.ones((1, long), np.uint8))
+                upright = cv2.morphologyEx(crop, cv2.MORPH_OPEN, np.ones((long, 1), np.uint8))
+                yy, xx = np.mgrid[0:crop.shape[0], 0:crop.shape[1]]
+                flat[np.abs(yy - r) < 0.8 * il] = 0        # only the frame's own
+                upright[np.abs(xx - r) < 0.7 * il] = 0     # sides, not the letter's
+                rest = crop & ~cv2.dilate(flat | upright, np.ones((3, 3), np.uint8))
+                n, lab, stats, cent = cv2.connectedComponentsWithStats(rest, connectivity=8)
+                keep = np.zeros_like(rest)
+                for i in range(1, n):
+                    x, y, w, h, area = stats[i]
+                    if h > 0.7 * il and abs(cent[i][0] - r) < 0.9 * il \
+                            and abs(cent[i][1] - r) < 0.9 * il:
+                        keep[lab == i] = 1
+                text = ""
+                if keep.any():
+                    img = Image.fromarray(((1 - np.pad(keep, int(il))) * 255).astype(np.uint8))
+                    img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+                    text = ocr(img, True, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+                out.append((m[0], m[1], m[2], text or m[3]))
+                doubtful.add((m[0], m[1], m[2]))
+    # letters run in order down the chart: doubtful ones between two sure
+    # letters take the letters that are missing between them
+    out.sort(key=lambda m: (m[0], m[2] // 150, m[1]))
+    sure = [k for k, m in enumerate(out) if m[:3] not in doubtful
+            and len(m[3]) == 1 and m[3].isalpha()]
+    for a, b in zip([None] + sure, sure + [None]):
+        lo = -1 if a is None else a
+        hi = len(out) if b is None else b
+        between = list(range(lo + 1, hi))
+        if not between:
+            continue
+        first = ord(out[a][3]) + 1 if a is not None else None
+        last = ord(out[b][3]) - 1 if b is not None else None
+        if first is not None and last is not None and last - first + 1 != len(between):
+            continue
+        if first is None and last is None:
+            continue
+        start = first if first is not None else last - len(between) + 1
+        if start < ord("A") or start + len(between) - 1 > ord("Z"):
+            continue
+        for n, k in enumerate(between):
+            out[k] = (*out[k][:3], chr(start + n))
+    return out
+
+
+def boxed_numbers(omr: Path, marks: list[tuple[int, int, int, str]]) -> dict[int, int]:
+    """{bar ordinal: printed measure number} from boxed bar numbers: the
+    box stands over the barline that opens its bar."""
+    out, ordinal = {}, 0
+    with zipfile.ZipFile(omr) as z:
+        for index, name in enumerate(_sheets(z)):
+            root = ET.fromstring(z.read(f"{name}/{name}.xml").decode("utf-8", "replace"))
+            bars = page_layout(root)
+            for sheet, x, y, text in marks:
+                if sheet != index or not text.isdigit():
+                    continue
+                near = [(abs(b["x0"] - x), k) for k, b in enumerate(bars)
+                        if 0 < b["top"] - y < 8 * b["il"]]
+                if near and min(near)[0] < 4 * bars[min(near)[1]]["il"]:
+                    out[ordinal + min(near)[1]] = int(text)
+            ordinal += len(bars)
+    return out
 
 
 def sliver_bars(omr: Path) -> set[int]:
