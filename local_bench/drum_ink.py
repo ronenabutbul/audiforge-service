@@ -296,6 +296,7 @@ class Sheet:
                 self.marksink[ys, xs] = (self.nolines & ~self.thinlines)[ys, xs]
         self.dynamics = [b for b in self.dynamics if b not in fake]
         self._rests(root)
+        self._stems_off_rests()
         # an eighth rest's hook and a quarter rest's zigzag cross like an x;
         # inside a rest Audiveris recognised, no cross is a head
         self.crosses = [(x, y) for x, y in self.crosses
@@ -554,6 +555,39 @@ class Sheet:
                             y1 = yy + 1
                         break
             self.stems.append((cx, float(y0), float(y1)))
+
+    def _stems_off_rests(self):
+        """A quarter rest printed right under (or over) a head of the
+        other voice touches it, and its upright zigzag then reads as that
+        head's stem pointing the wrong way. Ink inside a rest Audiveris
+        recognised is not stem: a stem is cut where it enters the rest's
+        box, and dropped when what is left is too short to be one.""" 
+        il = self.il
+        keep = []
+        for cx, y0, y1 in self.stems:
+            was = (y0, y1)
+            for _rx, _ry, _n, _r1, bx, by, bw, bh in self.rests:
+                if not (bx - 0.1 * il <= cx <= bx + bw + 0.1 * il):
+                    continue
+                if by - 0.3 * il <= y0 and y1 <= by + bh + 0.3 * il:
+                    y1 = y0         # the zigzag itself
+                elif y0 < by - 0.5 * il and y1 > by + 0.5 * bh:
+                    y1 = min(y1, by)
+                elif y1 > by + bh + 0.5 * il and y0 < by + 0.5 * bh:
+                    y0 = max(y0, by + bh)
+            # (the same least height `_stems` asks, for a stem that was cut)
+            if (y0, y1) != was and y1 - y0 < max(int(1.9 * il), 5):
+                continue
+            # two heads a second apart, the lower set a little to one side,
+            # leave an upright edge as tall as a short stem; a stem runs on
+            # well past the heads it carries, this edge ends with them
+            heads = [hy for hx, hy in self.filled if abs(hx - cx) <= 0.9 * il
+                     and y0 - 0.8 * il <= hy <= y1 + 0.8 * il]
+            if len(heads) >= 2 and y0 >= min(heads) - 0.8 * il \
+                    and y1 <= max(heads) + 0.8 * il:
+                continue
+            keep.append((cx, y0, y1))
+        self.stems = keep
 
     def _rests(self, root: ET.Element):
         self.voids = []
