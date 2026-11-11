@@ -304,6 +304,13 @@ def _gaps_joined(ink: np.ndarray, staves: list[Staff], b: dict) -> int:
     return n
 
 
+def _joined_score(ink: np.ndarray, staves: list[Staff], lines: list[dict]) -> bool:
+    """Most of these barlines join at least one gap between staves."""
+    if len(lines) < 2:
+        return False
+    return 2 * sum(_gaps_joined(ink, staves, b) > 0 for b in lines) > len(lines)
+
+
 def _repeat_dots(ink: np.ndarray, staff: Staff, x: float, side: int) -> bool:
     """Two dots in the middle spaces beside a barline, on `side` of it."""
     il = staff.il
@@ -439,10 +446,13 @@ def _bars_of(ink: np.ndarray, system: System) -> None:
     if edges and stops and edges[0]["x0"] < max(stops) + 3.0 * il and len(edges[0]["kind"].split("-")) > 1:
         prev = edges.pop(0)
     elif edges and stops and edges[0]["x0"] < max(stops) + 3.0 * il and opening is not None \
-            and _gaps_joined(ink, system.staves, opening) and not _gaps_joined(ink, system.staves, edges[0]):
+            and _gaps_joined(ink, system.staves, opening) and not _gaps_joined(ink, system.staves, edges[0]) \
+            and _joined_score(ink, system.staves, edges[1:]):
         # just past the clefs and key: an upright that fills every staff but,
         # unlike the system's opening barline, joins none of the gaps between
-        # them is a time signature's stroke (a hand-drawn 4), not a barline
+        # them is a time signature's stroke (a hand-drawn 4), not a barline.
+        # Only in a score whose other barlines join the gaps: a piano
+        # score may draw its barlines staff by staff (Bacchanale)
         edges.pop(0)
     for b in edges:
         bars.append({"x0": prev["x1"], "x1": b["x0"], "left": prev, "right": b})
