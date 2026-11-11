@@ -446,7 +446,12 @@ def bar_crops(omr_path: Path) -> list[dict]:
                             # printed after a barline, never on one: a
                             # "signature" centred on the barline is a
                             # two-bar repeat sign misread (Libertango)
-                            if si and abs(sig["x"] - x0) < 1.2 * interline:
+                            # ... unless the "barline" is the signature's
+                            # own stroke: the upright of a cut-time C cut
+                            # off a sliver of a stack after a double barline
+                            sliver = (si and float(stacks[si - 1].get("right"))
+                                      - float(stacks[si - 1].get("left")) < 4.5 * interline)
+                            if si and abs(sig["x"] - x0) < 1.2 * interline and not sliver:
                                 continue
                             if (si == len(stacks) - 1
                                     and sig["x"] > x0 + 0.85 * (x1 - x0)):
