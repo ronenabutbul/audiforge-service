@@ -1070,6 +1070,11 @@ def _clear(part, kinds: set[str]) -> None:
                     direction.remove(sound)
             if direction.find("direction-type") is None:
                 measure.remove(direction)
+        for sound in list(measure.findall("sound")):
+            for k in _SOUND_KEYS:
+                sound.attrib.pop(k, None)
+            if not sound.attrib and len(sound) == 0:
+                measure.remove(sound)
 
 
 def _barline(measure, location: str):
@@ -1114,26 +1119,41 @@ def _set_barline(measure, location: str, repeat: dict | None = None,
             barline.append(element)
 
 
+def _jump_sound(kind: str) -> dict[str, str]:
+    """The <sound> attributes that make a player act on a jump."""
+    if kind == TO_CODA:
+        return {"tocoda": "coda"}
+    if kind == FINE:
+        return {"fine": "yes"}
+    if kind.startswith("ds"):
+        return {"dalsegno": "segno"}
+    return {"dacapo": "yes"}
+
+
 def _direction(kind: str):
-    """The <direction> that prints a sign or a jump and tells a player
-    what it does."""
+    """The <direction> that prints a sign or a jump. Signs and To Coda /
+    Fine carry their <sound> inside, with matching ids (segno="segno" is
+    what dalsegno="segno" goes back to, coda="coda" what tocoda="coda"
+    goes on to). A D.S. or D.C. gets its <sound> from `place` as a
+    measure-level sibling instead: MuseScore reads "al Coda" / "al Fine"
+    from the words only when the direction has no sound of its own, and
+    the sound inside would make it a plain jump that plays to the end."""
     direction = ET.Element("direction", placement="above")
     dtype = ET.SubElement(direction, "direction-type")
     if kind in (SEGNO, CODA):
         ET.SubElement(dtype, kind)
         ET.SubElement(direction, "sound", {kind: kind})
         return direction
-    ET.SubElement(dtype, "words", {"font-weight": "bold"}).text = JUMP_WORDS[kind]
-    if kind == TO_CODA:
-        attrs = {"tocoda": "coda"}
-    elif kind == FINE:
-        attrs = {"fine": "yes"}
-    elif kind.startswith("ds"):
-        attrs = {"dalsegno": "segno"}
-    else:
-        attrs = {"dacapo": "yes"}
-    ET.SubElement(direction, "sound", attrs)
+    # No font-weight: MuseScore keeps it as <b> markup inside the jump's
+    # text and its own export then writes the tags out as literal words.
+    ET.SubElement(dtype, "words", {"justify": "right"}).text = JUMP_WORDS[kind]
+    if not _sound_apart(kind):
+        ET.SubElement(direction, "sound", _jump_sound(kind))
     return direction
+
+
+def _sound_apart(kind: str) -> bool:
+    return kind in JUMP_WORDS and (kind.startswith("ds") or kind.startswith("dc"))
 
 
 def place(omr_path: Path, result_path: Path, hbars: list[dict] | None = None,
@@ -1217,12 +1237,18 @@ def place(omr_path: Path, result_path: Path, hbars: list[dict] | None = None,
                     children[at].tag in ("print", "attributes")
                     or (children[at].tag == "barline" and children[at].get("location") == "left")):
                 at += 1
-        else:  # a jump is read at the end of its bar
+        else:
+            # A jump is read at the end of its bar: after the notes, so
+            # its time is the closing barline. MuseScore snaps a To Coda
+            # or D.S. to the nearest barline, so one written before a
+            # bar's only note would land on the bar before.
             at = len(children)
             while at and children[at - 1].tag == "barline" \
                     and children[at - 1].get("location", "right") == "right":
                 at -= 1
         measure.insert(at, _direction(m.kind))
+        if _sound_apart(m.kind):
+            measure.insert(at + 1, ET.Element("sound", _jump_sound(m.kind)))
         placed += 1
     tree.write(result_path, encoding="UTF-8", xml_declaration=True)
     return placed
