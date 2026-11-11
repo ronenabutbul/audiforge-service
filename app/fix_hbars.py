@@ -1619,7 +1619,8 @@ def _omr_rehearsal_marks(omr_path: Path) -> list[tuple[int, int, int, str]]:
 def _locate_marks(omr_path: Path, hbars: list[dict],
                   marks: list[tuple[int, int, int, object]],
                   band: str = "above", containing: bool = False,
-                  slack_il: float = 2.0) -> list[tuple[int, object]]:
+                  slack_il: float = 2.0,
+                  numbers: list[int] | None = None) -> list[tuple[int, object]]:
     """The printed measure number each page mark sits over.
 
     `marks` are (sheet ordinal, x, y, value); the value is carried
@@ -1629,7 +1630,9 @@ def _locate_marks(omr_path: Path, hbars: list[dict],
     mark lies inside (a dynamic under its note) rather than the bar
     whose starting barline is nearest (a letter over the barline), with
     `slack_il` interlines of tolerance for ink that begins a little
-    before its bar. Returns (printed number, value) in mark order."""
+    before its bar. `numbers` is the printed number of every stack when
+    the caller counts its measures another way than `stack_numbers`.
+    Returns (printed number, value) in mark order."""
     if not marks:
         return []
     # Two readers can see the same mark: same sheet and same place.
@@ -1641,7 +1644,8 @@ def _locate_marks(omr_path: Path, hbars: list[dict],
         deduped.append(m)
     marks = deduped
 
-    numbers = stack_numbers(omr_path, hbars)
+    if numbers is None:
+        numbers = stack_numbers(omr_path, hbars)
     by_stack = {h["stack"]: h for h in hbars}
     located = []  # (printed measure number, value)
     with zipfile.ZipFile(omr_path) as z:

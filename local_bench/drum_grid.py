@@ -1818,7 +1818,33 @@ def apply_structure(work_dir: Path, out: Path, omr: Path,
             print(f"  tempo recovered: {bpm} BPM", flush=True)
 
     engine = work_dir / "audiveris.musicxml"
-    if engine.exists():
+    if ink_marks is not None:
+        # The ink path: repeats, voltas, Segno, Coda and the jump texts
+        # are read off the page and placed by their pixel position, so
+        # they land on the right bars whatever the engine's measure list
+        # looks like (multirests expanded, slivers dropped, a pickup).
+        from drum_ink import sliver_bars
+        from structure_marks import numbers_for_bars, place as place_road_map
+        # The measures written are the bars main() kept: no half of a
+        # split multirest, no sliver. The marks count by the same list.
+        rests = {h["stack"] for h in hbars
+                 if h.get("read") and 2 <= h["count"] <= 150}
+        dropped = {h["stack"] + k for h in hbars
+                   for k in range(1, h.get("span", 1))} \
+            | (sliver_bars(omr) - rests)
+        written = len(ET.parse(out).getroot().find("part").findall("measure"))
+        numbers = numbers_for_bars(
+            omr, hbars, [c["stack"] for c in bar_crops(omr)
+                         if c["stack"] not in dropped], written)
+        if numbers is None:
+            print("  road map: the bars written do not add up to the page's "
+                  "stacks; marks placed by the multirest count alone",
+                  flush=True)
+        marks = place_road_map(omr, out, hbars, numbers=numbers)
+        if marks:
+            print(f"  {marks} road-map marks placed (repeats, endings, "
+                  f"signs, jumps)", flush=True)
+    elif engine.exists():
         # Repeats and voltas: the engine reads barlines fine even on drum
         # staves, and its measures follow the same printed bars we do.
         tree = ET.parse(out)
