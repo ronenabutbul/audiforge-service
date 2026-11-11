@@ -1945,8 +1945,9 @@ def repeat_signs(ink: np.ndarray, top: float, il: float, x0: float, x1: float
         down = [d for d in dots if run[-1] < d[0] <= run[-1] + reach + 0.6 * il
                 and top + 2.2 * il <= d[1] <= top + 3.3 * il]
         # the dots sit on a diagonal, not one over the other as a
-        # repeat barline's dots do
-        if len(run) <= 4 and any(d[0] - u[0] >= 1.2 * il for u in up for d in down):
+        # repeat barline's dots do (a small sign sets them only 1.2
+        # interlines apart)
+        if len(run) <= 4 and any(d[0] - u[0] >= 0.8 * il for u in up for d in down):
             found.append((float(mid), len(run)))
     return found
 
