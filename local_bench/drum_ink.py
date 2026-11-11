@@ -1208,7 +1208,18 @@ class Sheet:
         col = self.ink[max(int(hy - 1.5 * il), 0):int(hy + 1.5 * il), int(hx)]
         wide = max((b - a for a, b in _runs(row)), default=0)
         tall = max((b - a for a, b in _runs(col)), default=0)
-        return wide >= 1.05 * il and tall <= 0.8 * il
+        if not (wide >= 1.05 * il and tall <= 0.8 * il):
+            return False
+        # a beam is as flat but runs on from stem to stem: the run through
+        # the block, staff lines taken out, is longer than any rest with
+        # its ledger line
+        # (a scan's pinhole of a pixel or two does not break a run)
+        far = self.nolines[int(hy), max(int(hx - 4 * il), 0):int(hx + 4 * il)].copy()
+        gaps = [(a, b) for a, b in _runs(~far) if b - a <= 2 and a > 0 and b < len(far)]
+        for a, b in gaps:
+            far[a:b] = True
+        at = int(hx) - max(int(hx - 4 * il), 0)
+        return not any(a <= at <= b and b - a > 3.2 * il for a, b in _runs(far))
 
     def dotted(self, hx: float, hy: float, edge: float | None = None) -> bool:
         il = self.il
@@ -2279,7 +2290,7 @@ def _frames(band: np.ndarray, il: float) -> list[tuple[int, int, int, int]]:
                 cols = np.nonzero(fl[rows].any(axis=0))[0]
                 x, y = x + int(cols[0]), y + max(int(rows[0]) - 1, 0)
                 w, h = int(cols[-1] - cols[0] + 1), int(rows[-1] - rows[0] + 3)
-            if not (1.4 * il <= w <= 6 * il and min_h * il <= h <= 4 * il):
+            if not (1.4 * il <= w <= 6 * il and min_h * il <= h <= 4.5 * il):
                 continue
             if any(x < ox + ow and ox < x + w and y < oy + oh and oy < y + h
                    for ox, oy, ow, oh in out):
@@ -2379,7 +2390,7 @@ def boxed_marks(omr: Path) -> list[tuple[int, int, int, str]]:
                 here = []
                 for box in names.boxes():
                     f = box["frame"]
-                    if not box["inside"] or f["w"] > 6 * il or f["h"] > 4 * il:
+                    if not box["inside"] or f["w"] > 6 * il or f["h"] > 4.5 * il:
                         continue
                     text = ocr(names.image(box["inside"]), len(box["inside"]) == 1,
                                "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
@@ -2439,6 +2450,33 @@ def boxed_marks(omr: Path) -> list[tuple[int, int, int, str]]:
                         text = ""
                 out.append((m[0], m[1], m[2], text or m[3]))
                 doubtful.add((m[0], m[1], m[2]))
+            # a bar number whose frame touches a beam or a stem is neither a
+            # frame of its own nor one of Audiveris' rehearsal marks: it is
+            # an ordinary word of digits. It counts when a straight upright
+            # as tall as the digits stands just left and just right of it
+            # and a straight line runs above it.
+            for word in root.iter("word"):
+                value = (word.get("value") or "").strip()
+                b = word.find("bounds")
+                if not (value.isdigit() and len(value) <= 3) or b is None:
+                    continue
+                x, y, w, h = (int(float(b.get(k))) for k in ("x", "y", "w", "h"))
+                cx, cy = x + w // 2, y + h // 2
+                if any(f[0] == index and abs(f[1] - cx) < 2 * il and abs(f[2] - cy) < 2 * il
+                       for f in out):
+                    continue
+                pad = int(1.5 * il)
+
+                def upright(xa, xb):
+                    cols = ink[y:y + h, max(xa, 0):xb]
+                    return cols.size and cols.all(axis=0).any()
+
+                def flat(ya, yb):
+                    rows = ink[max(ya, 0):yb, x:x + w]
+                    return rows.size and rows.all(axis=1).any()
+                if upright(x - pad, x) and upright(x + w, x + w + pad) \
+                        and flat(y - pad, y) and flat(y + h, y + h + pad):
+                    out.append((index, cx, cy, value))
     # letters run in order down the chart: doubtful ones between two sure
     # letters take the letters that are missing between them
     out.sort(key=lambda m: (m[0], m[2] // 150, m[1]))

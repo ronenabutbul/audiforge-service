@@ -2202,14 +2202,18 @@ def place_breaks(omr_path: Path, out: Path, crops: list[dict],
 
 def _page_defaults(score: ET.Element, width: float, height: float, il: float,
                    left: float, right: float, top: float) -> None:
-    """Lay the score out on the original's page at the original's staff
-    size (`<defaults>`, in tenths: 40 tenths are one staff height). The
-    line breaks are the page's, and a row the engraver fitted at a small
-    staff no longer overflows a renderer's default staff and breaks in
+    """Lay the score out on the original's page (`<defaults>`, in tenths:
+    40 tenths are one staff height) at a staff a little smaller than the
+    printed one. The line breaks are the page's, and a row the engraver
+    fitted no longer overflows a renderer's default staff and breaks in
     two. Only the page's size is assumed: A4 if it is as tall as A4."""
     mm_per_px = 210.0 / width if abs(height / width - 297 / 210) < 0.03 else 215.9 / width
-    staff_mm = 4 * il * mm_per_px
-    tenths = 40 / (4 * il)          # tenths per pixel
+    # a renderer spaces notes wider than an engraver packs them (MuseScore
+    # broke the original's rows in two at the printed staff size, and kept
+    # all but one of Aznavour's 22 rows whole at three quarters of it)
+    shrink = 0.75
+    staff_mm = 4 * il * mm_per_px * shrink
+    tenths = 40 / (4 * il * shrink)     # tenths per pixel
     old = score.find("defaults")
     if old is not None:
         score.remove(old)
