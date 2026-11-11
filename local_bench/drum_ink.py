@@ -157,6 +157,20 @@ class Sheet:
         r2 = cv2.filter2D(fat, -1, np.fliplr(back) / L) >= 0.86
         d = np.ones((max(int(0.18 * il), 3),) * 2, np.uint8)
         both = cv2.dilate(r1.astype(np.uint8), d) & cv2.dilate(r2.astype(np.uint8), d)
+        # a heavy pen or a rough scan: the strokes are too thick to pass
+        # as "thin". Then the shape decides: ink along both diagonals,
+        # paper straight above, below, left and right of the centre.
+        raw = self.nolines.astype(np.float32)
+        q1 = cv2.filter2D(raw, -1, back / L) >= 0.8
+        q2 = cv2.filter2D(raw, -1, np.fliplr(back) / L) >= 0.8
+        off = max(int(round(0.34 * il)), 3)
+        paper = np.ones_like(self.ink)
+        blur = cv2.blur(raw, (3, 3))
+        for dy, dx in ((off, 0), (-off, 0), (0, off), (0, -off)):
+            paper &= np.roll(blur, (-dy, -dx), axis=(0, 1)) < 0.35
+        heavy = cv2.dilate(q1.astype(np.uint8), d) & cv2.dilate(q2.astype(np.uint8), d) \
+            & paper.astype(np.uint8)
+        both = both | heavy
         n, _lab, stats, cents = cv2.connectedComponentsWithStats(both)
         found = []
         for i in range(1, n):
@@ -435,7 +449,7 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
                            else 1 if ry < top + 0.8 * il else 0,
                            "value": value, "rest": True, "y": ry})
     events.sort(key=lambda e: e["x"])
-    return {"events": events, "slots": slots}
+    return {"events": events, "slots": slots, "x1": x1}
 
 
 def time_bar(read: dict, il: float) -> tuple[list[dict], str | None]:
@@ -444,14 +458,63 @@ def time_bar(read: dict, il: float) -> tuple[list[dict], str | None]:
     stems alone tell the hands from the feet)."""
     import copy
     first = None
-    for mode in ("voices", "stream"):
+    for mode in ("voices", "ruler", "stream"):
         attempt = {"events": copy.deepcopy(read["events"]), "slots": read["slots"]}
-        events, problem = _time_once(attempt, il, mode)
+        if mode == "ruler":
+            events, problem = _time_ruler(attempt, il, read.get("x1"))
+        else:
+            events, problem = _time_once(attempt, il, mode)
         if first is None:
             first = (events, problem)
         if problem is None:
             return events, None
     return first
+
+
+def _time_ruler(read: dict, il: float, x1: float | None) -> tuple[list[dict], str | None]:
+    """One voice adds up on its own: it becomes the ruler, and the other
+    voice is timed by where its heads stand against it. Engravers align
+    simultaneous notes exactly, so position is as good as arithmetic."""
+    events, slots = read["events"], read["slots"]
+    for ruler in (1, 2):
+        t = Fraction(0)
+        marks = []
+        for e in events:
+            if e["voice"] != ruler:
+                continue
+            marks.append((e["x"], t))
+            e["slot"] = t
+            t += e["value"] or 0
+        notes = [e for e in events if e["voice"] == ruler and not e.get("rest")]
+        if t != slots or len(notes) < 2:
+            continue
+        if x1 is not None:
+            marks.append((x1, Fraction(slots)))
+        ok = True
+        for e in events:
+            if e["voice"] == ruler:
+                continue
+            if e.get("rest"):
+                e["slot"] = None
+                continue
+            near = min(marks, key=lambda m: abs(m[0] - e["x"]))
+            if abs(near[0] - e["x"]) < 0.75 * il:
+                e["slot"] = near[1]
+                continue
+            left = [m for m in marks if m[0] <= e["x"]]
+            right = [m for m in marks if m[0] > e["x"]]
+            if not left or not right:
+                ok = False
+                break
+            (xa, ta), (xb, tb) = left[-1], right[0]
+            slot = ta + Fraction(round(float((tb - ta) * Fraction(e["x"] - xa) / Fraction(xb - xa))))
+            e["slot"] = min(slot, Fraction(slots - 1))
+        if ok:
+            for e in events:
+                if e.get("rest") and e.get("slot") is None:
+                    e["slot"] = Fraction(0)
+            return events, None
+    return events, "no voice adds up"
 
 
 def _time_once(read: dict, il: float, mode: str) -> tuple[list[dict], str | None]:
