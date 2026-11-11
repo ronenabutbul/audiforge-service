@@ -280,8 +280,15 @@ class Sheet:
                         if not self.in_dynamic(x, y) and not self.in_time(x, y)]
         self.filled = [(x, y) for x, y in self.filled if not self.in_time(x, y)]
         self._rings()
+        self.rings = [r for r in self.rings if not self.in_dynamic(r[0], r[1])]
         self._stems()
         self._rests(root)
+        # an eighth rest's hook and a quarter rest's zigzag cross like an x;
+        # inside a rest Audiveris recognised, no cross is a head
+        self.crosses = [(x, y) for x, y in self.crosses
+                        if not any(r[4] - 0.15 * self.il <= x <= r[4] + r[6] + 0.15 * self.il
+                                   and r[5] - 0.15 * self.il <= y <= r[5] + r[7] + 0.15 * self.il
+                                   for r in self.rests)]
         self._signs()
         self._graces(root)
         self._drags()
@@ -1127,6 +1134,40 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
             for bx, by, kind in sheet.stem_blobs(sx, sy0 + 1.3 * il, sy1 + 0.7 * il, -1,
                                                  narrow=True):
                 chords.setdefault(k, []).append((bx, by, kind))
+    # A cymbal x whose arm runs into its stem on a worn scan is neither a
+    # cross nor a blob beside the stem. A stem that ends level with its
+    # neighbours' cymbal heads (same direction, same end, an interline or
+    # three away) and has head-sized ink against that end carries the same
+    # head: beamed hi-hat or ride eighths all look alike.
+    for k, (sx, sy0, sy1) in enumerate(stems):
+        if chords.get(k) or sheet.hangs_from_line(sx, sy0):
+            continue
+        # the second half of a stem already carrying heads (the stroke
+        # split where a head joins it) is that stem
+        if any(chords.get(j) and abs(ox - sx) < 0.5 * il and oy0 < sy1 and sy0 < oy1
+               for j, (ox, oy0, oy1) in enumerate(stems) if j != k):
+            continue
+        like = []
+        for j, (ox, oy0, oy1) in enumerate(stems):
+            heads = chords.get(j, [])
+            if j == k or not heads or not 0.8 * il <= abs(ox - sx) <= 3.5 * il:
+                continue
+            if not all(h[2] in ("x", "circled_x") for h in heads) or len(heads) != 1:
+                continue
+            hx, hy, kind = heads[0]
+            up = hx < ox
+            if up and abs(oy1 - sy1) < 0.35 * il and abs(hy - oy1) < 0.8 * il:
+                like.append((sx - (ox - hx), hy, "x"))
+            elif not up and abs(oy0 - sy0) < 0.35 * il and abs(hy - oy0) < 0.8 * il:
+                like.append((sx + (hx - ox), hy, "x"))
+        if not like:
+            continue
+        hx, hy, kind = like[0]
+        box = sheet.nolines[int(hy - 0.4 * il):int(hy + 0.4 * il) + 1,
+                            int(min(hx, sx) - 0.3 * il):int(max(hx, sx) + 0.3 * il) + 1]
+        if box.size and 0.15 <= box.mean() <= 0.6 and not sheet.in_dynamic(hx, hy) \
+                and sy0 - 0.5 * il <= hy <= sy1 + 0.5 * il:
+            chords[k] = [(hx, hy, kind)]
     events = []
     for k, members in chords.items():
         sx, sy0, sy1 = stems[k]
