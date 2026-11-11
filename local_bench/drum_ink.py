@@ -955,6 +955,115 @@ def _attach_signs(sheet: Sheet, bar: dict, events: list[dict]) -> None:
                 best[1]["signs"].append(name)
 
 
+def repeat_signs(ink: np.ndarray, top: float, il: float, x0: float, x1: float
+                 ) -> list[tuple[float, int]]:
+    """Bar repeat signs ("%": slashes between two dots) on a staff
+    between x0 and x1: [(centre x, number of slashes)]. `ink` is the
+    page ink, `top` the top staff line's y. One slash repeats one bar;
+    two slashes repeat two bars and the sign then straddles the barline
+    between the two bars it fills.
+
+    A slash is a thick stroke rising to the right through the middle
+    of the staff. Staff lines and a barline through the sign cut it into
+    pieces, so slashes are found by projection, not by blobs: the rows
+    of the middle spaces (staff-line rows left out) are sheared by a
+    trial slope until every slash stands upright, and a slash is then a
+    band of columns inked on nearly every row. The dots stand in the
+    spaces above and below, one up-left and one down-right of the
+    slashes."""
+    xa, xb = int(max(x0 - 1.5 * il, 0)), int(min(x1 + 1.5 * il, ink.shape[1]))
+    ya, yb = int(max(top - 0.3 * il, 0)), int(top + 4.3 * il)
+    box = ink[ya:yb, xa:xb].copy()
+    if box.shape[0] < 4 * il or box.shape[1] < 2 * il:
+        return []
+    # barlines: columns inked over the whole staff height
+    full = box[int(0.3 * il):int(4.3 * il)].mean(axis=0) > 0.85
+    full = full | np.r_[False, full[:-1]] | np.r_[full[1:], False]
+    box[:, full] = False
+    # a slash crossing the barline: bridge the cut where ink goes on both sides
+    if full.any():
+        k = int(full.sum() // max(len(_runs(full)), 1)) + 3
+        shut = cv2.morphologyEx(box.astype(np.uint8), cv2.MORPH_CLOSE,
+                                np.ones((1, k), np.uint8)).astype(bool)
+        box[:, full] = shut[:, full]
+    lines = box.mean(axis=1) > 0.45
+    lines = lines | np.r_[False, lines[:-1]] | np.r_[lines[1:], False]
+    ymid = top + 2 * il
+    rows = [y for y in range(int(top + 1.3 * il) - ya, int(top + 2.7 * il) - ya)
+            if not lines[y]]
+    if len(rows) < 0.6 * il:
+        return []
+    width = box.shape[1]
+    best = None
+    for slope in np.linspace(-1.6, -0.25, 28):     # dx per dy, rising to the right
+        prof = np.zeros(width + 4 * int(il) + 4)
+        off = 2 * int(il) + 2
+        for y in rows:
+            shift = int(round(slope * (ya + y - ymid)))
+            prof[off - shift:off - shift + width] += box[y]
+        prof /= len(rows)
+        # the slope that stands the most columns upright
+        score = float((prof >= 0.8).sum())
+        if best is None or score > best[0]:
+            best = (score, prof, slope)
+    _score, prof, slope = best
+    strokes = []
+    for s, e in _runs(prof >= 0.8):
+        if max(2.0, 0.1 * il) <= e - s <= 1.6 * il:
+            strokes.append(xa + (s + e) / 2 - (2 * int(il) + 2))
+    if not strokes:
+        return []
+    # dots: small solid blobs off the staff lines
+    clean = box.copy()
+    clean[lines] = False
+    # staff-line remnants (a line printed thicker in places) touch the dots
+    flat = cv2.morphologyEx(box.astype(np.uint8), cv2.MORPH_OPEN,
+                            np.ones((1, max(3, int(1.2 * il))), np.uint8)).astype(bool)
+    clean &= ~flat
+    n, lab, stats, cents = cv2.connectedComponentsWithStats(clean.astype(np.uint8))
+    dots = []
+    for i in range(1, n):
+        bx, by, w, h, a = stats[i]
+        if 0.25 * il <= w <= 0.8 * il and 0.2 * il <= h <= 0.8 * il \
+                and a >= 0.55 * w * h:
+            dots.append((xa + cents[i][0], ya + cents[i][1]))
+    found = []
+    k = 0
+    while k < len(strokes):
+        run = [strokes[k]]
+        while k + len(run) < len(strokes) and strokes[k + len(run)] - run[-1] < 1.4 * il:
+            run.append(strokes[k + len(run)])
+        k += len(run)
+        mid = (run[0] + run[-1]) / 2
+        # the slash reaches about 1.2 interlines either side of the middle
+        reach = abs(slope) * 1.2 * il + 0.6 * il
+        up = [d for d in dots if run[0] - reach - 0.6 * il <= d[0] < run[0]
+              and top + 0.7 * il <= d[1] <= top + 1.8 * il]
+        down = [d for d in dots if run[-1] < d[0] <= run[-1] + reach + 0.6 * il
+                and top + 2.2 * il <= d[1] <= top + 3.3 * il]
+        # the dots sit on a diagonal, not one over the other as a
+        # repeat barline's dots do
+        if len(run) <= 4 and any(d[0] - u[0] >= 1.2 * il for u in up for d in down):
+            found.append((float(mid), len(run)))
+    return found
+
+
+def bar_repeat(ink: np.ndarray, bar: dict) -> tuple[int, int] | None:
+    """(bars repeated, which of them this bar is) when `bar` (a dict
+    with x0, x1, top, il) holds a bar repeat sign: (1, 0) for a one-bar
+    sign in its middle, (2, 0) / (2, 1) when a two-bar sign straddles
+    its right / left barline. None for a bar without one."""
+    il, x0, x1 = bar["il"], bar["x0"], bar["x1"]
+    for cx, n in repeat_signs(ink, bar["top"], il, x0, x1):
+        if n == 1 and x0 + 0.25 * (x1 - x0) <= cx <= x1 - 0.25 * (x1 - x0):
+            return (1, 0)
+        if n == 2 and abs(cx - x1) < 1.2 * il:
+            return (2, 0)
+        if n == 2 and abs(cx - x0) < 1.2 * il:
+            return (2, 1)
+    return None
+
+
 def time_bar(read: dict, il: float) -> tuple[list[dict], str | None]:
     """Time the bar as two voices; when that does not add up, as one
     stream (a sparse bar often drops the rests of the idle voice and the
@@ -1367,9 +1476,44 @@ def read_chart(omr: Path) -> list[dict]:
                         strikes += _strikes_of(e, bar)
                     out.append({"ordinal": ordinal, "part": part, "sheet": name,
                                 "strikes": strikes, "problem": problem, "events": events,
-                                "slots": slots, "bar": bar})
+                                "slots": slots, "bar": bar,
+                                "repeat": bar_repeat(ink, bar)})
                 ordinal += 1
+    fill_repeats(out)
     return out
+
+
+def fill_repeats(chart: list[dict]) -> None:
+    """Bars that print a repeat sign take the notes of the bar(s) they
+    repeat, so playback and scoring hear them; 'repeat_bars' (1 or 2)
+    tells the writer to show the sign. A two-bar sign must be seen from
+    both bars it covers, and the bars repeated must have the same
+    meter."""
+    import copy
+    i = 0
+    while i < len(chart):
+        rep = chart[i].get("repeat")
+        n = 0
+        if rep == (1, 0):
+            n = 1
+        elif rep == (2, 0) and i + 1 < len(chart) and chart[i + 1].get("repeat") == (2, 1):
+            n = 2
+        src = list(range(i - n, i))
+        # whatever was read under the sign is the sign itself, a
+        # rehearsal box or a coda mark touching the staff
+        if not n or src[0] < 0 or any(chart[k]["slots"] != chart[i]["slots"] for k in src):
+            i += 1
+            continue
+        for k in src:
+            dst = chart[k + n]
+            dst["strikes"] = copy.deepcopy(chart[k]["strikes"])
+            dst["events"] = copy.deepcopy(chart[k]["events"])
+            dst["problem"] = chart[k]["problem"]
+            if chart[k].get("tuplets"):
+                dst["tuplets"] = copy.deepcopy(chart[k]["tuplets"])
+            dst["repeat_bars"] = n
+            dst["repeat_of"] = (chart[k]["ordinal"], chart[k]["part"])
+        i += n
 
 
 def system_numbers(omr: Path) -> dict[int, int]:
@@ -1532,7 +1676,8 @@ def ink_readings(crops: list[dict], omr: Path, rest_counts: dict | None = None,
                                       marks=st["marks"], grace=st.get("grace", False),
                                       onset=str(onset) if onset is not None else None))
         readings.append(BarReading(strikes=strikes,
-                                   tuplets=bar.get("tuplets", []) if bar else []))
+                                   tuplets=bar.get("tuplets", []) if bar else [],
+                                   repeat_bars=bar.get("repeat_bars", 0) if bar else 0))
     return readings, unsure
 
 

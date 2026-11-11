@@ -192,6 +192,9 @@ class BarReading(BaseModel):
     # Tuplet brackets: {"voice", "start", "end" (16th slots, as fraction
     # strings), "actual", "normal"} - three notes in the time of two.
     tuplets: list[dict] = []
+    # The page prints a bar repeat sign here (1 or 2 bars repeated); the
+    # strikes are the repeated bar's, for playback.
+    repeat_bars: int = 0
 
 
 class Hit(BaseModel):
@@ -321,7 +324,8 @@ def reading_to_grid(reading: "BarReading",
                   tremolo=long.get(s, (None, 0))[1])
               for s, v in sorted(by_slot.items(),
                                  key=lambda kv: (kv[0][0], kv[0][1] or ""))],
-        dynamic=reading.dynamic, tuplets=reading.tuplets)
+        dynamic=reading.dynamic, tuplets=reading.tuplets,
+        repeat_bars=reading.repeat_bars)
 
 
 class BarGrid(BaseModel):
@@ -329,6 +333,7 @@ class BarGrid(BaseModel):
     hits: list[Hit] = []
     dynamic: str | None = None
     tuplets: list[dict] = []
+    repeat_bars: int = 0
 
 
 def _signature_only(image, x0: float, x1: float, top: float, bottom: float,
@@ -1438,12 +1443,32 @@ def write_musicxml(grids: list[BarGrid], out: Path,
                         attrs = ET.SubElement(m, "attributes")
                     style = ET.SubElement(attrs, "measure-style")
                     ET.SubElement(style, "multiple-rest").text = str(span)
+                    if gi and grids[gi - 1].repeat_bars:
+                        ET.SubElement(ET.SubElement(attrs, "measure-style"),
+                                      "measure-repeat", type="stop")
                 note = ET.SubElement(m, "note")
                 ET.SubElement(note, "rest", measure="yes")
                 ET.SubElement(note, "duration").text = str(slots * unit)
                 ET.SubElement(note, "voice").text = "1"
             continue
         measure = open_measure(gi)
+        # Bar repeat signs: MuseScore's own form - "start" on the first
+        # bar showing the sign, "stop" on the first bar after the run,
+        # and the repeated notes written out in every signed bar.
+        before = grids[gi - 1].repeat_bars if gi else 0
+        if grid.repeat_bars != before:
+            attrs = measure.find("attributes")
+            if attrs is None:
+                attrs = ET.Element("attributes")
+                measure.insert(0, attrs)
+            style = ET.SubElement(attrs, "measure-style")
+            if before:
+                ET.SubElement(style, "measure-repeat", type="stop")
+            if grid.repeat_bars:
+                if before:
+                    style = ET.SubElement(attrs, "measure-style")
+                ET.SubElement(style, "measure-repeat", type="start",
+                              slashes=str(grid.repeat_bars)).text = str(grid.repeat_bars)
         if not any(0 <= h.slot < slots and any(i in KIT for i in h.instruments)
                    for h in grid.hits):
             # No strikes: write the rests the page prints, as printed
@@ -1500,6 +1525,10 @@ def write_musicxml(grids: list[BarGrid], out: Path,
                 voice = KIT[inst][4]
                 if j < len(hit.voices) and hit.voices[j] in (1, 2):
                     voice = hit.voices[j]      # the page's own voice
+                if grid.repeat_bars:
+                    # MuseScore's repeat sign hides voice 1 only: the
+                    # repeated notes go in one voice under the sign
+                    voice = 1
                 seen_step = hit.steps[j] if j < len(hit.steps) else None
                 seen_head = hit.heads[j] if j < len(hit.heads) else None
                 value = hit.values[j] if j < len(hit.values) else 0
