@@ -626,6 +626,9 @@ class Sheet:
                                float(b.get("x")) + float(b.get("w")),
                                float(b.get("x")), float(b.get("y")),
                                float(b.get("w")), float(b.get("h"))))
+        # Audiveris can file one rest under two staves (the second with an
+        # absurd pitch): the same box twice is one rest
+        self.rests = list(dict.fromkeys(self.rests))
         # a digit inside a boxed bar number is not a rest (the 7 of "57")
         self.rests = [r for r in self.rests
                       if not any(fx <= r[0] <= fx + fw and fy <= r[1] <= fy + fh
