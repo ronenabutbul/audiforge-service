@@ -276,6 +276,19 @@ def calibrate(readings: list["BarReading"]) -> dict:
             if kick_step > snare_step:
                 step_map.setdefault(snare_step, {})["normal"] = "snare"
                 step_map.setdefault(kick_step, {})["normal"] = "kick"
+        # Toms: every plain-head place the chart uses for one is its own
+        # drum. Where the fixed table gives two of those places the same
+        # tom (a fill stepping down from the top line: top line and second
+        # line both "high tom"), one instrument would put both on one line
+        # in the render; then the places are dealt the toms high to low in
+        # order of height.
+        toms = sorted(st for st in plain_steps
+                      if step_map.get(st, {}).get("normal", "").startswith("tom"))
+        given = [step_map[st]["normal"] for st in toms]
+        if len(set(given)) < len(given):
+            names = ["tom_high", "tom_mid", "tom_low", "tom_floor"]
+            for k, st in enumerate(toms):
+                step_map[st]["normal"] = names[min(k, len(names) - 1)]
     return step_map
 
 
