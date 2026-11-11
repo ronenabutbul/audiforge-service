@@ -65,13 +65,16 @@ def page_layout(root: ET.Element) -> list[dict]:
         lines = staff.findall("lines/line") if staff is not None else []
         if len(lines) < 5:
             continue
-        for si, stack in enumerate(system.findall("stack")):
+        stacks = system.findall("stack")
+        widths = sorted(float(st.get("right")) - float(st.get("left")) for st in stacks)
+        for si, stack in enumerate(stacks):
             x0, x1 = float(stack.get("left")), float(stack.get("right"))
             mid = (x0 + x1) / 2
             ys = [_line_y(ln, mid) for ln in lines]
             bars.append({"x0": x0, "x1": x1, "top": ys[0],
                          "il": (ys[-1] - ys[0]) / 4, "lines": lines,
-                         "first": si == 0})
+                         "first": si == 0,
+                         "row_width": widths[len(widths) // 2] if widths else 0.0})
     return bars
 
 
@@ -83,6 +86,19 @@ def _runs(flags) -> list[tuple[int, int]]:
         elif not f and start is not None:
             out.append((start, k))
             start = None
+    return out
+
+
+def _mended(flags, gap: float, whole: float) -> list[tuple[int, int]]:
+    """Runs, with a scratch through one beam bridged. Two beams with the
+    paper between them are far thicker than one beam, so two pieces are
+    one beam only when together they are no thicker than a beam is."""
+    out: list[tuple[int, int]] = []
+    for a, b in _runs(flags):
+        if out and a - out[-1][1] <= gap and b - out[-1][0] <= whole:
+            out[-1] = (out[-1][0], b)
+        else:
+            out.append((a, b))
     return out
 
 
@@ -109,9 +125,17 @@ class Sheet:
         tall = cv2.morphologyEx(self.u8, cv2.MORPH_OPEN,
                                 np.ones((2 * thick + 3, 1), np.uint8)).astype(bool)
         self.nolines = ink & ~(self.linemask & ~tall)
+        # a long flat stroke thinner than any beam is a line, not a mark on
+        # a stem: the edge of a boxed number, an ending bracket, the flat
+        # of a tie, a tuplet bracket
+        flat = cv2.morphologyEx(self.nolines.astype(np.uint8), cv2.MORPH_OPEN,
+                                np.ones((1, max(int(1.5 * il), 5)), np.uint8))
+        stout = cv2.morphologyEx(self.nolines.astype(np.uint8), cv2.MORPH_OPEN,
+                                 np.ones((max(int(round(0.27 * il)), 3), 1), np.uint8))
+        self.thinlines = (flat & (1 - stout)).astype(bool)
         # printed words are not beams: the marks at a stem tip are read
         # from a copy with every recognised word blanked
-        self.marksink = self.nolines.copy()
+        self.marksink = self.nolines & ~self.thinlines
         self.equals = []
         for w in root.iter("word"):
             b = w.find("bounds")
@@ -156,23 +180,35 @@ class Sheet:
         self.solid = cv2.morphologyEx(self.u8, cv2.MORPH_OPEN, k)
         n, _lab, stats, cents = cv2.connectedComponentsWithStats(self.solid)
         self.filled = []
+        single = []
         for i in range(1, n):
-            x, y, w, h, _a = stats[i]
+            x, y, w, h, area = stats[i]
             # the opening shaves a head by a pixel or two; a beam, a
             # barline block or a bold letter is far longer or taller
             if w > 1.7 * il or h > 1.25 * il:
-                # two heads a second apart fuse into one tall blob
-                if w <= 1.7 * il and h <= 2.3 * il:
+                # heads a third apart on one stem fuse into one tall blob:
+                # two, three or four of them, one interline each
+                if 0.9 * il <= w <= 1.7 * il and h <= 4.4 * il:
                     cx = float(cents[i][0])
-                    self.filled.append((cx, y + h * 0.27))
-                    self.filled.append((cx, y + h * 0.73))
+                    count = max(int(round(h / il)), 2)
+                    for k in range(count):
+                        self.filled.append((cx, y + h * (k + 0.5) / count))
                 continue
             cx, cy = float(cents[i][0]), float(cents[i][1])
             # a head is an island; a thick beam is the same blob going on
             row = self.nolines[int(cy), max(int(cx - 1.6 * il), 0):int(cx + 1.6 * il)]
             if max((b - a for a, b in _runs(row)), default=0) > 1.75 * il:
                 continue
-            self.filled.append((cx, cy))
+            single.append((cx, cy, float(area)))
+        # A notehead is as big as the chart's other noteheads. A solid blob
+        # well under that size is something else: the head of a grace note
+        # or of a metronome mark, the hook of a rest, the corner of a
+        # slanted beam, a roll slash, a block rest.
+        areas = sorted(a for _, _, a in single)
+        usual = areas[len(areas) // 2] if len(areas) >= 8 else 0.95 * il * il
+        self.head_area = min(max(usual, 0.8 * il * il), 1.25 * il * il)
+        self.small = [(cx, cy) for cx, cy, a in single if a < 0.76 * self.head_area]
+        self.filled += [(cx, cy) for cx, cy, a in single if a >= 0.76 * self.head_area]
 
     # -- cross heads --------------------------------------------------------
     def _crosses(self):
@@ -279,13 +315,28 @@ class Sheet:
         il = self.il
         h = max(int(1.9 * il), 5)
         v = cv2.morphologyEx(self.u8, cv2.MORPH_OPEN, np.ones((h, 1), np.uint8))
-        n, _lab, stats, _c = cv2.connectedComponentsWithStats(v)
+        # Where a stem runs along two or three stacked heads the upright
+        # ink is as wide as the heads: take the stroke where it is thin,
+        # then follow it through the heads to its end.
+        wide = cv2.morphologyEx(v, cv2.MORPH_OPEN,
+                                np.ones((1, int(0.4 * il) + 1), np.uint8))
+        n, _lab, stats, _c = cv2.connectedComponentsWithStats(v & (1 - wide))
         self.stems = []
+        reach = int(1.6 * il)
         for i in range(1, n):
             x, y, w, hh, _a = stats[i]
-            if w > 0.4 * il:
+            if w > 0.4 * il or hh < 1.2 * il:
                 continue
-            self.stems.append((x + (w - 1) / 2, float(y), float(y + hh)))
+            cx = x + (w - 1) / 2
+            col = v[:, max(int(round(cx)) - 1, 0):int(round(cx)) + 2].any(axis=1)
+            y0, y1 = int(y), int(y + hh)
+            while y0 > 0 and y - y0 < reach and col[y0 - 1]:
+                y0 -= 1
+            while y1 < len(col) and y1 - (y + hh) < reach and col[y1]:
+                y1 += 1
+            if y1 - y0 < h:
+                continue
+            self.stems.append((cx, float(y0), float(y1)))
 
     def _rests(self, root: ET.Element):
         self.voids = []
@@ -307,7 +358,9 @@ class Sheet:
                 continue
             self.rests.append((float(b.get("x")) + float(b.get("w")) / 2,
                                float(b.get("y")) + float(b.get("h")) / 2, n,
-                               float(b.get("x")) + float(b.get("w"))))
+                               float(b.get("x")) + float(b.get("w")),
+                               float(b.get("x")), float(b.get("y")),
+                               float(b.get("w")), float(b.get("h"))))
 
     # -- note value at a stem tip ---------------------------------------------
     def tip_marks(self, x: float, tip: float, toward: int, reach: float) -> tuple[int, int]:
@@ -325,7 +378,7 @@ class Sheet:
                 return []
             # a run cut off by the far edge of the window lies beyond the
             # stem's tip: an open/closed mark over the beam, not a beam
-            return [((a + b) / 2 + y0) for a, b in _runs(self.marksink[y0:y1, col])
+            return [((a + b) / 2 + y0) for a, b in _mended(self.marksink[y0:y1, col], 0.12 * il, 0.75 * il)
                     if 0.16 * il <= b - a <= 1.35 * il
                     and not (toward > 0 and a == 0) and not (toward < 0 and b == y1 - y0)
                     # a beam lies at the tip or inside it, never beyond
@@ -437,6 +490,24 @@ class Sheet:
         self._frames = out
         return out
 
+    def tempo_note(self, x: float, y: float, top: float, height: float = 0.0) -> bool:
+        """The little note of a metronome mark: it stands above the staff,
+        just left of an equals sign."""
+        il = self.il
+        return y < top and any(0 < ex - x < 4.5 * il and abs(ey - y) < 1.5 * il + height / 2
+                               for ex, ey in self.equals)
+
+    def hangs_from_line(self, x: float, y: float) -> bool:
+        """The upper end of an upright stroke meets a long thin line that
+        runs on to one side: an ending bracket or the frame of a box."""
+        il = self.il
+        ya, yb = max(int(y - 0.3 * il), 0), int(y + 0.3 * il) + 1
+        for a, b in ((x + 0.3 * il, x + 2.3 * il), (x - 2.3 * il, x - 0.3 * il)):
+            band = self.thinlines[ya:yb, max(int(a), 0):max(int(b), 0)]
+            if band.size and band.any(axis=0).mean() > 0.9:
+                return True
+        return False
+
     def in_time(self, x: float, y: float) -> bool:
         return any(tx - 2 <= x <= tx + tw + 2 and ty - 2 <= y <= ty + th + 2
                    for tx, ty, tw, th in self.timesigs)
@@ -478,9 +549,14 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
         return x0 + 0.2 * il <= x <= x1 - 0.1 * il and ylo <= y <= yhi
 
     def on_rest(x, y):
-        return any(abs(x - r[0]) < 0.7 * il and abs(y - r[1]) < 0.7 * il for r in sheet.rests)
+        # the hook of an eighth rest and the foot of a quarter rest are
+        # solid enough to pass for heads; they lie inside the rest's glyph
+        return any(abs(x - r[0]) < 0.7 * il and abs(y - r[1]) < 0.7 * il
+                   or r[4] - 0.25 * il <= x <= r[4] + r[6] + 0.25 * il
+                   and r[5] - 0.25 * il <= y <= r[5] + r[7] + 0.25 * il for r in sheet.rests)
 
-    heads = [(x, y, "normal") for x, y in sheet.filled if inside(x, y) and not on_rest(x, y)] \
+    heads = [(x, y, "normal") for x, y in sheet.filled if inside(x, y) and not on_rest(x, y)
+             and not sheet.tempo_note(x, y, top)] \
         + [(x, y, "x") for x, y in sheet.crosses if inside(x, y)] \
         + [(x, y, "void") for x, y in sheet.voids if inside(x, y)] \
         + [(x, y, "circled_x") for x, y in sheet.rings if inside(x, y)
@@ -500,8 +576,11 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
              and not (s[0] > x1 - 1.6 * il and abs(s[1] - top) < 0.35 * il
                       and abs(s[2] - top - 4 * il) < 0.35 * il)
              # the little note of a metronome mark ("note = 136")
-             and not any(0 < ex - s[0] < 4.5 * il and s[1] - 1.5 * il < ey < s[2] + 1.5 * il
-                         and s[2] < top for ex, ey in sheet.equals)]
+             and not (s[2] < top and sheet.tempo_note(s[0], (s[1] + s[2]) / 2, top, s[2] - s[1]))
+             # the upright stroke of a quarter rest
+             and not any(r[4] - 0.2 * il <= s[0] <= r[4] + r[6] + 0.2 * il
+                         and s[1] >= r[5] - 0.5 * il and s[2] <= r[5] + r[7] + 0.5 * il
+                         for r in sheet.rests)]
     # hang heads on stems
     chords: dict[int, list] = {}
     loose = []
@@ -523,6 +602,10 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
         members = chords.get(k, [])
         if members:
             continue
+        if sheet.hangs_from_line(sx, sy0):
+            # the hook of an ending bracket, the side of a box: a line
+            # hanging from a line is a stem only with a real head on it
+            continue
         sides = [-1, 1]
         for side in sides:
             # an up-stem carries its heads on the lower part, left side
@@ -542,7 +625,14 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
     for k, members in chords.items():
         sx, sy0, sy1 = stems[k]
         ys = [hy for _, hy, _ in members]
-        up = (sum(ys) / len(ys)) > (sy0 + sy1) / 2   # heads low on the stem
+        mid = (sy0 + sy1) / 2
+        # An up-stem leaves its head on the head's right and rises; a
+        # down-stem leaves on the left and falls. Each head votes with
+        # both its side and its end of the stem; a flag's curl, read as a
+        # cross at the far end, is on the wrong side to vote with it.
+        ups = sum(1 for hx, hy, _ in members if hx < sx and hy > mid)
+        downs = sum(1 for hx, hy, _ in members if hx > sx and hy < mid)
+        up = ups > downs if ups != downs else (sum(ys) / len(ys)) > mid
         tip = sy0 if up else sy1
         right_side = [m for m in members if (m[0] < sx) == up]
         if right_side and len(right_side) < len(members):
@@ -556,6 +646,9 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
         if through and len(through) < len(members):
             members = [m for m in members if m not in through]
             tremolo += len(through)
+        tremolo += sum(1 for bx, by in sheet.small
+                       if abs(bx - sx) < 0.3 * il and sy0 + 0.3 * il < by < sy1 - 0.3 * il
+                       and all(abs(by - hy) > 0.8 * il for _, hy, _ in members))
         value = {0: Fraction(4), 1: Fraction(2), 2: Fraction(1)}.get(marks, Fraction(1, 2))
         if any(k == "void" for _, _, k in members):
             value, tremolo, marks = Fraction(8), tremolo + marks, 0
@@ -564,15 +657,17 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
         events.append({"x": sx - (0.55 * il if up else -0.55 * il), "voice": 1 if up else 2,
                        "value": value, "heads": members, "marks": marks,
                        "tremolo": tremolo})
+    loose += [(bx, by, "block") for bx, by in sheet.small
+              if inside(bx, by) and not on_rest(bx, by) and sheet.block(bx, by)]
     for hx, hy, kind in loose:
-        if kind == "normal" and sheet.block(hx, hy):
+        if kind == "block" or kind == "normal" and sheet.block(hx, hy):
             # a half or whole rest printed off the staff for one voice
             events.append({"x": hx, "voice": 2 if hy > top + 2 * il else 1,
                            "value": Fraction(8), "rest": True, "y": hy})
             continue
         events.append({"x": hx, "voice": 0, "value": None,
                        "heads": [(hx, hy, kind)], "marks": None})
-    for rx, ry, n, edge in sheet.rests:
+    for rx, ry, n, edge, *_box in sheet.rests:
         if x0 <= rx <= x1 and top - 3 * il <= ry <= top + 7 * il:
             value = Fraction(n).limit_denominator(4)
             if sheet.dotted(rx, ry - 0.4 * il, edge) or sheet.dotted(rx, ry + 0.2 * il, edge):
