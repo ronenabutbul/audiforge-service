@@ -1181,11 +1181,19 @@ def _roll_slashes(sheet, events: list[dict], il: float) -> None:
         up = tip < min(ys)
         lo, hi = (tip + 0.5 * il, min(ys) - 0.7 * il) if up else (max(ys) + 0.7 * il, tip - 0.5 * il)
         rows = 0
-        for y in range(int(lo), int(hi) + 1):
+        # the beams come first: the slash is looked for past the paper
+        # that follows them
+        step = 1 if up else -1
+        ys = list(range(int(tip), int(hi) + step, step)) if up else list(range(int(tip), int(lo) - 1, -1))
+        past = False
+        for y in ys:
             if not 0 <= y < sheet.ink.shape[0]:
                 continue
             left = sheet.nolines[y, int(sx - 0.7 * il):int(sx - 0.15 * il)].sum()
             right = sheet.nolines[y, int(sx + 0.15 * il):int(sx + 0.7 * il)].sum()
+            if not past:
+                past = left == 0 and right == 0
+                continue
             rows += left >= 0.2 * il and right >= 0.1 * il
         if rows >= 0.3 * il:
             e["tremolo"] = e.get("tremolo", 0) + 1
