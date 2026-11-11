@@ -364,6 +364,17 @@ def _strokes(sheet: _Sheet, staff, x_lo: int, x_hi: int) -> list[tuple[int, int]
 HEAVY_STROKE_IL = 0.3  # a thin barline is 0.15 to 0.25 interlines wide
 
 
+def _third_dot(pool, pair, x: float, top: float, bottom: float, il: float) -> bool:
+    """A repeat sign has exactly two dots, in the two middle spaces. A
+    dotted chord whose notes fill the staff has its dots in a column
+    too, and its stacked heads make a stroke as dark as a heavy barline;
+    a further dot in the same column, in another space of the staff,
+    gives it away."""
+    return any(k not in pair and abs(d[0] - x) < 0.3 * il
+               and top - 0.6 * il < d[1] < bottom + 0.6 * il
+               for k, (d, _) in enumerate(pool))
+
+
 def _repeat_signs(sheet: _Sheet) -> list[Mark]:
     """Repeat barlines, from their dots. Two dots, one above the other in
     the two middle spaces, with a barline within reach on one side only:
@@ -405,6 +416,8 @@ def _repeat_signs(sheet: _Sheet) -> list[Mark]:
                     x, y = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
                     top, bottom = _staff_at(staff, x)
                     if abs(y - (top + bottom) / 2) > 0.35 * il:
+                        continue
+                    if _third_dot(pool, (i, j), x, top, bottom, il):
                         continue
                     reach = int(2.6 * il)
                     strokes = _strokes(sheet, staff, int(x) - reach, int(x) + reach)
@@ -1244,10 +1257,90 @@ def place(omr_path: Path, result_path: Path, hbars: list[dict] | None = None,
     parts = tree.getroot().findall("part")
     if not parts:
         return 0
-    measures = parts[0].findall("measure")
-    by_number = _measure_index_by_number(measures)
+    by_number = _measure_index_by_number(parts[0].findall("measure"))
     bar = [by_number.get(n) if n is not None else None for n in located]
+    return _write(tree, result_path, marks, bar)
 
+
+def _map_systems(measure_map: list[dict]) -> dict[str, list[list[dict]]]:
+    """The map's measures grouped by sheet name, then by system."""
+    systems: dict[str, dict[int, list[dict]]] = {}
+    for m in measure_map:
+        systems.setdefault(m["sheet_name"], {}).setdefault(m["system"], []).append(m)
+    return {name: [sorted(bars, key=lambda b: b["x0"]) for _, bars in sorted(rows.items())]
+            for name, rows in systems.items()}
+
+
+def _map_system_of(rows: list[list[dict]], y: float, above_only: bool) -> list[dict] | None:
+    """The system a mark at height y belongs to, judged as
+    `_Sheet.system_of` judges it: the nearest, ink under a system counting
+    half again as far, a bracket only over its own staff."""
+    best = None
+    for bars in rows:
+        top, bottom, il = bars[0]["y_top"], bars[0]["y_bottom"], bars[0]["interline"]
+        if y > bottom and above_only:
+            continue
+        gap = top - y if y < top else 1.5 * (y - bottom) if y > bottom else 0
+        if gap > 9 * il:
+            continue
+        if best is None or gap < best[0]:
+            best = (gap, bars)
+    return None if best is None else best[1]
+
+
+def _map_bar(bars: list[dict], kind: str, x: float, y: float) -> int:
+    """Index in the score of the bar a mark at (x, y) names, with the
+    same rule per kind as `_BAR_OF` gives `_locate_marks`."""
+    containing, slack = _BAR_OF[kind]
+
+    def left(b):  # the barline leans: where it stands at the mark's height
+        return b["x0"] + b["lean"] * (y - b["y0"])
+    if containing:
+        before = [b for b in bars if left(b) <= x + slack * b["interline"]]
+        return (before[-1] if before else bars[0])["index"]
+    return min(bars, key=lambda b: abs(left(b) - x))["index"]
+
+
+def place_on_score(omr_path: Path, result_path: Path, measure_map: list[dict],
+                   marks: list[Mark] | None = None) -> int:
+    """Write the page's road map into a score whose measures are listed,
+    one per printed bar with its pixel box, in `measure_map` (the
+    full-score reader's `.measures.json`): measure i of every part is
+    entry i. Repeats and endings go on the barlines of every part, signs
+    and jumps above the top part. A repeat the map itself saw (its
+    `repeat_forward_at_left` / `repeat_backward_at_right`) is written too
+    when the dots were missed here. Returns marks written."""
+    omr_path, result_path = Path(omr_path), Path(result_path)
+    if marks is None:
+        marks = detect(omr_path)
+    with zipfile.ZipFile(omr_path) as z:
+        names = sorted({n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+                       key=lambda s: int(s.split("#")[1]))
+    systems = _map_systems(measure_map)
+    bar: list[int | None] = []
+    for m in marks:
+        rows = systems.get(names[m.sheet]) if m.sheet < len(names) else None
+        bars = rows and _map_system_of(rows, m.y, m.kind in _BRACKET_ENDS)
+        bar.append(_map_bar(bars, m.kind, m.x, m.y) if bars and m.kind in _BAR_OF else None)
+    marks, bar = list(marks), list(bar)
+    for entry in measure_map:
+        for flag, kind in (("repeat_forward_at_left", REPEAT_START),
+                           ("repeat_backward_at_right", REPEAT_END)):
+            if entry.get(flag) and not any(
+                    b == entry["index"] and m.kind == kind for m, b in zip(marks, bar)):
+                sheet = names.index(entry["sheet_name"]) if entry["sheet_name"] in names else 0
+                marks.append(Mark(sheet, int(entry["x0"]), int(entry["y_top"]), kind))
+                bar.append(entry["index"])
+    return _write(ET.parse(result_path), result_path, marks, bar)
+
+
+def _write(tree, result_path: Path, marks: list[Mark], bar: list[int | None]) -> int:
+    """Write `marks` into the score, each at the measure index in `bar`
+    (None: not placed), after taking out whatever road map it had."""
+    parts = tree.getroot().findall("part")
+    if not parts:
+        return 0
+    measures = parts[0].findall("measure")
     kinds = {m.kind for m in marks}
     for part in parts:
         _clear(part, kinds)
