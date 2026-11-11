@@ -238,9 +238,14 @@ def calibrate(readings: list["BarReading"]) -> dict:
         # Take the busiest lines by COUNT, then order them by height: a
         # sparse stray line above the groove must not steal the hi-hat slot,
         # which is what demoted Adele's hi-hat to ride.
-        busiest = [s for s, _ in sorted(x_steps.items(),
+        # An x at or under the bottom line is the hi-hat pedal (the foot's
+        # line, beside the kick): however often it is struck it is never
+        # the hands' timekeeper.
+        hands = {s: n for s, n in x_steps.items() if s < 6}
+        total_hands = sum(hands.values())
+        busiest = [s for s, _ in sorted(hands.items(),
                                         key=lambda kv: -kv[1])
-                   if x_steps[s] >= 0.20 * total_x][:2]
+                   if hands[s] >= 0.20 * total_hands][:2]
         main = sorted(busiest)
         for step in x_steps:
             if not main:

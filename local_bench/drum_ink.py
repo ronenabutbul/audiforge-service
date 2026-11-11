@@ -1683,7 +1683,7 @@ def staff_words(sheet: "Sheet") -> list[tuple[float, float, float, str]]:
 # "F.T."): the word, not the head's shape, says which drum
 # a line means. Compared as letters only, lower case. Tesseract reads an
 # italic F as E ("E.T." for "F.T."), so both spellings are kept. "Stick",
-# "Brushes", "Stick/stick" say how to play, not what, and are not here.
+# "Brushes" say how to play, not what, and are not here.
 _LABELS = {
     "hh": "hh_closed", "hihat": "hh_closed", "hithat": "hh_closed",
     "hhped": "hh_pedal", "hhpedal": "hh_pedal", "hhpd": "hh_pedal",
@@ -1693,6 +1693,9 @@ _LABELS = {
     "ht": "tom_high", "hightom": "tom_high", "mt": "tom_mid", "midtom": "tom_mid",
     "lt": "tom_low", "lowtom": "tom_low",
     "ft": "tom_floor", "et": "tom_floor", "floortom": "tom_floor",
+    # stick laid on stick (or on the rim): the nearest the kit has is the
+    # side stick. "Stick" alone only says sticks, not brushes.
+    "stickstick": "rim", "stickonstick": "rim",
 }
 
 
@@ -1708,18 +1711,36 @@ def kit_labels(sheet: "Sheet") -> list[tuple[float, float, str, bool]]:
     from PIL import Image
     il = sheet.il
     out = []
+
+    def read(x, y, w, h):
+        pad = int(0.5 * il)
+        crop = sheet.nolines[max(y - pad, 0):y + h + pad, max(x - pad, 0):x + w + pad]
+        img = Image.fromarray(((1 - crop.astype(np.uint8)) * 255).astype(np.uint8))
+        scale = 48 / max(h, 1)
+        img = img.resize((max(int(img.width * scale), 1), max(int(img.height * scale), 1)),
+                         Image.LANCZOS)
+        text = ocr(img, False, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ./")
+        return _LABELS.get("".join(c for c in text.lower() if c.isalpha()))
+
     for band, above in (((-6.0, -0.4), True), ((4.4, 8.0), False)):
-        for x, y, w, h in staff_text_runs(sheet, band, 1.9):
-            if w > 10 * il:
+        runs = sorted(r for r in staff_text_runs(sheet, band, 1.9) if r[2] <= 10 * il)
+        used = set()
+        for k, (x, y, w, h) in enumerate(runs):
+            if k in used:
                 continue
-            pad = int(0.5 * il)
-            crop = sheet.nolines[max(y - pad, 0):y + h + pad, max(x - pad, 0):x + w + pad]
-            img = Image.fromarray(((1 - crop.astype(np.uint8)) * 255).astype(np.uint8))
-            scale = 48 / max(h, 1)
-            img = img.resize((max(int(img.width * scale), 1), max(int(img.height * scale), 1)),
-                             Image.LANCZOS)
-            text = ocr(img, False, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ./")
-            inst = _LABELS.get("".join(c for c in text.lower() if c.isalpha()))
+            # a slash or a wide space splits one label into two runs
+            # ("Stick/stick"): two runs on one baseline close together
+            # are read as one first
+            if k + 1 < len(runs):
+                x2, y2, w2, h2 = runs[k + 1]
+                if 0 <= x2 - (x + w) < 1.5 * il and abs((y + h) - (y2 + h2)) < 0.5 * il:
+                    ya, yb = min(y, y2), max(y + h, y2 + h2)
+                    inst = read(x, ya, x2 + w2 - x, yb - ya)
+                    if inst:
+                        out.append((float(x), (ya + yb) / 2, inst, above))
+                        used.add(k + 1)
+                        continue
+            inst = read(x, y, w, h)
             if inst:
                 out.append((float(x), y + h / 2, inst, above))
     return out
@@ -1744,7 +1765,8 @@ def apply_kit_labels(chart: list[dict], labels: dict[str, list]) -> None:
       drum, until the
       next label or the end of the following bar; after the fill the
       cymbal names hold again.
-    The snare line is never renamed by a label. On a chart of plain ovals
+    The snare's plain heads are never renamed by a label (crosses on its
+    line under "Stick/stick" are). On a chart of plain ovals
     the label is the only word on the instrument and holds until the next
     one; over x heads it names the passage it is printed over and lapses
     once that line falls silent for a bar."""
@@ -1755,7 +1777,9 @@ def apply_kit_labels(chart: list[dict], labels: dict[str, list]) -> None:
     snare = {s for s, row in STEP_MAP.items() if row.get("normal") == "snare"}
     down = Counter(st["step"] for b in chart for st in b["strikes"] if st.get("voice") == 2)
     kick = down.most_common(1)[0][0] if down else None
-    cymbal_family = {"hh_closed", "hh_open", "hh_pedal", "ride", "ride_bell", "crash"}
+    # labels that name a line (the cymbals, and a stick click written as
+    # crosses), as against the drums of a fill
+    cymbal_family = {"hh_closed", "hh_open", "hh_pedal", "ride", "ride_bell", "crash", "rim"}
     claims = []         # (bar index, x where it starts, instrument, line or None)
     for i, b in enumerate(chart):
         bar = b["bar"]
@@ -1777,7 +1801,8 @@ def apply_kit_labels(chart: list[dict], labels: dict[str, list]) -> None:
                     if chart[k]["sheet"] == b["sheet"] and chart[k]["bar"]["top"] == top
                     for st in chart[k]["strikes"] if not st.get("grace")
                     and start <= st.get("x", 0) <= x + 5 * il
-                    and st["step"] not in snare and st["step"] != kick
+                    and not (st["step"] in snare and _oval(st["kind"]) == "normal")
+                    and st["step"] != kick
                     and (above or st["step"] > 4)]
             if not near:
                 continue
@@ -1811,7 +1836,7 @@ def apply_kit_labels(chart: list[dict], labels: dict[str, list]) -> None:
                     heard[line] = claims[ci][0]
                     fill = None
                 ci += 1
-            if st.get("grace") or st["step"] in snare:
+            if st.get("grace") or st["step"] in snare and _oval(st["kind"]) == "normal":
                 continue
             line = (st["step"], _oval(st["kind"]))
             if line in named:
