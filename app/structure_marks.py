@@ -442,6 +442,9 @@ def _repeat_signs(sheet: _Sheet) -> list[Mark]:
 ENDING_MIN_IL = 3.5        # shortest bracket line; a rehearsal box is narrower
 ENDING_LINE_MAX_IL = 0.36  # thicker is a beam
 ENDING_LEG_MIN_IL = 0.7
+# A bracket carried over a system break resumes after the clef and key
+# signature (a clef is ~3 interlines, seven sharps ~7), not at the margin.
+ENDING_RESUME_IL = 10.0
 
 
 def _level_lines(sheet: _Sheet, system: _System, above_limit: float) -> list[dict]:
@@ -626,7 +629,44 @@ def _ending_number(sheet: _Sheet, words, x: int, y: int, floor: float, il: float
             return None
         text = max(votes.items(), key=lambda kv: kv[1])[0]
     numbers = [d for d in re.findall(r"\d", text) if d != "0"]
-    return ", ".join(numbers) if numbers and len(numbers) <= 4 else None
+    # an ending is taken on passes counted up from one: "1", "2", "1, 2",
+    # "3"; digits that repeat or run backwards are a misreading
+    if not numbers or len(numbers) > 4 \
+            or any(int(b) <= int(a) for a, b in zip(numbers, numbers[1:])):
+        return None
+    return ", ".join(numbers)
+
+
+def _closed_below(sheet: _Sheet, line: dict, hooks, il: float) -> bool:
+    """A rehearsal box: hooks at both ends whose feet are joined by a
+    floor. Its floor is often lost as a line of its own where a beam or
+    a stem below touches it, so it is looked for in the ink at the feet."""
+    ends = [(h, n) for h, n in hooks
+            if h - line["x0"] <= 0.4 * il or line["x1"] - h <= 0.4 * il]
+    if len(ends) < 2:
+        return False
+    # The legs need not match: one can run on into ink below the box.
+    nl, nr = ends[0][1], ends[-1][1]
+    ink = sheet.ink
+    a, b = int(line["x0"] + 0.3 * il), int(line["x1"] - 0.3 * il)
+    if b - a < il:
+        return False
+    reach = max(2, int(0.6 * il))
+    lo, hi = int(line["x0"]) - reach, int(line["x1"]) + reach
+    if lo < 0 or hi > ink.shape[1]:
+        return False
+    for foot in (nl, nr):
+        for dy in range(-2, 3):
+            y = int(round(_line_y(line, (a + b) / 2) + foot + dy))
+            if not 0 <= y < ink.shape[0] or ink[y, a:b].mean() < 0.85:
+                continue
+            # a floor stops at the box's corners; a staff line that a
+            # bracket's legs reach down to runs on past them
+            band = ink[max(0, y - 2):y + 3]
+            if not band[:, lo:lo + reach - 2].any() \
+                    or not band[:, hi - reach + 2:hi].any():
+                return True
+    return False
 
 
 def _endings(sheet: _Sheet, words) -> list[dict]:
@@ -650,6 +690,8 @@ def _endings(sheet: _Sheet, words) -> list[dict]:
                    and abs(o["y0"] - line["y0"]) < 5 * il for j, o in enumerate(lines)):
                 continue
             hooks = _hooks(sheet, line, il)
+            if _closed_below(sheet, line, hooks, il):
+                continue
             ends = [n for h, n in hooks
                     if h - line["x0"] <= 0.4 * il or line["x1"] - h <= 0.4 * il]
             left = any(h - line["x0"] <= 0.4 * il for h, _n in hooks)
@@ -689,10 +731,17 @@ def _ending_marks(sheets: list[_Sheet], per_sheet: list[list[dict]]) -> list[Mar
             if b["left"]:
                 number = b["number"]
                 previous = open_bracket
-                if number is None and previous is not None and previous["sheet"] == sheet.index \
-                        and previous["system"] == b["system"] \
-                        and abs(previous["x1"] - b["x0"]) < 1.5 * il \
-                        and abs(previous["y"] - b["y"]) < il:
+                if number is None and previous is not None and (
+                        previous["sheet"] == sheet.index
+                        and previous["system"] == b["system"]
+                        and abs(previous["x1"] - b["x0"]) < 1.5 * il
+                        and abs(previous["y"] - b["y"]) < il
+                        # or closed at its system's end, this one opening
+                        # the next system
+                        or previous["right"]
+                        and previous["x1"] >= previous["edge"] - 2 * previous["il"]
+                        and b["x0"] <= system.x0 + ENDING_RESUME_IL * il
+                        and _next_system(sheets, previous) == (sheet.index, b["system"])):
                     last = max(int(n) for n in previous["number"].split(", "))
                     number = str(last + 1)
                 if number is None:
@@ -704,7 +753,7 @@ def _ending_marks(sheets: list[_Sheet], per_sheet: list[list[dict]]) -> list[Mar
                                 "edge": system.x1, "il": il}
             elif (open_bracket is not None and not open_bracket["right"]
                   and open_bracket["x1"] >= open_bracket["edge"] - 2 * open_bracket["il"]
-                  and b["x0"] <= system.x0 + 2 * il
+                  and b["x0"] <= system.x0 + ENDING_RESUME_IL * il
                   and _next_system(sheets, open_bracket) == (sheet.index, b["system"])):
                 number = open_bracket["number"]
                 marks.pop()  # the open end at the system break
@@ -786,7 +835,7 @@ def _read_phrase(phrase: dict) -> str | None:
     "to coda", "coda" (a coda mark whose side is settled later), "fine",
     "segno", "times:N", or None when it says something else."""
     raw = " ".join(phrase["texts"])
-    letters = re.sub(r"[^a-z]", "", raw.lower().replace("$", "s").replace("5", "s")
+    letters = re.sub(r"[^a-z]", "", raw.lower().replace("$", "s").replace("5", "s").replace("8", "s")
                      .replace("0", "o"))
     kinds = [sign[0] for sign in phrase["signs"]]
     has_coda_sign = CODA in kinds
@@ -823,6 +872,12 @@ def _read_phrase(phrase: dict) -> str | None:
         return CODA
     if _close(letters, "fine") and re.fullmatch(r"\W*[Ff][A-Za-z]{2,4}\W*", raw.strip()):
         return FINE
+    if SEGNO in kinds and not has_coda_sign \
+            and all(len(re.sub(r"\W", "", t)) <= 3 for t in phrase["texts"]):
+        # the segno's shape (S, slash, two dots) is proof enough; a short
+        # word beside it that says nothing of the road map (a boxed
+        # letter, a bar number) does not unmake it
+        return SEGNO
     return None
 
 
@@ -953,7 +1008,9 @@ def _attach_times(sheets: list[_Sheet], marks: list[Mark]) -> list[Mark]:
 # anchor (`_acts_at`) lies in.
 _BAR_OF = {
     REPEAT_START: (True, 1.0), REPEAT_END: (True, -1.0),
-    ENDING_START: (True, 1.5), ENDING_STOP: (True, -1.0), ENDING_OPEN: (True, -1.0),
+    # an open bracket's line often runs on past its last barline; a bar
+    # is never as narrow as the two interlines allowed for that
+    ENDING_START: (True, 1.5), ENDING_STOP: (True, -1.0), ENDING_OPEN: (True, -2.0),
     SEGNO: (False, 0.0), CODA: (False, 0.0),
     TO_CODA: (True, 0.0), FINE: (True, 0.0),
     **{jump: (True, 0.0) for jump in JUMPS},
@@ -1026,6 +1083,14 @@ def measure_numbers(omr_path: Path, hbars: list[dict], marks: list[Mark],
                                        numbers=stack_numbers_):
             if found[i] is None:
                 found[i] = number
+    # A mark read at a bar's end that stands on a multi-bar rest acts
+    # after the whole rest: on its last bar, not the first.
+    starts = stack_numbers_ or stack_numbers(omr_path, hbars) or []
+    counts = {starts[h["stack"]]: h["count"] for h in hbars
+              if h.get("read") and h["count"] > 1 and h["stack"] < len(starts)}
+    for i, m in enumerate(marks):
+        if found[i] in counts and m.kind in _AT_BAR_END:
+            found[i] += counts[found[i]] - 1
     return found
 
 
@@ -1070,6 +1135,11 @@ def _clear(part, kinds: set[str]) -> None:
                     direction.remove(sound)
             if direction.find("direction-type") is None:
                 measure.remove(direction)
+        for sound in list(measure.findall("sound")):
+            for k in _SOUND_KEYS:
+                sound.attrib.pop(k, None)
+            if not sound.attrib and len(sound) == 0:
+                measure.remove(sound)
 
 
 def _barline(measure, location: str):
@@ -1114,26 +1184,44 @@ def _set_barline(measure, location: str, repeat: dict | None = None,
             barline.append(element)
 
 
+def _jump_sound(kind: str) -> dict[str, str]:
+    """The <sound> attributes that make a player act on a jump."""
+    if kind == TO_CODA:
+        return {"tocoda": "coda"}
+    if kind == FINE:
+        return {"fine": "yes"}
+    if kind.startswith("ds"):
+        return {"dalsegno": "segno"}
+    return {"dacapo": "yes"}
+
+
 def _direction(kind: str):
-    """The <direction> that prints a sign or a jump and tells a player
-    what it does."""
+    """The <direction> that prints a sign or a jump. Signs and To Coda /
+    Fine carry their <sound> inside, with matching ids (segno="segno" is
+    what dalsegno="segno" goes back to, coda="coda" what tocoda="coda"
+    goes on to). A D.S. or D.C. gets its <sound> from `place` as a
+    measure-level sibling instead: MuseScore reads "al Coda" / "al Fine"
+    from the words only when the direction has no sound of its own, and
+    the sound inside would make it a plain jump that plays to the end."""
     direction = ET.Element("direction", placement="above")
     dtype = ET.SubElement(direction, "direction-type")
     if kind in (SEGNO, CODA):
         ET.SubElement(dtype, kind)
         ET.SubElement(direction, "sound", {kind: kind})
         return direction
-    ET.SubElement(dtype, "words", {"font-weight": "bold"}).text = JUMP_WORDS[kind]
-    if kind == TO_CODA:
-        attrs = {"tocoda": "coda"}
-    elif kind == FINE:
-        attrs = {"fine": "yes"}
-    elif kind.startswith("ds"):
-        attrs = {"dalsegno": "segno"}
-    else:
-        attrs = {"dacapo": "yes"}
-    ET.SubElement(direction, "sound", attrs)
+    # No font-weight: MuseScore keeps it as <b> markup inside the jump's
+    # text and its own export then writes the tags out as literal words.
+    ET.SubElement(dtype, "words", {"justify": "right"}).text = JUMP_WORDS[kind]
+    if not _sound_apart(kind):
+        ET.SubElement(direction, "sound", _jump_sound(kind))
     return direction
+
+
+def _sound_apart(kind: str) -> bool:
+    return kind in JUMP_WORDS and (kind.startswith("ds") or kind.startswith("dc"))
+
+
+_AT_BAR_END = {REPEAT_END, ENDING_STOP, ENDING_OPEN, TO_CODA, FINE, *JUMPS}
 
 
 def place(omr_path: Path, result_path: Path, hbars: list[dict] | None = None,
@@ -1217,12 +1305,18 @@ def place(omr_path: Path, result_path: Path, hbars: list[dict] | None = None,
                     children[at].tag in ("print", "attributes")
                     or (children[at].tag == "barline" and children[at].get("location") == "left")):
                 at += 1
-        else:  # a jump is read at the end of its bar
+        else:
+            # A jump is read at the end of its bar: after the notes, so
+            # its time is the closing barline. MuseScore snaps a To Coda
+            # or D.S. to the nearest barline, so one written before a
+            # bar's only note would land on the bar before.
             at = len(children)
             while at and children[at - 1].tag == "barline" \
                     and children[at - 1].get("location", "right") == "right":
                 at -= 1
         measure.insert(at, _direction(m.kind))
+        if _sound_apart(m.kind):
+            measure.insert(at + 1, ET.Element("sound", _jump_sound(m.kind)))
         placed += 1
     tree.write(result_path, encoding="UTF-8", xml_declaration=True)
     return placed
