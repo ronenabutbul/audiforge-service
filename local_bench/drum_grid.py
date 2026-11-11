@@ -1847,16 +1847,28 @@ def main():
               f"bars instead", flush=True)
     # The printed system numbers are the checksum: where they say a system
     # covered more measures than it printed bars, believe them.
-    from_anchors = anchor_spans(omr, len(crops))
-    for stack, span in from_anchors.items():
-        if rest_counts.get(stack, 1) < span:
-            rest_counts[stack] = span
-    if from_anchors:
-        print(f"  {len(from_anchors)} multirest spans recovered from printed "
-              f"measure numbers", flush=True)
+    if "--ink" not in sys.argv:
+        from_anchors = anchor_spans(omr, len(crops))
+        for stack, span in from_anchors.items():
+            if rest_counts.get(stack, 1) < span:
+                rest_counts[stack] = span
+        if from_anchors:
+            print(f"  {len(from_anchors)} multirest spans recovered from printed "
+                  f"measure numbers", flush=True)
     absorbed = {h["stack"] + k for h in hbars
                 for k in range(1, h.get("span", 1))}
     crops = [c for c in crops if c["stack"] not in absorbed]
+    if "--ink" in sys.argv:
+        from drum_ink import spans_from_numbers, system_numbers
+        before = dict(rest_counts)
+        rest_counts = spans_from_numbers(
+            system_numbers(omr), crops, rest_counts,
+            {h["stack"] for h in hbars}, bool(crops and crops[0].get("pickup")))
+        changed = {k: (before.get(k), v) for k, v in rest_counts.items()
+                   if before.get(k) != v}
+        if changed:
+            print(f"  multirests corrected by the printed numbers: {changed}",
+                  flush=True)
     total_measures = sum(rest_counts.get(c["stack"], 1) for c in crops)
     print(f"{len(crops)} printed bars = {total_measures} measures "
           f"({len(rest_counts)} multirests)", flush=True)
@@ -1868,7 +1880,15 @@ def main():
     # Multirest bars need no reading — they are rests by definition.
     to_read = crops
     raw_cache = out.with_suffix(".readings.json")
-    if "--recalibrate" in sys.argv and raw_cache.exists():
+    if "--ink" in sys.argv:
+        from drum_ink import ink_readings
+        readings, unsure = ink_readings(crops, omr, rest_counts)
+        print(f"read {len(readings)} bars from the ink alone; "
+              f"{len(unsure)} did not add up: {unsure[:20]}", flush=True)
+        transcribe_gemini.last_readings = readings
+        step_map = calibrate(readings)
+        read_grids = [reading_to_grid(r, step_map) for r in readings]
+    elif "--recalibrate" in sys.argv and raw_cache.exists():
         readings = [BarReading.model_validate(r)
                     for r in json.loads(raw_cache.read_text())]
         if "--snap" in sys.argv:
@@ -1922,7 +1942,10 @@ def main():
         else:
             print("  --verify skipped: no readings aligned to crops",
                   flush=True)
-    if raw and len(raw) == len(grids):
+    if "--ink" in sys.argv:
+        rest_bars = {i: rest_counts[c["stack"]] for i, c in enumerate(crops)
+                     if c["stack"] in rest_counts}
+    elif raw and len(raw) == len(grids):
         rest_bars = {i: n for i, n in spans_from_readings(raw).items()
                      if n > 1}
     else:
@@ -1941,7 +1964,7 @@ def main():
         tempos = {i: r.tempo_bpm for i, r in enumerate(raw)
                   if getattr(r, "tempo_bpm", None)
                   and 40 <= r.tempo_bpm <= 240}
-        if 0 not in tempos:
+        if 0 not in tempos and "--ink" not in sys.argv:
             start = read_start_tempo(omr)
             if start:
                 tempos[0] = start
