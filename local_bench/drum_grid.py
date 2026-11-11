@@ -2075,6 +2075,69 @@ def place_words(omr_path: Path, out: Path, crops: list[dict],
     return placed
 
 
+def place_breaks(omr_path: Path, out: Path, crops: list[dict],
+                 rest_bars: dict[int, int]) -> tuple[int, int]:
+    """Break lines and pages where the page does, so the render can be laid
+    beside the original bar for bar: `<print new-system="yes"/>` on the
+    first measure of every system after the first, `new-page` on the first
+    measure of every sheet after the first. A system starts at its first
+    stack; the measure is that of the first bar read at or after it (a
+    multirest is one printed bar: its first measure; a sliver or a bar
+    absorbed into a multirest gives way to the next bar of the system).
+    Returns (system breaks, page breaks)."""
+    import zipfile as _zipfile
+    starts: list[tuple[int, int, bool]] = []    # (first stack, end stack, new page)
+    ordinal = 0
+    with _zipfile.ZipFile(omr_path) as z:
+        sheets = sorted(
+            {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+            key=lambda s: int(s.split("#")[1]))
+        for si, sheet in enumerate(sheets):
+            root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml").decode("utf-8", "replace"))
+            first_on_sheet = True
+            for system in root.iter("system"):
+                staff = system.find(".//staff")
+                if staff is None or len(staff.findall("lines/line")) < 2:
+                    continue
+                n = len(system.findall("stack"))
+                if n:
+                    starts.append((ordinal, ordinal + n, si > 0 and first_on_sheet))
+                    first_on_sheet = False
+                ordinal += n
+    measure_of: dict[int, int] = {}
+    measure = 0 if crops and crops[0].get("pickup") else 1
+    order = []
+    for i, crop in enumerate(crops):
+        order.append((crop["stack"], measure))
+        measure += rest_bars.get(i, 1)
+    tree = ET.parse(out)
+    part = tree.getroot().find("part")
+    measures = part.findall("measure")
+    for m in measures:
+        for pr in list(m.findall("print")):
+            pr.attrib.pop("new-system", None)
+            pr.attrib.pop("new-page", None)
+            if not pr.attrib and not len(pr):
+                m.remove(pr)
+    by_number = {m.get("number"): m for m in measures}
+    systems = pages = 0
+    for k, (a, b, page) in enumerate(starts):
+        if k == 0:
+            continue
+        number = next((num for stack, num in order if a <= stack < b), None)
+        m = by_number.get(str(number)) if number is not None else None
+        if m is None or m is measures[0]:
+            continue
+        pr = ET.Element("print", {"new-page" if page else "new-system": "yes"})
+        m.insert(0, pr)
+        if page:
+            pages += 1
+        else:
+            systems += 1
+    tree.write(out, encoding="UTF-8", xml_declaration=True)
+    return systems, pages
+
+
 def place_fermatas(omr_path: Path, out: Path, crops: list[dict],
                    rest_bars: dict[int, int]) -> int:
     """A fermata over a rest or note, where the page prints one."""
@@ -2397,6 +2460,8 @@ def main():
                     ink_marks if "--ink" in sys.argv else None)
     words = place_words(omr, out, crops, rest_bars)
     fermatas = place_fermatas(omr, out, crops, rest_bars)
+    breaks = place_breaks(omr, out, crops, rest_bars)
+    print(f"  line breaks as printed: {breaks[0]} systems, {breaks[1]} pages", flush=True)
     if fermatas:
         print(f"  {fermatas} fermatas placed", flush=True)
     if words:
