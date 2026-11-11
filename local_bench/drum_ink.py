@@ -108,7 +108,7 @@ def _sign_shape(mask: np.ndarray, il: float) -> str | None:
     if hole.sum() >= 0.1 * mask.size:
         # "o": a small round ring, its hole in the middle
         hy, hx = np.nonzero(hole)
-        if w <= 1.0 * il and h <= 1.0 * il and abs(w - h) <= 0.25 * il \
+        if w <= 1.2 * il and h <= 1.2 * il and abs(w - h) <= 0.25 * il \
                 and abs(hx.mean() - (w - 1) / 2) <= 0.1 * w and abs(hy.mean() - (h - 1) / 2) <= 0.1 * h:
             return "open"
         return None
@@ -303,27 +303,39 @@ class Sheet:
         # as "thin". Then the shape decides: ink along both diagonals,
         # paper straight above, below, left and right of the centre.
         raw = self.nolines.astype(np.float32)
-        q1 = cv2.filter2D(raw, -1, back / L) >= 0.8
-        q2 = cv2.filter2D(raw, -1, np.fliplr(back) / L) >= 0.8
         off = max(int(round(0.34 * il)), 3)
         paper = np.ones_like(self.ink)
         blur = cv2.blur(raw, (3, 3))
         for dy, dx in ((off, 0), (-off, 0), (0, off), (0, -off)):
             paper &= np.roll(blur, (-dy, -dx), axis=(0, 1)) < 0.35
-        heavy = cv2.dilate(q1.astype(np.uint8), d) & cv2.dilate(q2.astype(np.uint8), d) \
-            & paper.astype(np.uint8)
-        both = both | heavy
-        n, _lab, stats, cents = cv2.connectedComponentsWithStats(both)
+
+        def heavy(ink):
+            q1 = cv2.filter2D(ink, -1, back / L) >= 0.8
+            q2 = cv2.filter2D(ink, -1, np.fliplr(back) / L) >= 0.8
+            return cv2.dilate(q1.astype(np.uint8), d) & cv2.dilate(q2.astype(np.uint8), d) \
+                & paper.astype(np.uint8)
+        both = both | heavy(raw)
+        # a heavy cross centred ON a staff line loses its middle when the
+        # line is taken out: look again with the line kept (a line crosses
+        # a diagonal in one point only), where nothing was found yet
+        # (keeping the lines pulls an off-line cross's centre toward them)
+        taken = cv2.dilate(both, np.ones((int(1.2 * il),) * 2, np.uint8))
+        on_line = heavy(self.ink.astype(np.float32)) & (1 - taken) \
+            & cv2.dilate(self.linemask.astype(np.uint8), np.ones((3, 1), np.uint8))
         found = []
-        for i in range(1, n):
-            cx, cy = float(cents[i][0]), float(cents[i][1])
-            # a cross is as wide as it is tall and mostly paper
-            x0, x1 = int(cx - 0.75 * il), int(cx + 0.75 * il)
-            y0, y1 = int(cy - 0.6 * il), int(cy + 0.6 * il)
-            box = self.nolines[max(y0, 0):y1, max(x0, 0):x1]
-            if not box.size or box.mean() > 0.42:
-                continue
-            found.append((cx, cy))
+        # ...and only an open, clean cross there: a roll slash on a line
+        # through a stem is heavier ink
+        for mask, most in ((both, 0.42), (on_line, 0.28)):
+            n, _lab, stats, cents = cv2.connectedComponentsWithStats(mask)
+            for i in range(1, n):
+                cx, cy = float(cents[i][0]), float(cents[i][1])
+                # a cross is as wide as it is tall and mostly paper
+                x0, x1 = int(cx - 0.75 * il), int(cx + 0.75 * il)
+                y0, y1 = int(cy - 0.6 * il), int(cy + 0.6 * il)
+                box = self.nolines[max(y0, 0):y1, max(x0, 0):x1]
+                if not box.size or box.mean() > most:
+                    continue
+                found.append((cx, cy))
         # one cross can light up as two or three specks
         found.sort()
         merged: list[list[float]] = []
@@ -735,6 +747,64 @@ class Sheet:
                 return True
         return False
 
+    def diamond(self, cx: float, cy: float) -> bool:
+        """A filled head drawn as a diamond (a ride bell): pointed at top
+        and bottom, its sides straight lines meeting at the widest row in
+        the middle. An oval head is flat-topped and fills far more of its
+        box; a hollow diamond (a roll) is not a filled head at all.
+
+        Measured row by row on the ink run through the centre column; a
+        row where a staff line runs on through the head is filled in from
+        its neighbours."""
+        il = self.il
+        x, y = int(round(cx)), int(round(cy))
+        span = int(0.9 * il)
+        rows = range(max(y - span, 0), min(y + span + 1, self.ink.shape[0]))
+        widths: list[float] = []
+        cap = int(1.2 * il)
+        for yy in rows:
+            row = self.ink[yy]
+            if not row[x]:
+                widths.append(0.0)
+                continue
+            a = b = x
+            while a > 0 and row[a - 1] and x - a < cap:
+                a -= 1
+            while b + 1 < len(row) and row[b + 1] and b - x < cap:
+                b += 1
+            # a staff line runs on through the head: unknown width
+            widths.append(np.nan if x - a >= cap or b - x >= cap else float(b - a + 1))
+        w = np.array(widths)
+        mid = y - rows.start
+        if mid >= len(w):
+            return False
+        # the head: the rows through its centre that are not paper
+        lo = hi = mid
+        while lo > 0 and w[lo - 1] != 0:
+            lo -= 1
+        while hi + 1 < len(w) and w[hi + 1] != 0:
+            hi += 1
+        w = w[lo:hi + 1]
+        known = np.nonzero(~np.isnan(w))[0]
+        if len(known) < 4:
+            return False
+        w = w[known[0]:known[-1] + 1]
+        gaps = np.isnan(w)
+        w[gaps] = np.interp(np.nonzero(gaps)[0], np.nonzero(~gaps)[0], w[~gaps])
+        h = len(w)
+        if not 0.6 * il <= h <= 1.4 * il:
+            return False
+        widest = w.max()
+        if not 0.7 * il <= widest <= 1.6 * il:
+            return False
+        end = max(h // 6, 2)
+        top_w, bot_w = w[:end].mean(), w[-end:].mean()
+        fill = w.sum() / (h * widest)
+        # widest at mid height: the corners left and right
+        peak = float(np.mean(np.nonzero(w >= 0.92 * widest)[0])) / (h - 1)
+        return fill <= 0.62 and max(top_w, bot_w) <= 0.35 * widest \
+            and 0.3 <= peak <= 0.7
+
     def in_time(self, x: float, y: float) -> bool:
         return any(tx - 2 <= x <= tx + tw + 2 and ty - 2 <= y <= ty + th + 2
                    for tx, ty, tw, th in self.timesigs)
@@ -784,6 +854,9 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
 
     heads = [(x, y, "normal") for x, y in sheet.filled if inside(x, y) and not on_rest(x, y)
              and not sheet.tempo_note(x, y, top)] \
+        + [(x, y, "normal") for x, y in sheet.small if inside(x, y) and sheet.diamond(x, y)
+           and not any(abs(x - cx) < 0.5 * il and abs(y - cy) < 0.5 * il
+                       for cx, cy in sheet.crosses)] \
         + [(x, y, "x") for x, y in sheet.crosses if inside(x, y)] \
         + [(x, y, "void") for x, y in sheet.voids if inside(x, y)] \
         + [(x, y, "circled_x") for x, y in sheet.rings if inside(x, y)
@@ -906,6 +979,12 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
                            else 1 if ry < top + 0.8 * il else 0,
                            "value": value, "rest": True, "y": ry})
     events.sort(key=lambda e: e["x"])
+    # a filled head drawn as a diamond keeps "normal" for timing; the
+    # strike it becomes is a "diamond"
+    for e in events:
+        if not e.get("rest"):
+            e["diamonds"] = [(hx, hy) for hx, hy, k in e["heads"]
+                             if k == "normal" and sheet.diamond(hx, hy)]
     _attach_signs(sheet, bar, events)
     # a grace note leans on the next note to its right
     for gx, gy, _gs in sheet.graces:
@@ -1413,6 +1492,8 @@ def _strikes_of(e: dict, bar: dict) -> list[dict]:
                  or s.endswith("@above") and k == 0
                  or s.endswith("@below") and k == len(heads) - 1]
         slot = e["slot"]
+        if (hx, hy) in e.get("diamonds", ()):
+            kind = "diamond"
         out.append({"slot": int(slot), "onset": slot,
                     "step": int(round((hy - bar["top"]) / (bar["il"] / 2))),
                     "kind": kind, "value": e.get("nominal", e["value"]),

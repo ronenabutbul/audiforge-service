@@ -302,6 +302,9 @@ def reading_to_grid(reading: "BarReading",
             inst = "hh_open"
         elif "closed" in strike.marks and inst == "hh_open":
             inst = "hh_closed"
+        # a ride struck like a crash: the dash over the stem tip
+        if inst == "ride" and any(m.startswith("tenuto") for m in strike.marks):
+            inst = "ride_crash"
         key = (strike.slot, strike.onset)
         by_slot.setdefault(key, []).append(
             (inst, strike.accent, strike.step, strike.head,
