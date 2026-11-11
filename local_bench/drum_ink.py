@@ -2171,8 +2171,14 @@ def _time_ruler(read: dict, il: float, x1: float | None) -> tuple[list[dict], st
             # column: its stem is still in the column
             sx = e.get("sx", e["x"])
             near = min(marks, key=lambda m: abs(m[0] - sx))
-            if abs(near[0] - sx) < 0.4 * il and any(
+            # (or its stem reaches a head the other voice already holds
+            # there: the head was printed once, for both stems)
+            if abs(near[0] - sx) < 0.75 * il and any(
                     abs(h[0] - sx) < 0.9 * il and (h[0] > sx) == (e["voice"] == 2)
+                    or any(o is not e and o.get("slot") == near[1]
+                           and any(abs(h[0] - g[0]) < 0.5 * il and abs(h[1] - g[1]) < 0.5 * il
+                                   for g in o.get("heads", []))
+                           for o in events)
                     for h in e.get("heads", [])):
                 e["slot"] = near[1]
                 continue

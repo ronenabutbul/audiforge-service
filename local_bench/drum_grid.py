@@ -2210,8 +2210,8 @@ def _page_defaults(score: ET.Element, width: float, height: float, il: float,
     mm_per_px = 210.0 / width if abs(height / width - 297 / 210) < 0.03 else 215.9 / width
     # a renderer spaces notes wider than an engraver packs them (MuseScore
     # broke the original's rows in two at the printed staff size, and kept
-    # all but one of Aznavour's 22 rows whole at three quarters of it)
-    shrink = 0.75
+    # every one of Aznavour's 24 rows whole at two thirds of it)
+    shrink = 0.65
     staff_mm = 4 * il * mm_per_px * shrink
     tenths = 40 / (4 * il * shrink)     # tenths per pixel
     old = score.find("defaults")
