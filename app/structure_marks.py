@@ -49,12 +49,18 @@ from pathlib import Path
 from typing import NamedTuple
 
 try:
-    from app.fix_hbars import (_locate_marks, _measure_index_by_number,
-                               _staff_at, detect_hbars, stack_numbers)
+    from app.fix_hbars import (MERGED_STACK_EDGE_IL, MERGED_STACK_MIN_RATIO,
+                               _interior_barline_xs, _locate_marks,
+                               _measure_index_by_number, _merged_bar_xs,
+                               _row_median_widths, _staff_at, detect_hbars,
+                               stack_numbers)
     from app.fix_multirests import TESSERACT
 except ImportError:  # local_bench puts app/ itself on sys.path
-    from fix_hbars import (_locate_marks, _measure_index_by_number,
-                           _staff_at, detect_hbars, stack_numbers)
+    from fix_hbars import (MERGED_STACK_EDGE_IL, MERGED_STACK_MIN_RATIO,
+                           _interior_barline_xs, _locate_marks,
+                           _measure_index_by_number, _merged_bar_xs,
+                           _row_median_widths, _staff_at, detect_hbars,
+                           stack_numbers)
     from fix_multirests import TESSERACT
 
 TESSDATA = Path(os.environ.get(
@@ -193,6 +199,11 @@ def _bounds(el) -> tuple[int, int, int, int] | None:
 # Measured on the bench pages: a coda sign is 2.4 to 3.2 interlines tall and
 # a segno 2.6 to 3.3; a circled-x notehead, the nearest lookalike, is one.
 SIGN_MIN_IL, SIGN_MAX_IL = 1.7, 4.6
+# Engraving programs set the segno smaller: MuseScore's default is 1.25
+# interlines tall and 0.85 wide, with its dots tucked into the S's
+# curls. Its shape tests (half-turn, slash, a matched pair of dots) are
+# strict enough to take it at that size.
+SEGNO_MIN_IL, SEGNO_MIN_W_IL = 1.1, 0.75
 
 
 def _is_coda(glyph) -> bool:
@@ -288,26 +299,42 @@ def _signs(sheet: _Sheet) -> list[tuple[int, int, int, int, str]]:
             if 0.15 * il <= max(w, h) <= 0.7 * il and min(w, h) >= 0.1 * il
             and area >= 0.55 * w * h]
 
-    def segno_dots(cx: float, cy: float) -> bool:
+    def segno_dots(cx: float, cy: float, w: int) -> bool:
         """A dot on either side, each the other's half-turn about the
-        centre."""
-        left = [d for d in dots if 0.3 * il <= cx - d[0] <= 1.9 * il and abs(d[1] - cy) <= il]
-        right = [d for d in dots if 0.3 * il <= d[0] - cx <= 1.9 * il and abs(d[1] - cy) <= il]
+        centre. A small segno's dots sit within a quarter of its width
+        of the centre."""
+        near = min(0.3 * il, 0.25 * w)
+        left = [d for d in dots if near <= cx - d[0] <= 1.9 * il and abs(d[1] - cy) <= il]
+        right = [d for d in dots if near <= d[0] - cx <= 1.9 * il and abs(d[1] - cy) <= il]
         return any(abs(a[0] + b[0] - 2 * cx) <= 0.45 * il
                    and abs(a[1] + b[1] - 2 * cy) <= 0.45 * il
                    for a in left for b in right)
 
+    def in_word(k: int, x: int, y: int, w: int, h: int) -> bool:
+        """A letter-sized S with another letter beside it on its line
+        (the "s" of "sim.") is a word's first letter, not a sign."""
+        for j in range(1, len(stats)):
+            ox, oy, ow, oh, _ = (int(v) for v in stats[j])
+            if j == k or oh < 0.5 * h or oh > 2 * h:
+                continue
+            gap = max(ox - (x + w), x - (ox + ow))
+            if gap <= 0.6 * il and abs((oy + oh / 2) - (y + h / 2)) <= 0.5 * h:
+                return True
+        return False
+
     found = []
     for k in range(1, len(stats)):
         x, y, w, h, _area = (int(v) for v in stats[k])
-        if not (lo <= h <= hi and 1.0 * il <= w <= 3.8 * il):
+        if not (SEGNO_MIN_IL * il <= h <= hi and SEGNO_MIN_W_IL * il <= w <= 3.8 * il):
             continue
         if sheet.system_of(x + w / 2, y + h / 2) is None:
             continue
         glyph = labels[y:y + h, x:x + w] == k
-        if _is_coda(glyph):
+        full_size = lo <= h and w >= 1.0 * il
+        if full_size and _is_coda(glyph):
             found.append((x, y, w, h, CODA))
-        elif segno_dots(x + w / 2, y + h / 2) and _is_segno(glyph, il):
+        elif (segno_dots(x + w / 2, y + h / 2, w) and _is_segno(glyph, il)
+              and (full_size or not in_word(k, x, y, w, h))):
             found.append((x, y, w, h, SEGNO))
     # Audiveris's own, where the ink agrees: a sign that touches its
     # neighbour is one blob to the scan above and still a marker to it.
@@ -1137,7 +1164,8 @@ def _clear(part, kinds: set[str]) -> None:
             for dtype in list(direction.findall("direction-type")):
                 signs = dtype.findall("segno") + dtype.findall("coda")
                 words = dtype.findall("words")
-                said = [_read_phrase({"texts": [w.text or ""], "signs": []}) for w in words]
+                said = [_read_phrase({"texts": [w.text or ""], "signs": []})
+                        or _garbled_jump(w.text or "", kinds) for w in words]
                 if signs or (words and all(
                         s is not None and (ours or s in kinds) for s in said)):
                     direction.remove(dtype)
@@ -1153,6 +1181,18 @@ def _clear(part, kinds: set[str]) -> None:
                 sound.attrib.pop(k, None)
             if not sound.attrib and len(sound) == 0:
                 measure.remove(sound)
+
+
+def _garbled_jump(text: str, kinds: set[str]) -> str | None:
+    """A jump the engine's OCR garbled past reading ("BS. 31 Coda" for
+    "D.S. al Coda"): a short run of letters and digits ending in "Coda"
+    or "Fine", when the page has a jump to that very end. It is the same
+    print and goes with it; anything longer is someone's words."""
+    m = re.fullmatch(r"\W*(?:[A-Za-z0-9]{1,3}\W*){1,3}(coda|fine)\W*", text.strip(), re.I)
+    if m is None:
+        return None
+    tail = "-al-" + m.group(1).lower()
+    return next((k for k in kinds if k.endswith(tail)), None)
 
 
 def _barline(measure, location: str):
@@ -1271,13 +1311,17 @@ def _map_systems(measure_map: list[dict]) -> dict[str, list[list[dict]]]:
             for name, rows in systems.items()}
 
 
-def _map_system_of(rows: list[list[dict]], y: float, above_only: bool) -> list[dict] | None:
-    """The system a mark at height y belongs to, judged as
-    `_Sheet.system_of` judges it: the nearest, ink under a system counting
-    half again as far, a bracket only over its own staff."""
+def _map_system_of(rows: list[list[dict]], x: float, y: float,
+                   above_only: bool) -> list[dict] | None:
+    """The system a mark at (x, y) belongs to, judged as
+    `_Sheet.system_of` judges it: among the systems it is beside, the
+    nearest, ink under a system counting half again as far, a bracket
+    only over its own staff."""
     best = None
     for bars in rows:
         top, bottom, il = bars[0]["y_top"], bars[0]["y_bottom"], bars[0]["interline"]
+        if not (bars[0]["x0"] - 3 * il <= x <= bars[-1]["x1"] + 3 * il):
+            continue
         if y > bottom and above_only:
             continue
         gap = top - y if y < top else 1.5 * (y - bottom) if y > bottom else 0
@@ -1288,17 +1332,32 @@ def _map_system_of(rows: list[list[dict]], y: float, above_only: bool) -> list[d
     return None if best is None else best[1]
 
 
-def _map_bar(bars: list[dict], kind: str, x: float, y: float) -> int:
-    """Index in the score of the bar a mark at (x, y) names, with the
-    same rule per kind as `_BAR_OF` gives `_locate_marks`."""
+def _map_bar(bars: list[dict], kind: str, x: float, y: float) -> dict:
+    """The map entry of the bar a mark at (x, y) names, with the same
+    rule per kind as `_BAR_OF` gives `_locate_marks`."""
     containing, slack = _BAR_OF[kind]
 
     def left(b):  # the barline leans: where it stands at the mark's height
-        return b["x0"] + b["lean"] * (y - b["y0"])
+        return b["x0"] + b.get("lean", 0.0) * (y - b.get("y0", y))
     if containing:
         before = [b for b in bars if left(b) <= x + slack * b["interline"]]
-        return (before[-1] if before else bars[0])["index"]
-    return min(bars, key=lambda b: abs(left(b) - x))["index"]
+        return before[-1] if before else bars[0]
+    return min(bars, key=lambda b: abs(left(b) - x))
+
+
+def _map_marks(omr_path: Path, measure_map: list[dict],
+               marks: list[Mark]) -> list[dict | None]:
+    """The map entry each mark names; None for a mark beside no system."""
+    with zipfile.ZipFile(omr_path) as z:
+        names = sorted({n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+                       key=lambda s: int(s.split("#")[1]))
+    systems = _map_systems(measure_map)
+    found: list[dict | None] = []
+    for m in marks:
+        rows = systems.get(names[m.sheet]) if m.sheet < len(names) else None
+        bars = rows and _map_system_of(rows, m.x, m.y, m.kind in _BRACKET_ENDS)
+        found.append(_map_bar(bars, m.kind, m.x, m.y) if bars and m.kind in _BAR_OF else None)
+    return found
 
 
 def place_on_score(omr_path: Path, result_path: Path, measure_map: list[dict],
@@ -1316,13 +1375,8 @@ def place_on_score(omr_path: Path, result_path: Path, measure_map: list[dict],
     with zipfile.ZipFile(omr_path) as z:
         names = sorted({n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
                        key=lambda s: int(s.split("#")[1]))
-    systems = _map_systems(measure_map)
-    bar: list[int | None] = []
-    for m in marks:
-        rows = systems.get(names[m.sheet]) if m.sheet < len(names) else None
-        bars = rows and _map_system_of(rows, m.y, m.kind in _BRACKET_ENDS)
-        bar.append(_map_bar(bars, m.kind, m.x, m.y) if bars and m.kind in _BAR_OF else None)
-    marks, bar = list(marks), list(bar)
+    marks = list(marks)
+    bar = [None if e is None else e["index"] for e in _map_marks(omr_path, measure_map, marks)]
     for entry in measure_map:
         for flag, kind in (("repeat_forward_at_left", REPEAT_START),
                            ("repeat_backward_at_right", REPEAT_END)):
@@ -1332,6 +1386,197 @@ def place_on_score(omr_path: Path, result_path: Path, measure_map: list[dict],
                 marks.append(Mark(sheet, int(entry["x0"]), int(entry["y_top"]), kind))
                 bar.append(entry["index"])
     return _write(ET.parse(result_path), result_path, marks, bar)
+
+
+# A repeat sign printed right after the clef, key and time signature is a
+# heavy stroke inside the system's first stack; it divides nothing. Its
+# heavy and thin lines stand within this many interlines of the end of
+# Audiveris's <header> (measured 1.4 to 2.6); the shortest bar after a
+# header, a whole note, ends ten or more beyond it.
+HEADER_REPEAT_IL = 4.0
+
+
+# A barline fills its column from the top staff line to the bottom one; a
+# courtesy "4/4" at a system's end, the nearest thing to it, fills under
+# nine tenths (two digits with a gap between them).
+BARLINE_FILL = 0.95
+
+
+def _closed_at(pixels, x: float, top: float, bottom: float, il: float) -> bool:
+    """Whether a barline stands at x, the right edge of a stack. A bar
+    always ends at one; a courtesy key or time signature at a system's
+    end stands after the last barline with none of its own. Audiveris
+    sometimes reads no barline there, so the ink decides."""
+    lo, hi = int(round(top)), int(round(bottom)) + 1
+    return any(pixels[lo:hi, c].mean() >= BARLINE_FILL
+               for c in range(max(int(x - 0.6 * il), 0),
+                              min(int(x + 0.4 * il) + 1, pixels.shape[1])))
+
+
+def _read_barlines(read, x0: int, x1: int, top: float, bottom: float, il: float,
+                   row_median: float, header_stop: float | None) -> list[int]:
+    """Barlines Audiveris read inside a stack it did not divide there. On
+    a tilted scan a thin barline leans across columns, so no single
+    column of ink is full and `_merged_bar_xs` misses it; Audiveris's own
+    barline still runs from the top staff line to the bottom one. Only
+    in a stack wide enough to hold two bars (the ratio `_merged_bar_xs`
+    uses), away from either edge and clear of a repeat sign right after
+    the clef and key. The strokes of a double barline count once."""
+    if not row_median or (x1 - x0) < MERGED_STACK_MIN_RATIO * row_median:
+        return []
+    edge = MERGED_STACK_EDGE_IL * il
+    left = x0 + edge
+    if header_stop is not None:
+        left = max(left, header_stop + HEADER_REPEAT_IL * il)
+    xs: list[int] = []
+    for bx, by, bw, bh in sorted(read):
+        x = bx + bw / 2
+        if not (left <= x <= x1 - edge):
+            continue
+        if abs(by - top) > 0.5 * il or abs(by + bh - bottom) > 0.5 * il:
+            continue
+        if xs and x - xs[-1] <= il:
+            continue
+        xs.append(int(x))
+    return xs
+
+
+# A stack that holds only a signature (a key or time change printed
+# between two barlines mid-system) ends within this many interlines of
+# the signature's last glyph; the emptiest real bar, a whole rest after a
+# time change, runs on nine or more past it.
+SIGNATURE_ONLY_IL = 4.0
+_SIGNATURE_TAGS = ("key", "time-whole", "time-pair", "clef")
+_PLAYED_TAGS = ("head", "rest", "multiple-rest", "measure-repeat")
+
+
+def _boxes(root, tags) -> list[tuple[int, int, int, int]]:
+    return [b for t in tags for b in map(_bounds, root.iter(t)) if b is not None]
+
+
+def _signature_only(played, signatures, x0: int, x1: int, top: float,
+                    bottom: float, il: float) -> bool:
+    """Whether a stack holds a signature and nothing played: no note,
+    rest or repeat sign, and its right edge close after the signature."""
+    def within(b):
+        cx, cy = b[0] + b[2] / 2, b[1] + b[3] / 2
+        return x0 < cx < x1 and top - 3 * il < cy < bottom + 3 * il
+    if any(within(b) for b in played):
+        return False
+    ends = [b[0] + b[2] for b in signatures if within(b)]
+    return bool(ends) and x1 - max(ends) <= SIGNATURE_ONLY_IL * il
+
+
+def page_measure_map(omr_path: Path, hbars: list[dict]) -> list[dict]:
+    """Every printed bar on the pages, in reading order, with its printed
+    number, the bars it stands for (a multirest's count) and its pixel
+    box: the same shape of map the full-score reader writes, built from
+    Audiveris's stacks for a single-staff part.
+
+    `fix_hbars.stack_numbers` counts two things as bars that are none,
+    and every number after them then runs late:
+    - the stack Audiveris cuts off at a system's end for a courtesy key
+      or time signature, when it is wider than three interlines (a key
+      change of three flats with its naturals is four). Audiveris marks
+      it CAUTIONARY, but marks some real bars so too, and a bar whose
+      whole notes it missed looks as empty; what tells them apart is
+      that a bar ends at a barline and the courtesy signature does not;
+    - a repeat sign right after the clef, key and time signature, which
+      reads as a barline inside the first stack once the signature is
+      wider than the nine interlines `_merged_bar_xs` allows for it.
+      Audiveris's own <header> says where the signature ends;
+    - a key or time change mid-system that Audiveris cut off as a stack
+      of its own, between the barline and a repeat sign.
+    And it misses one: a thin barline on a tilted scan, which no single
+    column of ink holds from line to line, where Audiveris read it."""
+    import numpy as np
+    from PIL import Image
+
+    by_stack = {h["stack"]: h for h in hbars}
+    absorbed = {h["stack"] + k for h in hbars for k in range(1, h.get("span", 1))}
+    medians = _row_median_widths(omr_path)
+    out: list[dict] = []
+    ordinal, number = 0, 1
+    with zipfile.ZipFile(omr_path) as z:
+        names = sorted({n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+                       key=lambda s: int(s.split("#")[1]))
+        for name in names:
+            root = ET.fromstring(z.read(f"{name}/{name}.xml").decode("utf-8", "replace"))
+            pixels = np.asarray(Image.open(io.BytesIO(
+                z.read(f"{name}/BINARY.png"))).convert("L")) < 128
+            read = _boxes(root, ("barline",))
+            played, signatures = _boxes(root, _PLAYED_TAGS), _boxes(root, _SIGNATURE_TAGS)
+            for si, system in enumerate(root.iter("system")):
+                staves = [st.findall("lines/line") for st in system.iter("staff")]
+                stacks = system.findall("stack")
+                if not staves or len(staves[0]) < 5:
+                    continue
+                header = system.find(".//header")
+                header_stop = float(header.get("stop")) if header is not None else None
+                for k, stack in enumerate(stacks):
+                    s = ordinal + k
+                    x0, x1 = int(float(stack.get("left"))), int(float(stack.get("right")))
+                    top, bottom = _staff_at(staves[0], (x0 + x1) / 2)
+                    il = (bottom - top) / 4
+                    low = _staff_at(staves[-1], (x0 + x1) / 2)[1]
+                    h = by_stack.get(s)
+                    if s in absorbed or x1 - x0 < 3 * il:
+                        continue
+                    # a "multirest" of one read there is the courtesy 4/4's digit
+                    if (k == len(stacks) - 1 and not (h and h.get("read") and h["count"] > 1)
+                            and not _closed_at(pixels, x1, top, bottom, il)):
+                        continue  # a courtesy signature: no bar
+                    if k and h is None and _signature_only(played, signatures, x0, x1,
+                                                           top, low, il):
+                        continue  # a key or time change cut off as a stack
+                    if h is not None:
+                        edges = [x0] + _interior_barline_xs(pixels, top, bottom, x0, x1, il) + [x1]
+                    else:
+                        inner = _merged_bar_xs(pixels, top, bottom, x0, x1, il,
+                                               medians.get(s, 0), head=k == 0)
+                        if k == 0 and header_stop is not None:
+                            inner = [x for x in inner if x - header_stop > HEADER_REPEAT_IL * il]
+                        inner = sorted(inner + [
+                            x for x in _read_barlines(read, x0, x1, top, bottom, il,
+                                                      medians.get(s, 0), header_stop if k == 0 else None)
+                            if all(abs(x - y) > il for y in inner)])
+                        edges = [x0] + inner + [x1]
+                    for j, (a, b) in enumerate(zip(edges, edges[1:])):
+                        count = h["count"] if h is not None and j == h.get("bar_offset", 0) else 1
+                        out.append({"index": None, "number": number, "count": count,
+                                    "sheet_name": name, "system": si, "stack": s,
+                                    "x0": float(a), "x1": float(b), "interline": il,
+                                    "y_top": top, "y_bottom": low})
+                        number += count
+                ordinal += len(stacks)
+    return out
+
+
+def place_by_page(omr_path: Path, result_path: Path, hbars: list[dict] | None = None,
+                  marks: list[Mark] | None = None) -> int:
+    """`place` for a single-staff part whose measures are numbered as
+    printed (multirests by their count): each mark is put on its bar by
+    `page_measure_map` and found in the score by that bar's printed
+    number. A mark that closes a multirest acts on its last bar."""
+    omr_path, result_path = Path(omr_path), Path(result_path)
+    if hbars is None:
+        hbars = detect_hbars(omr_path)
+    if marks is None:
+        marks = detect(omr_path)
+    entries = _map_marks(omr_path, page_measure_map(omr_path, hbars), marks)
+    tree = ET.parse(result_path)
+    parts = tree.getroot().findall("part")
+    if not parts:
+        return 0
+    by_number = _measure_index_by_number(parts[0].findall("measure"))
+    bar = []
+    for m, e in zip(marks, entries):
+        if e is None:
+            bar.append(None)
+            continue
+        n = e["number"] + (e["count"] - 1 if m.kind in _AT_BAR_END else 0)
+        bar.append(by_number.get(n, by_number.get(e["number"])))
+    return _write(tree, result_path, marks, bar)
 
 
 def _write(tree, result_path: Path, marks: list[Mark], bar: list[int | None]) -> int:
@@ -1355,6 +1600,16 @@ def _write(tree, result_path: Path, marks: list[Mark], bar: list[int | None]) ->
             if start[0] is not None and bi is not None:
                 endings.append([start[0], max(bi, start[0]), start[1], m.kind == ENDING_STOP])
             start = None
+    # The same number opening twice on one bar is one bracket read in two
+    # pieces (its corner hook taken for a short bracket of its own): it
+    # runs to where the last piece ends.
+    merged: list[list] = []
+    for e in endings:
+        if merged and merged[-1][0] == e[0] and merged[-1][2] == e[2]:
+            merged[-1][1], merged[-1][3] = max(merged[-1][1], e[1]), e[3]
+        else:
+            merged.append(e)
+    endings = merged
     for a, b in zip(endings, endings[1:]):
         if a[1] >= b[0] > a[0]:  # one bracket ends where the next begins
             a[1] = b[0] - 1

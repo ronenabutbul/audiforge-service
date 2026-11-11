@@ -686,6 +686,14 @@ def _repair_structure(steps: _Steps, work: Path, result: Path, aud: Path) -> Non
     steps.note("placed_from_page", placed_from_page,
                "placed from the page: " + ", ".join(
                    f"{count} {label}" for label, count in placed_from_page.items()))
+    # The road map read off the ink (repeat dots, brackets, segno, coda,
+    # jump words) replaces the repeats, endings and signs placed above
+    # from Audiveris's inters; if it fails, those stand.
+    from app import structure_marks
+    road_map = steps.run("road map", structure_marks.place_by_page, omr, result, hbars,
+                         default=None)
+    if road_map is not None:
+        steps.note("road_map", road_map, f"{road_map} road-map marks placed")
 
 
 def finish(work: Path, homr: Path | None, audiveris: Path | None, result: Path,
