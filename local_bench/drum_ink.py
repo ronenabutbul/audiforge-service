@@ -1908,29 +1908,67 @@ def _frames(band: np.ndarray, il: float) -> list[tuple[int, int, int, int]]:
     (a boxed bar number or letter), found by its four straight sides
     (long flat and upright runs), not by connectivity, so print touching
     the frame or a sign touching it from outside does not hide it. A
-    volta hook has no bottom and is not one."""
+    volta hook has no bottom and is not one. Uprights are looked for at
+    two lengths: long ones first, then short ones for a frame as short as
+    one interline (Abba's "100"), which would otherwise lose its sides."""
     if band.size == 0:
         return []
     band = band.astype(np.uint8)
-    long = max(int(1.2 * il), 4)
-    flat = cv2.morphologyEx(band, cv2.MORPH_OPEN, np.ones((1, long), np.uint8))
-    upright = cv2.morphologyEx(band, cv2.MORPH_OPEN, np.ones((long, 1), np.uint8))
-    sides = flat | upright
-    n, _lab, stats, _c = cv2.connectedComponentsWithStats(
-        cv2.dilate(sides, np.ones((3, 3), np.uint8)))
-    out = []
+    flat = cv2.morphologyEx(band, cv2.MORPH_OPEN, np.ones((1, max(int(1.2 * il), 4)), np.uint8))
+    out: list[tuple[int, int, int, int]] = []
     edge = max(int(0.2 * il), 2)
-    for i in range(1, n):
-        x, y, w, h, _a = stats[i]
-        if not (1.4 * il <= w <= 6 * il and 1.4 * il <= h <= 4 * il):
-            continue
-        g = sides[y:y + h, x:x + w]
-        cover = sorted((g[:edge].any(axis=0).mean(), g[-edge:].any(axis=0).mean(),
-                        g[:, :edge].any(axis=1).mean(), g[:, -edge:].any(axis=1).mean()))
-        # one side may be broken by a faint scan, never missing
-        if cover[0] < 0.6 or cover[1] < 0.85:
-            continue
-        out.append((int(x), int(y), int(w), int(h)))
+    for upright_len, min_h in ((1.2, 1.4), (0.75, 0.9)):
+        upright = cv2.morphologyEx(band, cv2.MORPH_OPEN,
+                                   np.ones((max(int(upright_len * il), 4), 1), np.uint8))
+        sides = flat | upright
+        n, _lab, stats, _c = cv2.connectedComponentsWithStats(
+            cv2.dilate(sides, np.ones((3, 3), np.uint8)))
+        for i in range(1, n):
+            x, y, w, h, _a = stats[i]
+            # a stem or a sign joined to the frame stretches the component:
+            # the frame is where its flat sides are
+            fl = flat[y:y + h, x:x + w] & (_lab[y:y + h, x:x + w] == i)
+            rows = np.nonzero(fl.sum(axis=1) >= 1.4 * il)[0]
+            if len(rows) >= 2 and rows[-1] - rows[0] >= min_h * il - 2 * edge:
+                cols = np.nonzero(fl[rows].any(axis=0))[0]
+                x, y = x + int(cols[0]), y + max(int(rows[0]) - 1, 0)
+                w, h = int(cols[-1] - cols[0] + 1), int(rows[-1] - rows[0] + 3)
+            if not (1.4 * il <= w <= 6 * il and min_h * il <= h <= 4 * il):
+                continue
+            if any(x < ox + ow and ox < x + w and y < oy + oh and oy < y + h
+                   for ox, oy, ow, oh in out):
+                continue
+            g = sides[y:y + h, x:x + w]
+            cover = sorted((g[:edge].any(axis=0).mean(), g[-edge:].any(axis=0).mean(),
+                            g[:, :edge].any(axis=1).mean(), g[:, -edge:].any(axis=1).mean()))
+            # one side may be broken by a faint scan, never missing
+            if cover[0] < 0.6 or cover[1] < 0.85:
+                continue
+            # a frame's uprights end at its corners; stems run on through
+            # a beam (two beams and their stems close a rectangle too)
+            run_on = 0
+            for cx in (x + edge // 2, x + w - 1 - edge // 2):
+                for ys in ((y + h, y + h + int(0.6 * il)), (max(y - int(0.6 * il), 0), y)):
+                    col = band[ys[0]:ys[1], max(cx - edge, 0):cx + edge + 1]
+                    if col.size and col.any(axis=1).mean() > 0.9:
+                        run_on += 1
+            if run_on >= 2:
+                continue
+            # and it holds print, most of its height (two beams joined by
+            # stems close a rectangle too, an empty one)
+            t = edge + 1
+            inner = band[y + t:y + h - t, x + t:x + w - t]
+            if inner.size == 0:
+                continue
+            m, _l2, st2, _c2 = cv2.connectedComponentsWithStats(inner)
+            # (a stem between two beams runs from one to the other; a
+            # letter does not touch both)
+            if not any(st2[j][3] > 0.5 * inner.shape[0]
+                       and not (st2[j][1] == 0 and st2[j][1] + st2[j][3] == inner.shape[0]
+                                and st2[j][2] <= 0.3 * il)
+                       for j in range(1, m)):
+                continue
+            out.append((int(x), int(y), int(w), int(h)))
     return out
 
 

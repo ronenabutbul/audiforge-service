@@ -1970,12 +1970,17 @@ def place_words(omr_path: Path, out: Path, crops: list[dict],
     """
     import zipfile as _zipfile
 
-    # measure number of each crop, once multirests are expanded
-    measure_of: dict[int, int] = {}
+    # measure number of each crop, once multirests are expanded (a stack
+    # holding two printed bars gives each its own measure)
+    measure_of: dict[tuple[int, int], int] = {}
     measure = 0 if crops and crops[0].get("pickup") else 1
     for i, crop in enumerate(crops):
-        measure_of.setdefault(crop["stack"], measure)
+        measure_of.setdefault((crop["stack"], crop.get("part", 0)), measure)
         measure += rest_bars.get(i, 1)
+    inner: dict[int, list[int]] = {}
+    if any(c.get("part", 0) for c in crops):
+        from drum_ink import merged_bars
+        inner = merged_bars(omr_path)
 
     found: list[tuple[int, str]] = []  # (stack ordinal, text)
     stack_ordinal = 0
@@ -2041,7 +2046,8 @@ def place_words(omr_path: Path, out: Path, crops: list[dict],
                             if starts[i] <= cx <= ends[i]]
                     si = over[0] if over else min(
                         range(len(starts)), key=lambda i: abs(starts[i] - cx))
-                    found.append((stack_ordinal + si, text))
+                    k = stack_ordinal + si
+                    found.append(((k, sum(1 for x in inner.get(k, []) if x <= cx)), text))
                 stack_ordinal += len(stacks)
 
     if not found:
