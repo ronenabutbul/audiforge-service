@@ -111,6 +111,8 @@ def parse_chord(text: str) -> dict | None:
         tail = re.search(r"(?<=\d)(b|#|add)(\d{1,2})$", s)
         if not tail:
             break
+        if not 2 <= int(tail.group(2)) <= 13:              # b51: no such degree
+            return None
         acc = tail.group(1) if tail.group(1) != "add" else ""
         chord["degrees"].insert(0, (int(tail.group(2)), ALTER[acc], "add"))
         s = s[:tail.start()]
@@ -178,7 +180,9 @@ class Names:
             out.append({"frame": f, "inside": inside})
         return out
 
-    def image(self, parts: list[dict]) -> Image.Image:
+    def image(self, parts: list[dict], close: bool = False) -> Image.Image:
+        """close: bridge one-pixel gaps, for small print whose hairlines
+        Audiveris's binary image lost (the join of an m, the neck of a 7)."""
         xa = min(p["x"] for p in parts)
         xb = max(p["x"] + p["w"] for p in parts)
         ya = min(p["y"] for p in parts)
@@ -187,6 +191,8 @@ class Names:
         pad = int(self.il)
         canvas = np.full((yb - ya + 2 * pad, xb - xa + 2 * pad), 255, np.uint8)
         canvas[pad:pad + yb - ya, pad:pad + xb - xa][keep] = 0
+        if close:
+            canvas = 255 - cv2.morphologyEx(255 - canvas, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
         img = Image.fromarray(canvas)
         scale = max(1.0, 64 / max(yb - ya, 1))
         return img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
@@ -342,14 +348,21 @@ def read_marks(names: Names) -> tuple[list[dict], set[int]]:
     return marks, used
 
 
-def _read_run(names: Names, parts: list[dict], cap: float) -> str:
-    """Text of one stretch of a name: signs by shape, the rest by tesseract."""
+def _read_run(names: Names, parts: list[dict], cap: float, alone: bool = False) -> str:
+    """Text of one stretch of a name: signs by shape, the rest by tesseract.
+    alone: every letter read by itself (a second try when the line reading
+    made no chord: tesseract reads the 6 of a lone "m6" as an o)."""
     text, chunk = "", []
 
     def flush():
         nonlocal text, chunk
         if chunk:
-            text += ocr(names.image(chunk), len(chunk) == 1, WHITE)
+            if alone:
+                for g in _glyphs(chunk):
+                    text += ocr(names.image(g, close=True), True, WHITE)
+            else:
+                broken = any(len(g) > 1 for g in _glyphs(chunk))
+                text += ocr(names.image(chunk, close=broken), len(chunk) == 1, WHITE)
             chunk = []
 
     for p in parts:
@@ -371,17 +384,43 @@ def _read_token(names: Names, tok: list[dict], cap: float, base: float) -> str:
     """One name. Small raised print (the b5 of a jazz font) is read apart
     from the letters on the line: tesseract reads one size at a time."""
     tok = _stacked(names, tok, cap)
+    glyphs = _glyphs(tok)
     runs: list[tuple[bool, list[dict]]] = []
-    for p in tok:
-        speck = p["h"] < 0.3 * cap and p["w"] < 0.3 * cap     # the dot of an i or a j
-        raised = p["h"] < 0.8 * cap and p["y"] + p["h"] < base - 0.3 * cap and not speck
+    for g in glyphs:
+        top = min(q["y"] for q in g)
+        foot = max(q["y"] + q["h"] for q in g)
+        h, w = foot - top, max(q["x"] + q["w"] for q in g) - min(q["x"] for q in g)
+        speck = h < 0.3 * cap and w < 0.3 * cap     # the dot of an i or a j
+        raised = h < 0.8 * cap and foot < base - 0.3 * cap and not speck
         if speck and runs:
-            runs[-1][1].append(p)
+            runs[-1][1].extend(g)
         elif runs and runs[-1][0] == raised:
-            runs[-1][1].append(p)
+            runs[-1][1].extend(g)
         else:
-            runs.append((raised, [p]))
-    return "".join(_read_run(names, parts, cap) for _raised, parts in runs)
+            runs.append((raised, list(g)))
+    text = "".join(_read_run(names, parts, cap) for _raised, parts in runs)
+    if parse_chord(tidy(text)) is None:
+        again = "".join(_read_run(names, parts, cap, alone=True) for _raised, parts in runs)
+        if parse_chord(tidy(again)) is not None:
+            return again
+    return text
+
+
+def _glyphs(tok: list[dict]) -> list[list[dict]]:
+    """Ink parts grouped into letters: a letter printed in more than one
+    piece (the bar and the stem of a thin 7) is its pieces one above the
+    other. Stacked 6/9 figures stay alone."""
+    glyphs: list[list[dict]] = []
+    for p in tok:
+        if glyphs and "stacked" not in p and "stacked" not in glyphs[-1][-1]:
+            gx0 = min(q["x"] for q in glyphs[-1])
+            gx1 = max(q["x"] + q["w"] for q in glyphs[-1])
+            over = min(gx1, p["x"] + p["w"]) - max(gx0, p["x"])
+            if over > 0.5 * min(p["w"], gx1 - gx0):
+                glyphs[-1].append(p)
+                continue
+        glyphs.append([p])
+    return glyphs
 
 
 def _stacked(names: Names, tok: list[dict], cap: float) -> list[dict]:
