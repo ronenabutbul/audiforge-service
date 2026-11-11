@@ -1151,6 +1151,31 @@ def _own_signs(sheet, systems: list[System], slot: int) -> None:
     sheet.signs = kept
 
 
+def _roll_slashes(sheet, events: list[dict], il: float) -> None:
+    """A roll slash drawn off-centre through a stem, between the head and
+    the beam: a slanted bar of ink that crosses the stem (ink on both of
+    its sides on the same rows). Its tail right of the stem was taken for
+    the head's dot; it makes the note a roll instead."""
+    for e in events:
+        if e.get("rest") or not e.get("heads") or "sx" not in e:
+            continue
+        sx, tip = e["sx"], e["tip"]
+        ys = [h[1] for h in e["heads"]]
+        up = tip < min(ys)
+        lo, hi = (tip + 0.5 * il, min(ys) - 0.7 * il) if up else (max(ys) + 0.7 * il, tip - 0.5 * il)
+        rows = 0
+        for y in range(int(lo), int(hi) + 1):
+            if not 0 <= y < sheet.ink.shape[0]:
+                continue
+            left = sheet.nolines[y, int(sx - 0.7 * il):int(sx - 0.15 * il)].sum()
+            right = sheet.nolines[y, int(sx + 0.15 * il):int(sx + 0.7 * il)].sum()
+            rows += left >= 0.2 * il and right >= 0.1 * il
+        if rows >= 0.3 * il:
+            e["tremolo"] = e.get("tremolo", 0) + 1
+            if e["value"] and e["value"].numerator % 3 == 0:
+                e["value"] = e["value"] * 2 / 3
+
+
 def _head_y(e: dict, strike: dict) -> float:
     """Page y of the head a strike was made from."""
     if strike.get("grace"):
@@ -1305,6 +1330,7 @@ def read_drums(systems: list[System], pages: dict, slot: int, meters: list[tuple
                     if e.get("heads"):
                         e["heads"] = [(hx, hy, "x" if kind == "normal" and _waisted(sheet, hx, hy, geo["il"])
                                        else kind) for hx, hy, kind in e["heads"]]
+                _roll_slashes(sheet, read["events"], geo["il"])
                 events, problem = drum_ink.time_bar(read, geo["il"])
                 notes = [e for e in events if not e.get("rest")]
                 if not notes and _simile(sheet, geo):
