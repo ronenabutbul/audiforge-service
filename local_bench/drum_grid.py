@@ -1880,6 +1880,7 @@ _TERMS = [
     "accel.", "Fine", "Solo", "Tacet", "Swing", "Rock", "Samba", "Cha cha",
     "Cym.", "Hi-hat", "Hit hat", "Ride", "Cup", "Bell", "Sticks", "Brushes",
     "Snare", "Toms", "Bass drum", "Fill", "Cue", "Vamp", "Open", "Choke",
+    "Cym. Dome", "Dome", "Ride Bell", "Sus. Cym.", "Crash",
 ]
 
 

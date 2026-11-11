@@ -1561,7 +1561,107 @@ def read_chart(omr: Path) -> list[dict]:
                                 "repeat": bar_repeat(ink, bar)})
                 ordinal += 1
     fill_repeats(out)
+    with zipfile.ZipFile(omr) as z:
+        words = {name: kit_words(ET.fromstring(
+            z.read(f"{name}/{name}.xml").decode("utf-8", "replace")))
+            for name in _sheets(z)}
+    apply_kit_words(out, words)
     return out
+
+
+# Words that name the part of the cymbal struck. Compared with letters
+# only ("Cym.Dome", "Cym_Dome", "Cym. Dome" are one word).
+_BELL_WORDS = ("bell", "cup", "dome", "cymdome", "ridebell")
+_CYMBAL_WORDS = ("ride", "ridecym", "suscym", "cym", "hh", "hihat", "hithat", "crash",
+                 "choke")
+
+
+def _kit_word(text: str) -> str | None:
+    """'bell', 'cymbal' (a word that ends a bell passage) or None. One
+    wrong letter in a word of three or more is OCR ("Gym." for "Cym.")."""
+    letters = "".join(c for c in text.lower() if c.isalpha())
+    for kind, terms in (("bell", _BELL_WORDS), ("cymbal", _CYMBAL_WORDS)):
+        for t in terms:
+            if letters == t or (len(t) >= 3 and len(letters) == len(t)
+                                and sum(a != b for a, b in zip(letters, t)) == 1):
+                return kind
+    return None
+
+
+def kit_words(root: ET.Element) -> list[tuple[float, float, float, str]]:
+    """[(x, y, width, 'bell' | 'cymbal')] for every printed kit word on
+    one page, from Audiveris' sentences (the words inside each
+    sentence's bounds, read together)."""
+    words = []
+    for w in root.iter("word"):
+        b = w.find("bounds")
+        if b is not None and (w.get("value") or "").strip():
+            words.append((float(b.get("x")), float(b.get("y")), float(b.get("w")),
+                          float(b.get("h")), w.get("value")))
+    out = []
+    for sentence in root.iter("sentence"):
+        b = sentence.find("bounds")
+        if b is None:
+            continue
+        sx, sy, sw, sh = (float(b.get(k)) for k in ("x", "y", "w", "h"))
+        inside = sorted((w for w in words if sx - 4 <= w[0] <= sx + sw + 4
+                         and sy - 4 <= w[1] <= sy + sh + 4), key=lambda w: w[0])
+        kind = _kit_word("".join(w[4] for w in inside))
+        if kind:
+            out.append((sx, sy + sh / 2, sw, kind))
+    return out
+
+
+def apply_kit_words(chart: list[dict], words: dict[str, list]) -> None:
+    """A bell word ("Bell", "Cup", "Dome", "Cym. Dome", "Ride Bell") makes
+    the cymbal note it stands over, or the first one after it, a ride
+    bell, and every later cymbal note with the same head on the same line
+    too, until a cymbal word ("Ride", "Cym.", "Sus. Cym.", "H.H.",
+    "Crash", "Choke") or a hi-hat sign (o, +) says otherwise. Notes with
+    another head or on another line are left as they are."""
+    cymbal = ("x", "circled_x", "diamond")
+    marks = []          # (chart index, x, kind)
+    for i, b in enumerate(chart):
+        bar = b["bar"]
+        il, top = bar["il"], bar["top"]
+        for x, y, w, kind in words.get(b["sheet"], []):
+            # over the staff (or just under it), inside the bar
+            if bar["x0"] - 0.5 * il <= x < bar["x1"] and top - 7 * il <= y <= top + 9 * il:
+                # the nearest staff when two systems could claim it
+                others = [c for c in chart if c["sheet"] == b["sheet"] and c is not b
+                          and c["bar"]["x0"] - 0.5 * il <= x < c["bar"]["x1"]
+                          and abs(c["bar"]["top"] + 2 * il - y) < abs(top + 2 * il - y)]
+                if not others:
+                    # a bell word stands over the note it starts on; a
+                    # word that ends the passage may follow its note
+                    # ("Choke" printed right of the choked cymbal)
+                    marks.append((i, x - (0.8 if kind == "bell" else 3.0) * il, kind))
+    marks.sort(key=lambda m: (m[0], m[1]))
+    if not any(k == "bell" for _i, _x, k in marks):
+        return
+    target = None       # (step, head) a bell word has claimed
+    pending = False     # a bell word waiting for its first cymbal note
+    mi = 0
+    for i, b in enumerate(chart):
+        for st in sorted(b["strikes"], key=lambda s: s.get("x", 0)):
+            while mi < len(marks) and (marks[mi][0] < i or
+                                       marks[mi][0] == i and marks[mi][1] <= st.get("x", 0)):
+                pending = marks[mi][2] == "bell"
+                target = None
+                mi += 1
+            if st["kind"] not in cymbal:
+                continue
+            if "open" in st["marks"] or "closed" in st["marks"]:
+                target, pending = None, False
+                continue
+            if pending:
+                target, pending = (st["step"], st["kind"]), False
+            if target == (st["step"], st["kind"]):
+                st["inst"] = "ride_bell"
+        while mi < len(marks) and marks[mi][0] == i:
+            pending = marks[mi][2] == "bell"
+            target = None if pending or marks[mi][2] == "cymbal" else target
+            mi += 1
 
 
 def fill_repeats(chart: list[dict]) -> None:
@@ -1755,6 +1855,7 @@ def ink_readings(crops: list[dict], omr: Path, rest_counts: dict | None = None,
                                       voice=voice if sure else None,
                                       value=int(value) if sure else None,
                                       marks=st["marks"], grace=st.get("grace", False),
+                                      inst=st.get("inst"),
                                       onset=str(onset) if onset is not None else None))
         readings.append(BarReading(strikes=strikes,
                                    tuplets=bar.get("tuplets", []) if bar else [],
