@@ -592,8 +592,59 @@ def build(folder: Path, names: list[str]) -> None:
         print(name, "omr:", [p.name for p in d.glob("*.omr")], flush=True)
 
 
+# The owner's own chart (the app's PDF export, read by Audiveris): the
+# reader must keep passing it. Found next to the set folder
+# (<scratchpad>/chord/out) or through CHORD_CHART_TEST.
+OWNER_BARS = ["Eb7", "Dm/F D7/F#", "Gm Dm/A", "Bbmaj7", "Cm C#o7", "D", "Eb7 D/F#", "Gm",
+              "E9 A7(b9)", "D7(addb13) D7", "Gm Ab7", "Eb Ab7", "Cm7 C#o7", "Gm/D Eb", "Bb Ao7", "Gm"]
+OWNER_MARKS = [(1, "A"), (9, "B")]
+
+
+def owner_chart(folder: Path) -> Path | None:
+    import os
+    p = Path(os.environ.get("CHORD_CHART_TEST") or folder.resolve().parents[2] / "chord" / "out")
+    return next(p.rglob("Chord Chart Test.omr"), None) if p.exists() else None
+
+
+def check_owner(omr: Path, out: Path) -> list[str]:
+    """Every difference from what the owner's chart says; empty when it passes."""
+    r = cc.convert(omr, out)
+    bad = []
+    got = [" ".join(n) for n in r["names"]]
+    if len(got) != len(OWNER_BARS):
+        bad.append(f"{len(got)} bars, want {len(OWNER_BARS)}")
+    for i, (w, h) in enumerate(zip(OWNER_BARS, got), 1):
+        if w != h:
+            bad.append(f"bar {i}: {w} -> {h}")
+    if [tuple(m) for m in r["marks"]] != OWNER_MARKS:
+        bad.append(f"marks {r['marks']}, want {OWNER_MARKS}")
+    m = r["meta"]
+    if (m["fifths"], m["beats"], m["beat_type"]) != (-2, 4, 4):
+        bad.append(f"key {m['fifths']} time {m['beats']}/{m['beat_type']}, want -2 4/4")
+    bars = chart_of(out)
+    for i, b in enumerate(bars, 1):
+        kinds = [what.split()[0] for _t, _q, what in b["items"]]
+        want = ["slash", "note", "slash", "slash"] if i == 2 else ["slash"] * 4
+        if kinds != want:
+            bad.append(f"bar {i}: pattern {pattern(b)}")
+    return bad
+
+
 def run(folder: Path, names: list[str], verbose: bool = False) -> bool:
     rows, ok_all = [], True
+    owner = owner_chart(folder) if not names or "owner" in names else None
+    if owner is not None:
+        try:
+            bad = check_owner(owner, folder.parent / "owner_result.musicxml")
+        except Exception as e:
+            bad = [f"crashed: {type(e).__name__}: {e}"]
+        ok_all &= not bad
+        print(f"owner 'Chord Chart Test': {'PASS' if not bad else 'FAIL'}")
+        for line in bad:
+            print("   ", line)
+    elif not names:
+        print("owner 'Chord Chart Test': NOT FOUND (set CHORD_CHART_TEST)")
+        ok_all = False
     for d in sorted(p for p in folder.iterdir() if p.is_dir()):
         if names and d.name not in names:
             continue
