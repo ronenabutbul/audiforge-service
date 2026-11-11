@@ -664,7 +664,11 @@ def read_items(sheet: Sheet, system: System, header: float, blocked: list[tuple[
             and not any(a - 0.2 * il <= hx <= b + 0.2 * il for a, b in blocked) \
             and not any(x <= hx <= x + w and y <= hy <= y + h for x, y, w, h in text_boxes)
 
-    heads = [(hx, hy, "filled") for hx, hy in sheet.filled if free(hx, hy)]
+    # a whole or half rest is a solid block on a line: not a filled head
+    rest_boxes = [r[4:8] for r in sheet.rests if len(r) >= 8]
+    heads = [(hx, hy, "filled") for hx, hy in sheet.filled if free(hx, hy)
+             and not any(x - 0.2 * il <= hx <= x + w + 0.2 * il and y - 0.3 * il <= hy <= y + h + 0.3 * il
+                         for x, y, w, h in rest_boxes)]
     for h in el.iter("head"):
         b = _bounds(h)
         if b and h.get("shape") in ("NOTEHEAD_VOID", "WHOLE_NOTE") and free(b[0] + b[2] / 2, b[1] + b[3] / 2):
@@ -807,6 +811,7 @@ def read_sheet(ink: np.ndarray, root: ET.Element, verbose: bool, stack0: int = 0
         stack_of = {}
         for n, (left, right) in enumerate(s.stacks):
             stack_of[(left, right)] = stack0 + n
+        stack0 += len(s.stacks)            # stacks are counted through the page, as fix_hbars does
         for bx0, bx1 in _bar_edges(s):
             start = max(bx0, header) if bx0 < header else bx0
             mine = [it for it in items if bx0 <= it["cx"] < bx1]
@@ -879,6 +884,12 @@ def _settle_chords(systems: list[dict], verbose: bool) -> None:
                 continue
             home = next((b for b in bars if b["start"] - 1.0 * il <= c["bx"] < b["x1"] - 1.0 * il),
                         bars[0] if c["bx"] < bars[0]["start"] else bars[-1])
+            if mode == "centre":
+                # a centred name that runs over a barline (over an empty bar
+                # there is no slash to centre on): its middle says the bar
+                mid = (c["x"] + c["x1"]) / 2
+                if any(c["x"] < b["x0"] < c["x1"] for b in bars[1:]):
+                    home = next((b for b in bars if b["x0"] <= mid < b["x1"]), home)
             if "unread" in c and c["x1"] < sy["header"]:
                 continue                               # a bar number at the head of the line
             home["chords"].append(c)
