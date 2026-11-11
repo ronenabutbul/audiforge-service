@@ -108,7 +108,7 @@ def _sign_shape(mask: np.ndarray, il: float) -> str | None:
     if hole.sum() >= 0.1 * mask.size:
         # "o": a small round ring, its hole in the middle
         hy, hx = np.nonzero(hole)
-        if w <= 1.0 * il and h <= 1.0 * il and abs(w - h) <= 0.25 * il \
+        if w <= 1.2 * il and h <= 1.2 * il and abs(w - h) <= 0.25 * il \
                 and abs(hx.mean() - (w - 1) / 2) <= 0.1 * w and abs(hy.mean() - (h - 1) / 2) <= 0.1 * h:
             return "open"
         return None
@@ -207,11 +207,15 @@ class Sheet:
         # from a copy with every recognised word blanked
         self.marksink = self.nolines & ~self.thinlines
         self.equals = []
+        # words of two letters or more (a "3" alone is not one)
+        self.wordboxes = []
         for w in root.iter("word"):
             b = w.find("bounds")
             value = (w.get("value") or "").strip()
             if b is None:
                 continue
+            if len(value) >= 2 and sum(ch.isalpha() for ch in value) >= 1:
+                self.wordboxes.append(tuple(float(b.get(k)) for k in ("x", "y", "w", "h")))
             if value.startswith("=") or value[:1].isdigit() and "=" in value:
                 self.equals.append((float(b.get("x")), float(b.get("y")) + float(b.get("h")) / 2))
             # words, and the open/closed marks over a hi-hat line
@@ -303,27 +307,49 @@ class Sheet:
         # as "thin". Then the shape decides: ink along both diagonals,
         # paper straight above, below, left and right of the centre.
         raw = self.nolines.astype(np.float32)
-        q1 = cv2.filter2D(raw, -1, back / L) >= 0.8
-        q2 = cv2.filter2D(raw, -1, np.fliplr(back) / L) >= 0.8
         off = max(int(round(0.34 * il)), 3)
         paper = np.ones_like(self.ink)
         blur = cv2.blur(raw, (3, 3))
         for dy, dx in ((off, 0), (-off, 0), (0, off), (0, -off)):
             paper &= np.roll(blur, (-dy, -dx), axis=(0, 1)) < 0.35
-        heavy = cv2.dilate(q1.astype(np.uint8), d) & cv2.dilate(q2.astype(np.uint8), d) \
-            & paper.astype(np.uint8)
-        both = both | heavy
-        n, _lab, stats, cents = cv2.connectedComponentsWithStats(both)
+
+        def heavy(ink):
+            q1 = cv2.filter2D(ink, -1, back / L) >= 0.8
+            q2 = cv2.filter2D(ink, -1, np.fliplr(back) / L) >= 0.8
+            return cv2.dilate(q1.astype(np.uint8), d) & cv2.dilate(q2.astype(np.uint8), d) \
+                & paper.astype(np.uint8)
+        both = both | heavy(raw)
+        # a heavy cross centred ON a staff line loses its middle when the
+        # line is taken out: look again with the line kept (a line crosses
+        # a diagonal in one point only), where nothing was found yet
+        # (keeping the lines pulls an off-line cross's centre toward them)
+        taken = cv2.dilate(both, np.ones((int(1.2 * il),) * 2, np.uint8))
+        on_line = heavy(self.ink.astype(np.float32)) & (1 - taken) \
+            & cv2.dilate(self.linemask.astype(np.uint8), np.ones((3, 1), np.uint8))
         found = []
+        # ...and only an open, clean cross there: a roll slash on a line
+        # through a stem is heavier ink, and a grace note's flag beside
+        # its slash is solid ink a small square fits in
+        solid = cv2.morphologyEx(self.nolines.astype(np.uint8), cv2.MORPH_OPEN,
+                                 np.ones((sq, sq), np.uint8))
+        r = int(0.6 * il)
+        on_line = on_line.copy()
+        n, _lab, _st, cents = cv2.connectedComponentsWithStats(on_line)
         for i in range(1, n):
-            cx, cy = float(cents[i][0]), float(cents[i][1])
-            # a cross is as wide as it is tall and mostly paper
-            x0, x1 = int(cx - 0.75 * il), int(cx + 0.75 * il)
-            y0, y1 = int(cy - 0.6 * il), int(cy + 0.6 * il)
-            box = self.nolines[max(y0, 0):y1, max(x0, 0):x1]
-            if not box.size or box.mean() > 0.42:
-                continue
-            found.append((cx, cy))
+            cx, cy = int(cents[i][0]), int(cents[i][1])
+            if solid[max(cy - r, 0):cy + r, max(cx - r, 0):cx + r].any():
+                on_line[_lab == i] = 0
+        for mask, most in ((both, 0.42), (on_line, 0.28)):
+            n, _lab, stats, cents = cv2.connectedComponentsWithStats(mask)
+            for i in range(1, n):
+                cx, cy = float(cents[i][0]), float(cents[i][1])
+                # a cross is as wide as it is tall and mostly paper
+                x0, x1 = int(cx - 0.75 * il), int(cx + 0.75 * il)
+                y0, y1 = int(cy - 0.6 * il), int(cy + 0.6 * il)
+                box = self.nolines[max(y0, 0):y1, max(x0, 0):x1]
+                if not box.size or box.mean() > most:
+                    continue
+                found.append((cx, cy))
         # one cross can light up as two or three specks
         found.sort()
         merged: list[list[float]] = []
@@ -735,6 +761,94 @@ class Sheet:
                 return True
         return False
 
+    def digit(self, glyph: tuple) -> str | None:
+        """The digit one glyph (an entry of `self.glyphs`) prints, read by
+        Tesseract twice (as one character and as a word); None unless
+        both readings agree. Cached: a page has few candidates."""
+        cache = self.__dict__.setdefault("_digits", {})
+        if glyph in cache:
+            return cache[glyph]
+        import os
+        import subprocess
+        import tempfile
+        x, y, w, h, k = glyph
+        mask = (self._labels[y:y + h, x:x + w] == k).astype(np.uint8)
+        pad = max(h // 2, 4)
+        img = (np.pad(1 - mask, pad, constant_values=1) * 255).astype(np.uint8)
+        f = 64 / img.shape[0]
+        img = cv2.resize(img, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+        env = {"TESSDATA_PREFIX": str(BENCH_DIR / "tools" / "tessdata"),
+               "PATH": "/opt/homebrew/bin:/usr/bin:/bin" + os.pathsep + os.environ.get("PATH", "")}
+        reads = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = f"{tmp}/g.png"
+            cv2.imwrite(path, img)
+            for psm in ("10", "8"):
+                r = subprocess.run(["tesseract", path, "-", "--psm", psm, "-c",
+                                    "tessedit_char_whitelist=0123456789"],
+                                   capture_output=True, text=True, env=env)
+                reads.append(r.stdout.strip())
+        cache[glyph] = reads[0] if reads[0] and reads[0] == reads[1] else None
+        return cache[glyph]
+
+    def diamond(self, cx: float, cy: float) -> bool:
+        """A filled head drawn as a diamond (a ride bell): pointed at top
+        and bottom, its sides straight lines meeting at the widest row in
+        the middle. An oval head is flat-topped and fills far more of its
+        box; a hollow diamond (a roll) is not a filled head at all.
+
+        Measured row by row on the ink run through the centre column; a
+        row where a staff line runs on through the head is filled in from
+        its neighbours."""
+        il = self.il
+        x, y = int(round(cx)), int(round(cy))
+        span = int(0.9 * il)
+        rows = range(max(y - span, 0), min(y + span + 1, self.ink.shape[0]))
+        widths: list[float] = []
+        cap = int(1.2 * il)
+        for yy in rows:
+            row = self.ink[yy]
+            if not row[x]:
+                widths.append(0.0)
+                continue
+            a = b = x
+            while a > 0 and row[a - 1] and x - a < cap:
+                a -= 1
+            while b + 1 < len(row) and row[b + 1] and b - x < cap:
+                b += 1
+            # a staff line runs on through the head: unknown width
+            widths.append(np.nan if x - a >= cap or b - x >= cap else float(b - a + 1))
+        w = np.array(widths)
+        mid = y - rows.start
+        if mid >= len(w):
+            return False
+        # the head: the rows through its centre that are not paper
+        lo = hi = mid
+        while lo > 0 and w[lo - 1] != 0:
+            lo -= 1
+        while hi + 1 < len(w) and w[hi + 1] != 0:
+            hi += 1
+        w = w[lo:hi + 1]
+        known = np.nonzero(~np.isnan(w))[0]
+        if len(known) < 4:
+            return False
+        w = w[known[0]:known[-1] + 1]
+        gaps = np.isnan(w)
+        w[gaps] = np.interp(np.nonzero(gaps)[0], np.nonzero(~gaps)[0], w[~gaps])
+        h = len(w)
+        if not 0.6 * il <= h <= 1.4 * il:
+            return False
+        widest = w.max()
+        if not 0.7 * il <= widest <= 1.6 * il:
+            return False
+        end = max(h // 6, 2)
+        top_w, bot_w = w[:end].mean(), w[-end:].mean()
+        fill = w.sum() / (h * widest)
+        # widest at mid height: the corners left and right
+        peak = float(np.mean(np.nonzero(w >= 0.92 * widest)[0])) / (h - 1)
+        return fill <= 0.62 and max(top_w, bot_w) <= 0.35 * widest \
+            and 0.3 <= peak <= 0.7
+
     def in_time(self, x: float, y: float) -> bool:
         return any(tx - 2 <= x <= tx + tw + 2 and ty - 2 <= y <= ty + th + 2
                    for tx, ty, tw, th in self.timesigs)
@@ -760,8 +874,11 @@ class Sheet:
         n, _lab, stats, _c = cv2.connectedComponentsWithStats(box)
         for i in range(1, n):
             _x, _y, w, h, a = stats[i]
+            # a dot stands free: a piece cut off by the box's edge (a
+            # flag's tail running in from above) is not one
             if 0.14 * il <= w <= 0.5 * il and 0.14 * il <= h <= 0.5 * il \
-                    and a >= 0.6 * w * h and _x > 0 and _x + w < box.shape[1]:
+                    and a >= 0.6 * w * h and _x > 0 and _x + w < box.shape[1] \
+                    and _y > 0 and _y + h < box.shape[0]:
                 return True
         return False
 
@@ -784,6 +901,9 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
 
     heads = [(x, y, "normal") for x, y in sheet.filled if inside(x, y) and not on_rest(x, y)
              and not sheet.tempo_note(x, y, top)] \
+        + [(x, y, "normal") for x, y in sheet.small if inside(x, y) and sheet.diamond(x, y)
+           and not any(abs(x - cx) < 0.5 * il and abs(y - cy) < 0.5 * il
+                       for cx, cy in sheet.crosses)] \
         + [(x, y, "x") for x, y in sheet.crosses if inside(x, y)] \
         + [(x, y, "void") for x, y in sheet.voids if inside(x, y)] \
         + [(x, y, "circled_x") for x, y in sheet.rings if inside(x, y)
@@ -906,6 +1026,13 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
                            else 1 if ry < top + 0.8 * il else 0,
                            "value": value, "rest": True, "y": ry})
     events.sort(key=lambda e: e["x"])
+    # a filled head drawn as a diamond keeps "normal" for timing; the
+    # strike it becomes is a "diamond"
+    for e in events:
+        if not e.get("rest"):
+            e["diamonds"] = [(hx, hy) for hx, hy, k in e["heads"]
+                             if k == "normal" and sheet.diamond(hx, hy)]
+    _read_triplets(sheet, bar, events)
     _attach_signs(sheet, bar, events)
     # a grace note leans on the next note to its right
     for gx, gy, _gs in sheet.graces:
@@ -953,6 +1080,195 @@ def _attach_signs(sheet: Sheet, bar: dict, events: list[dict]) -> None:
             name = kind if kind in ("open", "closed") else kind + ("@above" if above else "@below")
             if name not in best[1].setdefault("signs", []):
                 best[1]["signs"].append(name)
+
+
+def _read_triplets(sheet: Sheet, bar: dict, events: list[dict]) -> None:
+    """A "3" over the stem tips of three notes (or under them, for the
+    lower voice), with or without a bracket: the three notes take the
+    time of two. Their values become two thirds of what they print
+    ("nominal" keeps the printed value) and they share a "tuplet" id."""
+    il, top = bar["il"], bar["top"]
+    notes = [e for e in events if not e.get("rest") and e["voice"] in (1, 2)]
+    if len(notes) < 3:
+        return
+    for glyph in sheet.glyphs:
+        gx, gy, gw, gh, _k = glyph
+        cx, cy = gx + gw / 2, gy + gh / 2
+        if not (bar["x0"] < cx < bar["x1"]) \
+                or not (0.55 * il <= gh <= 1.6 * il and 0.35 * il <= gw <= 1.2 * il
+                        and gh >= 1.1 * gw):
+            continue
+        above = cy < top + 2 * il
+        voice = 1 if above else 2
+        line = sorted((e for e in events if e["voice"] == voice and not e.get("tuplet")),
+                      key=lambda e: e["x"])
+        # stem tips of this voice near the digit, on its far side
+        tips = [e for e in line if not e.get("rest") and e.get("tip") is not None
+                and abs(e["x"] - cx) < 4 * il
+                and (0 < e["tip"] - cy < 3.2 * il if above else 0 < cy - e["tip"] < 3.2 * il)]
+        # a letter of a printed word ("Someone Like You") is not a 3:
+        # a tuplet's digit has no letter-sized neighbour on its line
+        # (a bracket's arms are long and flat, not letters)
+        if any(wx - 2 <= cx <= wx + ww + 2 and wy - 2 <= cy <= wy + wh + 2
+               for wx, wy, ww, wh in sheet.wordboxes):
+            continue
+        if any(o is not glyph and abs(o[1] + o[3] / 2 - cy) < 0.5 * gh
+               and 0.4 * gh <= o[3] <= 1.6 * gh and o[2] <= 1.5 * gh
+               and min(abs(o[0] - (gx + gw)), abs(gx - (o[0] + o[2]))) < 0.6 * il
+               for o in sheet.glyphs):
+            continue
+        if not tips or sheet.digit(glyph) != "3":
+            continue
+        cols: list[list[dict]] = []
+        for e in line:
+            if cols and e["x"] - cols[-1][0]["x"] < 0.7 * il:
+                cols[-1].append(e)
+            else:
+                cols.append([e])
+        if len(cols) < 3:
+            continue
+        best = min(range(len(cols) - 2), key=lambda k: abs(
+            np.mean([cols[k + j][0]["x"] for j in range(3)]) - cx))
+        group = cols[best:best + 3]
+        values = {min(c["value"] for c in col) for col in group}
+        if len(values) != 1 or abs(np.mean([c[0]["x"] for c in group]) - cx) > 2.5 * il:
+            continue
+        tid = f"{int(gx)}:{int(gy)}"
+        # a bracket: thin flat ink level with the digit, on both sides
+        band = sheet.thinlines[max(int(cy - 0.6 * il), 0):int(cy + 0.6 * il)]
+        left = band[:, max(int(gx - 3 * il), 0):max(int(gx - 0.1 * il), 0)].any(axis=0)
+        right = band[:, int(gx + gw + 0.1 * il):int(gx + gw + 3 * il)].any(axis=0)
+        bracket = bool(left.size and right.size and left.mean() > 0.4 and right.mean() > 0.4)
+        sheet.__dict__.setdefault("_brackets", {})[tid] = bracket
+        for col in group:
+            for e in col:
+                e["nominal"] = e["value"]
+                e["value"] = e["value"] * Fraction(2, 3)
+                e["tuplet"] = tid
+
+
+def bar_tuplets(events: list[dict], brackets: dict | None = None) -> list[dict]:
+    """The writer's tuplet list for a timed bar: one entry per "3" read."""
+    out = []
+    for tid in sorted({e["tuplet"] for e in events if e.get("tuplet")}):
+        members = [e for e in events if e.get("tuplet") == tid and e.get("slot") is not None]
+        if not members:
+            continue
+        start = min(e["slot"] for e in members)
+        last = max(members, key=lambda e: e["slot"])
+        out.append({"voice": members[0]["voice"], "start": str(start),
+                    "end": str(last["slot"] + last["value"]), "actual": 3, "normal": 2,
+                    "bracket": bool((brackets or {}).get(tid))})
+    return out
+
+
+def repeat_signs(ink: np.ndarray, top: float, il: float, x0: float, x1: float
+                 ) -> list[tuple[float, int]]:
+    """Bar repeat signs ("%": slashes between two dots) on a staff
+    between x0 and x1: [(centre x, number of slashes)]. `ink` is the
+    page ink, `top` the top staff line's y. One slash repeats one bar;
+    two slashes repeat two bars and the sign then straddles the barline
+    between the two bars it fills.
+
+    A slash is a thick stroke rising to the right through the middle
+    of the staff. Staff lines and a barline through the sign cut it into
+    pieces, so slashes are found by projection, not by blobs: the rows
+    of the middle spaces (staff-line rows left out) are sheared by a
+    trial slope until every slash stands upright, and a slash is then a
+    band of columns inked on nearly every row. The dots stand in the
+    spaces above and below, one up-left and one down-right of the
+    slashes."""
+    xa, xb = int(max(x0 - 1.5 * il, 0)), int(min(x1 + 1.5 * il, ink.shape[1]))
+    ya, yb = int(max(top - 0.3 * il, 0)), int(top + 4.3 * il)
+    box = ink[ya:yb, xa:xb].copy()
+    if box.shape[0] < 4 * il or box.shape[1] < 2 * il:
+        return []
+    # barlines: columns inked over the whole staff height
+    full = box[int(0.3 * il):int(4.3 * il)].mean(axis=0) > 0.85
+    full = full | np.r_[False, full[:-1]] | np.r_[full[1:], False]
+    box[:, full] = False
+    # a slash crossing the barline: bridge the cut where ink goes on both sides
+    if full.any():
+        k = int(full.sum() // max(len(_runs(full)), 1)) + 3
+        shut = cv2.morphologyEx(box.astype(np.uint8), cv2.MORPH_CLOSE,
+                                np.ones((1, k), np.uint8)).astype(bool)
+        box[:, full] = shut[:, full]
+    lines = box.mean(axis=1) > 0.45
+    lines = lines | np.r_[False, lines[:-1]] | np.r_[lines[1:], False]
+    ymid = top + 2 * il
+    rows = [y for y in range(int(top + 1.3 * il) - ya, int(top + 2.7 * il) - ya)
+            if not lines[y]]
+    if len(rows) < 0.6 * il:
+        return []
+    width = box.shape[1]
+    best = None
+    for slope in np.linspace(-1.6, -0.25, 28):     # dx per dy, rising to the right
+        prof = np.zeros(width + 4 * int(il) + 4)
+        off = 2 * int(il) + 2
+        for y in rows:
+            shift = int(round(slope * (ya + y - ymid)))
+            prof[off - shift:off - shift + width] += box[y]
+        prof /= len(rows)
+        # the slope that stands the most columns upright
+        score = float((prof >= 0.8).sum())
+        if best is None or score > best[0]:
+            best = (score, prof, slope)
+    _score, prof, slope = best
+    strokes = []
+    for s, e in _runs(prof >= 0.8):
+        if max(2.0, 0.1 * il) <= e - s <= 1.6 * il:
+            strokes.append(xa + (s + e) / 2 - (2 * int(il) + 2))
+    if not strokes:
+        return []
+    # dots: small solid blobs off the staff lines
+    clean = box.copy()
+    clean[lines] = False
+    # staff-line remnants (a line printed thicker in places) touch the dots
+    flat = cv2.morphologyEx(box.astype(np.uint8), cv2.MORPH_OPEN,
+                            np.ones((1, max(3, int(1.2 * il))), np.uint8)).astype(bool)
+    clean &= ~flat
+    n, lab, stats, cents = cv2.connectedComponentsWithStats(clean.astype(np.uint8))
+    dots = []
+    for i in range(1, n):
+        bx, by, w, h, a = stats[i]
+        if 0.25 * il <= w <= 0.8 * il and 0.2 * il <= h <= 0.8 * il \
+                and a >= 0.55 * w * h:
+            dots.append((xa + cents[i][0], ya + cents[i][1]))
+    found = []
+    k = 0
+    while k < len(strokes):
+        run = [strokes[k]]
+        while k + len(run) < len(strokes) and strokes[k + len(run)] - run[-1] < 1.4 * il:
+            run.append(strokes[k + len(run)])
+        k += len(run)
+        mid = (run[0] + run[-1]) / 2
+        # the slash reaches about 1.2 interlines either side of the middle
+        reach = abs(slope) * 1.2 * il + 0.6 * il
+        up = [d for d in dots if run[0] - reach - 0.6 * il <= d[0] < run[0]
+              and top + 0.7 * il <= d[1] <= top + 1.8 * il]
+        down = [d for d in dots if run[-1] < d[0] <= run[-1] + reach + 0.6 * il
+                and top + 2.2 * il <= d[1] <= top + 3.3 * il]
+        # the dots sit on a diagonal, not one over the other as a
+        # repeat barline's dots do
+        if len(run) <= 4 and any(d[0] - u[0] >= 1.2 * il for u in up for d in down):
+            found.append((float(mid), len(run)))
+    return found
+
+
+def bar_repeat(ink: np.ndarray, bar: dict) -> tuple[int, int] | None:
+    """(bars repeated, which of them this bar is) when `bar` (a dict
+    with x0, x1, top, il) holds a bar repeat sign: (1, 0) for a one-bar
+    sign in its middle, (2, 0) / (2, 1) when a two-bar sign straddles
+    its right / left barline. None for a bar without one."""
+    il, x0, x1 = bar["il"], bar["x0"], bar["x1"]
+    for cx, n in repeat_signs(ink, bar["top"], il, x0, x1):
+        if n == 1 and x0 + 0.25 * (x1 - x0) <= cx <= x1 - 0.25 * (x1 - x0):
+            return (1, 0)
+        if n == 2 and abs(cx - x1) < 1.2 * il:
+            return (2, 0)
+        if n == 2 and abs(cx - x0) < 1.2 * il:
+            return (2, 1)
+    return None
 
 
 def time_bar(read: dict, il: float) -> tuple[list[dict], str | None]:
@@ -1043,7 +1359,7 @@ def _time_assign(read: dict, il: float) -> tuple[list[dict], str | None]:
         if e.get("rest"):
             e["voice"] = voice[id(e)]
         e["slot"], e["value"] = times[id(e)]
-    if any(e["slot"].denominator != 1 for e in notes):
+    if any(e["slot"].denominator != 1 and not e.get("tuplet") for e in notes):
         return events, "off-grid"
     return events, None
 
@@ -1158,7 +1474,7 @@ def _time_once(read: dict, il: float, mode: str) -> tuple[list[dict], str | None
     if any(e != slots for e in ends):
         problem = "voices end at " + "/".join(str(float(cursor[v])) for v in (1, 2)) \
             + f" of {slots}"
-    if any(e.get("slot") is not None and e["slot"].denominator != 1
+    if any(e.get("slot") is not None and e["slot"].denominator != 1 and not e.get("tuplet")
            for e in events if not e.get("rest")):
         problem = (problem or "") + " off-grid"
     return events, problem
@@ -1304,6 +1620,8 @@ def _strikes_of(e: dict, bar: dict) -> list[dict]:
                  or s.endswith("@above") and k == 0
                  or s.endswith("@below") and k == len(heads) - 1]
         slot = e["slot"]
+        if (hx, hy) in e.get("diamonds", ()):
+            kind = "diamond"
         out.append({"slot": int(slot), "onset": slot,
                     "step": int(round((hy - bar["top"]) / (bar["il"] / 2))),
                     "kind": kind, "value": e.get("nominal", e["value"]),
@@ -1367,9 +1685,146 @@ def read_chart(omr: Path) -> list[dict]:
                         strikes += _strikes_of(e, bar)
                     out.append({"ordinal": ordinal, "part": part, "sheet": name,
                                 "strikes": strikes, "problem": problem, "events": events,
-                                "slots": slots, "bar": bar})
+                                "tuplets": bar_tuplets(events, sheet.__dict__.get("_brackets"))
+                                if not problem else [],
+                                "slots": slots, "bar": bar,
+                                "repeat": bar_repeat(ink, bar)})
                 ordinal += 1
+    fill_repeats(out)
+    with zipfile.ZipFile(omr) as z:
+        words = {name: kit_words(ET.fromstring(
+            z.read(f"{name}/{name}.xml").decode("utf-8", "replace")))
+            for name in _sheets(z)}
+    apply_kit_words(out, words)
     return out
+
+
+# Words that name the part of the cymbal struck. Compared with letters
+# only ("Cym.Dome", "Cym_Dome", "Cym. Dome" are one word).
+_BELL_WORDS = ("bell", "cup", "dome", "cymdome", "ridebell")
+_CYMBAL_WORDS = ("ride", "ridecym", "suscym", "cym", "hh", "hihat", "hithat", "crash",
+                 "choke")
+
+
+def _kit_word(text: str) -> str | None:
+    """'bell', 'cymbal' (a word that ends a bell passage) or None. One
+    wrong letter in a word of three or more is OCR ("Gym." for "Cym.")."""
+    letters = "".join(c for c in text.lower() if c.isalpha())
+    for kind, terms in (("bell", _BELL_WORDS), ("cymbal", _CYMBAL_WORDS)):
+        for t in terms:
+            if letters == t or (len(t) >= 3 and len(letters) == len(t)
+                                and sum(a != b for a, b in zip(letters, t)) == 1):
+                return kind
+    return None
+
+
+def kit_words(root: ET.Element) -> list[tuple[float, float, float, str]]:
+    """[(x, y, width, 'bell' | 'cymbal')] for every printed kit word on
+    one page, from Audiveris' sentences (the words inside each
+    sentence's bounds, read together)."""
+    words = []
+    for w in root.iter("word"):
+        b = w.find("bounds")
+        if b is not None and (w.get("value") or "").strip():
+            words.append((float(b.get("x")), float(b.get("y")), float(b.get("w")),
+                          float(b.get("h")), w.get("value")))
+    out = []
+    for sentence in root.iter("sentence"):
+        b = sentence.find("bounds")
+        if b is None:
+            continue
+        sx, sy, sw, sh = (float(b.get(k)) for k in ("x", "y", "w", "h"))
+        inside = sorted((w for w in words if sx - 4 <= w[0] <= sx + sw + 4
+                         and sy - 4 <= w[1] <= sy + sh + 4), key=lambda w: w[0])
+        kind = _kit_word("".join(w[4] for w in inside))
+        if kind:
+            out.append((sx, sy + sh / 2, sw, kind))
+    return out
+
+
+def apply_kit_words(chart: list[dict], words: dict[str, list]) -> None:
+    """A bell word ("Bell", "Cup", "Dome", "Cym. Dome", "Ride Bell") makes
+    the cymbal note it stands over, or the first one after it, a ride
+    bell, and every later cymbal note with the same head on the same line
+    too, until a cymbal word ("Ride", "Cym.", "Sus. Cym.", "H.H.",
+    "Crash", "Choke") or a hi-hat sign (o, +) says otherwise. Notes with
+    another head or on another line are left as they are."""
+    cymbal = ("x", "circled_x", "diamond")
+    marks = []          # (chart index, x, kind)
+    for i, b in enumerate(chart):
+        bar = b["bar"]
+        il, top = bar["il"], bar["top"]
+        for x, y, w, kind in words.get(b["sheet"], []):
+            # over the staff (or just under it), inside the bar
+            if bar["x0"] - 0.5 * il <= x < bar["x1"] and top - 7 * il <= y <= top + 9 * il:
+                # the nearest staff when two systems could claim it
+                others = [c for c in chart if c["sheet"] == b["sheet"] and c is not b
+                          and c["bar"]["x0"] - 0.5 * il <= x < c["bar"]["x1"]
+                          and abs(c["bar"]["top"] + 2 * il - y) < abs(top + 2 * il - y)]
+                if not others:
+                    # a bell word stands over the note it starts on; a
+                    # word that ends the passage may follow its note
+                    # ("Choke" printed right of the choked cymbal)
+                    marks.append((i, x - (0.8 if kind == "bell" else 3.0) * il, kind))
+    marks.sort(key=lambda m: (m[0], m[1]))
+    if not any(k == "bell" for _i, _x, k in marks):
+        return
+    target = None       # (step, head) a bell word has claimed
+    pending = False     # a bell word waiting for its first cymbal note
+    mi = 0
+    for i, b in enumerate(chart):
+        for st in sorted(b["strikes"], key=lambda s: s.get("x", 0)):
+            while mi < len(marks) and (marks[mi][0] < i or
+                                       marks[mi][0] == i and marks[mi][1] <= st.get("x", 0)):
+                pending = marks[mi][2] == "bell"
+                target = None
+                mi += 1
+            if st["kind"] not in cymbal:
+                continue
+            if "open" in st["marks"] or "closed" in st["marks"]:
+                target, pending = None, False
+                continue
+            if pending:
+                target, pending = (st["step"], st["kind"]), False
+            if target == (st["step"], st["kind"]):
+                st["inst"] = "ride_bell"
+        while mi < len(marks) and marks[mi][0] == i:
+            pending = marks[mi][2] == "bell"
+            target = None if pending or marks[mi][2] == "cymbal" else target
+            mi += 1
+
+
+def fill_repeats(chart: list[dict]) -> None:
+    """Bars that print a repeat sign take the notes of the bar(s) they
+    repeat, so playback and scoring hear them; 'repeat_bars' (1 or 2)
+    tells the writer to show the sign. A two-bar sign must be seen from
+    both bars it covers, and the bars repeated must have the same
+    meter."""
+    import copy
+    i = 0
+    while i < len(chart):
+        rep = chart[i].get("repeat")
+        n = 0
+        if rep == (1, 0):
+            n = 1
+        elif rep == (2, 0) and i + 1 < len(chart) and chart[i + 1].get("repeat") == (2, 1):
+            n = 2
+        src = list(range(i - n, i))
+        # whatever was read under the sign is the sign itself, a
+        # rehearsal box or a coda mark touching the staff
+        if not n or src[0] < 0 or any(chart[k]["slots"] != chart[i]["slots"] for k in src):
+            i += 1
+            continue
+        for k in src:
+            dst = chart[k + n]
+            dst["strikes"] = copy.deepcopy(chart[k]["strikes"])
+            dst["events"] = copy.deepcopy(chart[k]["events"])
+            dst["problem"] = chart[k]["problem"]
+            if chart[k].get("tuplets"):
+                dst["tuplets"] = copy.deepcopy(chart[k]["tuplets"])
+            dst["repeat_bars"] = n
+            dst["repeat_of"] = (chart[k]["ordinal"], chart[k]["part"])
+        i += n
 
 
 def system_numbers(omr: Path) -> dict[int, int]:
@@ -1530,9 +1985,11 @@ def ink_readings(crops: list[dict], omr: Path, rest_counts: dict | None = None,
                                       voice=voice if sure else None,
                                       value=int(value) if sure else None,
                                       marks=st["marks"], grace=st.get("grace", False),
+                                      inst=st.get("inst"),
                                       onset=str(onset) if onset is not None else None))
         readings.append(BarReading(strikes=strikes,
-                                   tuplets=bar.get("tuplets", []) if bar else []))
+                                   tuplets=bar.get("tuplets", []) if bar else [],
+                                   repeat_bars=bar.get("repeat_bars", 0) if bar else 0))
     return readings, unsure
 
 
