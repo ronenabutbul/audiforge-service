@@ -1107,6 +1107,35 @@ def _bar_on_staff(system: System, bar: dict, staff: Staff, first: bool) -> dict:
             "lines": staff.lines, "first": first}
 
 
+def _head_y(e: dict, strike: dict) -> float:
+    """Page y of the head a strike was made from."""
+    if strike.get("grace"):
+        return next(gy for gx, gy in e.get("graces", []) if gx == strike["x"])
+    return next(hy for hx, hy, _k in e["heads"] if hx == strike["x"])
+
+
+def _join_split_heads(sheet) -> None:
+    """Two filled heads on one stem a third apart print side by side
+    vertically one interline apart; a single head that runs into a staff
+    line and a stem can come out of the head opening as one blob too tall
+    for a head, which `drum_ink` cuts into two "heads" well under an
+    interline apart at the very same x. Such a pair is one head."""
+    il = sheet.il
+    heads = sorted(sheet.filled)
+    out, used = [], set()
+    for i, (x, y) in enumerate(heads):
+        if i in used:
+            continue
+        twin = next((j for j in range(i + 1, len(heads)) if j not in used
+                     and abs(heads[j][0] - x) < 0.05 * il and abs(heads[j][1] - y) < 0.85 * il), None)
+        if twin is None:
+            out.append((x, y))
+        else:
+            used.add(twin)
+            out.append((x, (y + heads[twin][1]) / 2))
+    sheet.filled = out
+
+
 def _drop_head_columns(sheet) -> None:
     """A stem shows itself somewhere as a thin upright with paper on both
     sides. A cross head printed right above a filled head makes an
@@ -1207,6 +1236,7 @@ def read_drums(systems: list[System], pages: dict, slot: int, meters: list[tuple
                             for k2, b2 in enumerate(s2.bars)}
                     sheets[system.name] = drum_ink.Sheet(ink, root, bars=list(geos.values()))
                     _drop_head_columns(sheets[system.name])
+                    _join_split_heads(sheets[system.name])
                     geo_of.update(geos)
                 sheet = sheets[system.name]
                 # the very bar the sheet knows (its "k" homes the signs)
@@ -1228,7 +1258,14 @@ def read_drums(systems: list[System], pages: dict, slot: int, meters: list[tuple
                     for e in events:
                         if e.get("rest") or e.get("slot") is None:
                             continue
-                        entry["strikes"] += drum_ink._strikes_of(e, geo)
+                        strikes = drum_ink._strikes_of(e, geo)
+                        if staff.count == 5:
+                            # a skewed page tilts the staff: a head's line
+                            # is told by the staff where the head stands
+                            for st in strikes:
+                                ys = staff.ys(st["x"])
+                                st["step"] = int(round((_head_y(e, st) - ys[0]) / ((ys[-1] - ys[0]) / 8)))
+                        entry["strikes"] += strikes
                         if not problem and e["voice"] in (1, 2):
                             y = geo["top"] + 2 * geo["il"]
                             entry["anchors"].append((e["x"] - system.shift(y), Fraction(e["slot"]) / 4))
@@ -1237,6 +1274,17 @@ def read_drums(systems: list[System], pages: dict, slot: int, meters: list[tuple
                 entry["shown"] = False
             out.append(entry)
             ordinal += 1
+    # "o" and "+" are hi-hat marks: a cross carrying one is the hi-hat,
+    # wherever the beam's slant has nudged it to
+    from collections import Counter
+    marked = Counter(st["step"] for e in out for st in e["strikes"]
+                     if st["kind"] == "x" and {"open", "closed"} & set(st["marks"]))
+    if marked:
+        hh = marked.most_common(1)[0][0]
+        for e in out:
+            for st in e["strikes"]:
+                if st["kind"] in ("x", "circled_x") and {"open", "closed"} & set(st["marks"]):
+                    st["step"] = hh
     # a simile bar plays the bar before it
     for k, entry in enumerate(out):
         if entry["simile"] and k and out[k - 1]["slots"] == entry["slots"]:
