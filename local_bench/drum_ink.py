@@ -445,6 +445,19 @@ class Sheet:
         # flats) away first, so the sign is an island again.
         upright = cv2.morphologyEx(self.u8, cv2.MORPH_OPEN,
                                    np.ones((max(int(1.9 * il), 5), 1), np.uint8))
+        # The side of a small box is no taller than a "+": it is known by
+        # the thin flat lines it joins at both of its ends.
+        short = cv2.morphologyEx(self.u8, cv2.MORPH_OPEN,
+                                 np.ones((max(int(1.1 * il), 5), 1), np.uint8))
+        m, slab, sstats, _c = cv2.connectedComponentsWithStats(short & (1 - upright))
+        for j in range(1, m):
+            sx, sy, sw, sh_, _a = sstats[j]
+            if sw > 0.4 * il:
+                continue
+            ends = [self.thinlines[max(yy - 4, 0):yy + 5, max(sx - 4, 0):sx + sw + 4].any()
+                    for yy in (sy, sy + sh_)]
+            if all(ends):
+                upright[slab == j] = 1
         upright = cv2.dilate(upright, np.ones((1, 3), np.uint8))
         islands = self.u8 & (1 - upright) & (1 - self.thinlines.astype(np.uint8))
         n, lab, stats, _c = cv2.connectedComponentsWithStats(islands, connectivity=8)
@@ -463,6 +476,10 @@ class Sheet:
             if k in dashes:
                 # a dash on a staff line is a piece of the line
                 if self.linemask[y:y + h, x + w // 2].any():
+                    continue
+                # two dashes one over the other are an equals sign
+                if any(j != k and abs(stats[j][0] - x) < 0.5 * il
+                       and 0 < abs(stats[j][1] - y) < 0.8 * il for j in dashes):
                     continue
                 kind = "tenuto"
             elif not (0.42 * il <= w <= 2.0 * il and 0.42 * il <= h <= 1.6 * il):
@@ -915,7 +932,8 @@ def _attach_signs(sheet: Sheet, bar: dict, events: list[dict]) -> None:
         best = None
         for e in notes:
             ys = [h[1] for h in e["heads"]]
-            dx = min(abs(sx - x) for x in [h[0] for h in e["heads"]] + [e["x"]])
+            # a sign is centred on the head or on the stem
+            dx = min(abs(sx - x) for x in [h[0] for h in e["heads"]] + [e["x"], e.get("sx", e["x"])])
             if dx > 0.95 * il:
                 continue
             if (sy > min(ys) - 0.5 * il) if above else (sy < max(ys) + 0.5 * il):
