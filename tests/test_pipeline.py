@@ -848,6 +848,29 @@ def test_whole_rest_before_a_multirest_is_not_a_lost_bar():
     assert not any(w.text == "?" for w in ET.parse(path).getroot().iter("words"))
 
 
+def test_a_signature_standing_alone_is_not_a_bar():
+    """A key or time signature with nothing else in its stack is not a
+    bar: the courtesy 2/4 after a system's last barline, or a 4/4 between
+    a double barline and a repeat sign. Counted as bars they pushed every
+    printed number after them one too high, and rests placed by number
+    landed a bar late. James Bond Tenor Sax: the numbers at the start of
+    every system must be the ones printed there."""
+    from app import fix_hbars
+
+    omr = next((replay.RESULTS / "convert" / "James Bond - Tenor Sax").glob("*.omr"))
+    hbars = quiet(fix_hbars.detect_hbars, omr)
+    numbers = fix_hbars.stack_numbers(omr, hbars)
+    starts, previous = [], None
+    for stack in fix_hbars._iter_stacks(omr):
+        system = (id(stack[0]), round(stack[2]))
+        if system != previous:
+            starts.append(numbers[stack[7]])
+        previous = system
+    printed = [1, 11, 15, 21, 28, 33, 39, 47, 55, 64, 70, 78, 89, 96, 101, 109,
+               116, 123, 133, 142, 148, 154, 160, 166]
+    assert starts == printed, starts
+
+
 def test_rest_expanded_from_a_misread_count_is_cut_to_the_page():
     """homr read an "8" over a rest the page prints as "4" and expanded it
     to 8 bars; the count is corrected to 4 but the bars stayed 8. The page

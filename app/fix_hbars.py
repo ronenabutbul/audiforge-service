@@ -771,6 +771,54 @@ def _detect_hbars_only(omr_path: Path) -> list[dict]:
     return merged
 
 
+# A signature-only stack wider than this is a real bar that happens to
+# hold no chords Audiveris read; the narrowest signature stack seen in the
+# corpus between barlines is 4.8 interlines (a 4/4 between a double
+# barline and a repeat sign), a full bar is rarely under 7.
+SIGNATURE_STACK_MAX_IL = 6.0
+
+
+def courtesy_stacks(omr_path: Path) -> set[int]:
+    """Ordinals of stacks that hold only a key or time signature: no note,
+    no rest, nothing but the signature and a barline. Such a stack is not a
+    bar. At a system's end it is the courtesy signature after the final
+    barline (Audiveris marks it CAUTIONARY, and it may be wider than the
+    3-interline sliver test catches: a 2/4 at 3.2 interlines, a key of
+    three flats at 5.4). Inside a system it is a new signature standing
+    between a double barline and the next bar's repeat sign. Counting it
+    put every bar number after it one too high."""
+    out, ordinal = set(), 0
+    with zipfile.ZipFile(omr_path) as z:
+        sheets = sorted(
+            {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+            key=lambda s: int(s.split("#")[1]))
+        for sheet in sheets:
+            root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml")
+                                 .decode("utf-8", "replace"))
+            interline = root.find("scale/interline")
+            il = float(interline.get("main")) if interline is not None else 0
+            for system in root.iter("system"):
+                staff = system.find(".//staff")
+                if staff is None or len(staff.findall("lines/line")) < 5:
+                    continue
+                stacks = system.findall("stack")
+                parts = system.findall("part")
+                measures = parts[0].findall("measure") if len(parts) == 1 else []
+                for k, stack in enumerate(stacks[:len(measures)]):
+                    kinds = {child.tag for child in measures[k]}
+                    signature = kinds & {"keys", "times"}
+                    if not signature or kinds - {"keys", "times", "right-barline"}:
+                        continue
+                    width = float(stack.get("right")) - float(stack.get("left"))
+                    trailing = (k == len(stacks) - 1
+                                and stack.get("special") == "CAUTIONARY"
+                                and "right-barline" not in kinds)
+                    if trailing or (il and width < SIGNATURE_STACK_MAX_IL * il):
+                        out.add(ordinal + k)
+                ordinal += len(stacks)
+    return out
+
+
 def stack_numbers(omr_path: Path, hbars: list[dict]) -> list[int]:
     """Printed measure number for every stack (in reading order), advancing
     by the verified H-bar count on multirest stacks — the numbering the
@@ -786,10 +834,11 @@ def stack_numbers(omr_path: Path, hbars: list[dict]) -> list[int]:
     # bars shifts every number after it, and every letter and rest
     # placed by number with them.
     medians = _row_median_widths(omr_path)
+    courtesy = courtesy_stacks(omr_path)
     counts = {}
     for (_, pixels, top, bottom, il, x0, x1, ordinal,
          _sx0) in _iter_stacks(omr_path):
-        if x1 - x0 < 3 * il:
+        if x1 - x0 < 3 * il or ordinal in courtesy:
             # A sliver at a system's end holds a courtesy clef or time
             # signature, not a bar.
             counts[ordinal] = 0
