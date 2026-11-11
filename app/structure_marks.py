@@ -442,6 +442,9 @@ def _repeat_signs(sheet: _Sheet) -> list[Mark]:
 ENDING_MIN_IL = 3.5        # shortest bracket line; a rehearsal box is narrower
 ENDING_LINE_MAX_IL = 0.36  # thicker is a beam
 ENDING_LEG_MIN_IL = 0.7
+# A bracket carried over a system break resumes after the clef and key
+# signature (a clef is ~3 interlines, seven sharps ~7), not at the margin.
+ENDING_RESUME_IL = 10.0
 
 
 def _level_lines(sheet: _Sheet, system: _System, above_limit: float) -> list[dict]:
@@ -737,7 +740,7 @@ def _ending_marks(sheets: list[_Sheet], per_sheet: list[list[dict]]) -> list[Mar
                         # the next system
                         or previous["right"]
                         and previous["x1"] >= previous["edge"] - 2 * previous["il"]
-                        and b["x0"] <= system.x0 + 2 * il
+                        and b["x0"] <= system.x0 + ENDING_RESUME_IL * il
                         and _next_system(sheets, previous) == (sheet.index, b["system"])):
                     last = max(int(n) for n in previous["number"].split(", "))
                     number = str(last + 1)
@@ -750,7 +753,7 @@ def _ending_marks(sheets: list[_Sheet], per_sheet: list[list[dict]]) -> list[Mar
                                 "edge": system.x1, "il": il}
             elif (open_bracket is not None and not open_bracket["right"]
                   and open_bracket["x1"] >= open_bracket["edge"] - 2 * open_bracket["il"]
-                  and b["x0"] <= system.x0 + 2 * il
+                  and b["x0"] <= system.x0 + ENDING_RESUME_IL * il
                   and _next_system(sheets, open_bracket) == (sheet.index, b["system"])):
                 number = open_bracket["number"]
                 marks.pop()  # the open end at the system break
@@ -1080,6 +1083,14 @@ def measure_numbers(omr_path: Path, hbars: list[dict], marks: list[Mark],
                                        numbers=stack_numbers_):
             if found[i] is None:
                 found[i] = number
+    # A mark read at a bar's end that stands on a multi-bar rest acts
+    # after the whole rest: on its last bar, not the first.
+    starts = stack_numbers_ or stack_numbers(omr_path, hbars) or []
+    counts = {starts[h["stack"]]: h["count"] for h in hbars
+              if h.get("read") and h["count"] > 1 and h["stack"] < len(starts)}
+    for i, m in enumerate(marks):
+        if found[i] in counts and m.kind in _AT_BAR_END:
+            found[i] += counts[found[i]] - 1
     return found
 
 
@@ -1208,6 +1219,9 @@ def _direction(kind: str):
 
 def _sound_apart(kind: str) -> bool:
     return kind in JUMP_WORDS and (kind.startswith("ds") or kind.startswith("dc"))
+
+
+_AT_BAR_END = {REPEAT_END, ENDING_STOP, ENDING_OPEN, TO_CODA, FINE, *JUMPS}
 
 
 def place(omr_path: Path, result_path: Path, hbars: list[dict] | None = None,
