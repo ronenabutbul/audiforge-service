@@ -1183,7 +1183,17 @@ def _waisted(sheet, hx: float, hy: float, il: float) -> bool:
         near = [b - a for a, b in _runs(row) if a + x0 <= hx + 0.5 * il and b + x0 >= hx - 0.5 * il]
         if near:
             widths.append(max(near))
-    return bool(widths) and float(np.median(widths)) < 0.72 * il
+    if bool(widths) and float(np.median(widths)) < 0.72 * il:
+        return True
+    # a cross's arms leave paper straight above or below its knot, where
+    # a filled head is ink for half an interline either way
+    xi = int(round(hx))
+    for d in (-1, 1):
+        ys = range(int(round(hy + d * 0.22 * il)), int(round(hy + d * 0.42 * il)), d)
+        if not all(sheet.ink[y, max(xi - 1, 0):xi + 2].any() for y in ys
+                   if 0 <= y < sheet.ink.shape[0]):
+            return True
+    return False
 
 
 def _simile(sheet, bar: dict) -> bool:
