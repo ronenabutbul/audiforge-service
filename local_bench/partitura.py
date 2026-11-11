@@ -1107,6 +1107,49 @@ def _bar_on_staff(system: System, bar: dict, staff: Staff, first: bool) -> dict:
             "lines": staff.lines, "first": first}
 
 
+def _score_sheet():
+    """`drum_ink.Sheet` as a score's percussion staff needs it."""
+    import drum_ink
+
+    class ScoreSheet(drum_ink.Sheet):
+        def tip_marks(self, x, tip, toward, reach):
+            """Two sixteenth beams printed close run into one black band
+            on a coarse scan, too thick for one beam: such a band at the
+            tip counts as the beams that fit in it."""
+            beams, slashes = super().tip_marks(x, tip, toward, reach)
+            if beams > 1:
+                return beams, slashes
+            il = self.il
+            ya, yb = tip - toward * 0.45 * il, tip + toward * reach
+            y0, y1 = max(int(min(ya, yb)), 0), max(int(max(ya, yb)), 1)
+            for dx in (-0.38 * il, 0.38 * il):
+                col = int(round(x + dx))
+                if not 0 <= col < self.ink.shape[1]:
+                    continue
+                for a, b in drum_ink._runs(self.marksink[y0:y1, col]):
+                    near_tip = abs((a if toward > 0 else b) + y0 - tip) < 0.35 * il
+                    if near_tip and 1.05 * il < b - a <= 2.3 * il:
+                        return max(beams, int(round((b - a) / (0.7 * il)))), slashes
+            return beams, slashes
+    return ScoreSheet
+
+
+def _own_signs(sheet, systems: list[System], slot: int) -> None:
+    """Keep the signs that belong to this staff: a sign nearer another
+    staff of its system (an accent over the line below, a mark over the
+    staff above) speaks to that staff."""
+    def gap(st, y):
+        a, b = st.top(st.left), st.bottom(st.left)
+        return 0.0 if a <= y <= b else min(abs(y - a), abs(y - b))
+    kept = []
+    for sign in sheet.signs:
+        y = sign[1]
+        system = min(systems, key=lambda s: min(gap(st, y) for st in s.staves))
+        if min(system.staves, key=lambda st: gap(st, y)).slot == slot:
+            kept.append(sign)
+    sheet.signs = kept
+
+
 def _head_y(e: dict, strike: dict) -> float:
     """Page y of the head a strike was made from."""
     if strike.get("grace"):
@@ -1244,9 +1287,10 @@ def read_drums(systems: list[System], pages: dict, slot: int, meters: list[tuple
                             for s2 in systems if s2.name == system.name
                             for st2 in s2.staves if st2.slot == slot
                             for k2, b2 in enumerate(s2.bars)}
-                    sheets[system.name] = drum_ink.Sheet(ink, root, bars=list(geos.values()))
+                    sheets[system.name] = _score_sheet()(ink, root, bars=list(geos.values()))
                     _drop_head_columns(sheets[system.name])
                     _join_split_heads(sheets[system.name])
+                    _own_signs(sheets[system.name], [s2 for s2 in systems if s2.name == system.name], slot)
                     geo_of.update(geos)
                 sheet = sheets[system.name]
                 # the very bar the sheet knows (its "k" homes the signs)
