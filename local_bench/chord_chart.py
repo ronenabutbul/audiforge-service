@@ -658,7 +658,7 @@ def read_items(sheet: Sheet, system: System, header: float, blocked: list[tuple[
         if not it["stem"] and kind == "filled" and not -0.3 * il <= hy - system.top(hx) <= 4.3 * il:
             continue          # a blob outside the staff with no stem: a digit, a bold letter
         items.append(it)
-    for rx, ry, slots, edge in sheet.rests:
+    for rx, ry, slots, edge, *_box in sheet.rests:
         rel = ry - system.top(rx)
         if header < rx < system.x1 and -il < rel < 5 * il:
             q = Fraction(slots).limit_denominator(4) / 4
