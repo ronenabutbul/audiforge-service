@@ -505,13 +505,28 @@ def number_staves(systems: list[System], pages: dict) -> list[Part]:
     while k < len(model.staves):
         group = next((g for g in groups if g[0] == k and owner.get(k)), [k])
         staff = model.staves[k]
-        kind = "line" if staff.count == 1 else "drums" if staff.clef == "PERC" else "pitched"
-        parts.append(Part(owner.get(k, ""), group, kind))
+        name = owner.get(k, "")
+        kind = "line" if staff.count == 1 else "drums" if staff.clef == "PERC" \
+            or (len(group) == 1 and _unpitched_name(name)) else "pitched"
+        parts.append(Part(name, group, kind))
         k = group[-1] + 1
     for n, p in enumerate(parts):
         if not p.name:
             p.name = _ocr_margin(model, model.staves[p.slots[0]], pages[model.name][0]) or f"Part {n + 1}"
     return parts
+
+
+# Instruments that play no pitch. Older band parts write them on a bass
+# staff with a bass clef (snare in a space, bass drum below), so the clef
+# alone does not tell; the printed name does. Timpani are pitched.
+UNPITCHED = re.compile(r"\b(drums?|drum\s*set|drumset|snare|s\.\s*d\.|bass\s*drum|b\.\s*d\.|"
+                       r"percussion|perc\.?|cymbals?|tom-?toms?|bongos?|congas?|batterie|schlagzeug)\b",
+                       re.I)
+
+
+def _unpitched_name(name: str) -> bool:
+    return bool(name) and bool(UNPITCHED.search(name)) and not re.search(r"timp|glock|xyl|vib|marimba|bell",
+                                                                         name, re.I)
 
 
 def _ocr_margin(system: System, staff: Staff, ink: np.ndarray) -> str:
@@ -1224,8 +1239,8 @@ def _roll_slashes(sheet, events: list[dict], il: float) -> None:
     its sides on the same rows). Its tail right of the stem was taken for
     the head's dot; it makes the note a roll instead."""
     for e in events:
-        if e.get("rest") or not e.get("heads") or "sx" not in e:
-            continue
+        if e.get("rest") or not e.get("heads") or e.get("sx") is None or e.get("tip") is None:
+            continue                         # a stem-less note has no roll slash to cross
         sx, tip = e["sx"], e["tip"]
         ys = [h[1] for h in e["heads"]]
         up = tip < min(ys)
@@ -1566,9 +1581,72 @@ class Locator:
         return min(system.staves, key=gap)
 
 
-def read_signatures(systems: list[System]) -> tuple[list[tuple[int, int]], list[dict], dict]:
+def _sectional(barline: dict) -> bool:
+    """A double or final barline (or a repeat): where a new section, and
+    so a meter change in mid line, begins."""
+    return len(str(barline.get("kind", "")).split("-")) > 1
+
+
+def _stack_durations(system: System) -> list[Fraction | None]:
+    """Per bar of the system, the length Audiveris measured for the notes
+    of its stack (the stack whose span holds the bar's middle)."""
+    stacks = []
+    for st in system.element.iter("stack"):
+        if st.get("left") and st.get("right") and st.get("duration"):
+            stacks.append((float(st.get("left")), float(st.get("right")), Fraction(st.get("duration"))))
+    out = []
+    for bar in system.bars:
+        mid = (bar["x0"] + bar["x1"]) / 2
+        out.append(next((d for a, b, d in stacks if a <= mid <= b), None))
+    return out
+
+
+def _held_meter(systems: list[System], system: System, k: int,
+                meter: tuple[int, int]) -> tuple[int, int] | None:
+    """The meter the bars of a new section hold, when its printed time
+    signature was read by neither Audiveris nor the ink reader (a blurred
+    3 read as 4 or 8). The section runs from bar k to the next double
+    barline. Audiveris measures how long the notes of every bar are; when
+    at least three bars of the section say one length other than the
+    meter in force, and two thirds of the section agree on it, that is
+    the meter. A single bar's count is often wrong (a missed rest, a
+    tuplet), so only an agreeing majority counts."""
+    lens = []
+    start = systems.index(system)
+    for sy in systems[start:start + 2]:
+        durs = _stack_durations(sy)
+        for j, bar in enumerate(sy.bars):
+            if sy is system and j < k:
+                continue
+            if lens and _sectional(bar["left"]):
+                break
+            lens.append(durs[j])
+        else:
+            continue
+        break
+    lens = [d for d in lens if d]
+    if len(lens) < 3:
+        return None
+    best = max(set(lens), key=lens.count)
+    if lens.count(best) < 3 or 3 * lens.count(best) < 2 * len(lens):
+        return None
+    if best == Fraction(meter[0], meter[1]) or not Fraction(1, 2) <= best <= Fraction(3, 2):
+        return None
+    beat = meter[1]
+    while (best * beat).denominator != 1 and beat < 16:
+        beat *= 2
+    if (best * beat).denominator != 1:
+        return None
+    return int(best * beat), beat
+
+
+def read_signatures(systems: list[System], pages: dict | None = None
+                    ) -> tuple[list[tuple[int, int]], list[dict], dict]:
     """Per measure the meter; per measure {slot: fifths}; and per system
-    id {slot: [(x, clef)]} for the clef in force along the staff."""
+    id {slot: [(x, clef)]} for the clef in force along the staff. With
+    `pages`, a mid-line bar that opens past a double barline and has no
+    time signature from Audiveris takes the meter its section's bars hold
+    (`_held_meter`)."""
     meters, keys, clefs = [], [], {}
     meter = (4, 4)
     key: dict[int, int] = {}
@@ -1620,13 +1698,21 @@ def read_signatures(systems: list[System]) -> tuple[list[tuple[int, int]], list[
                 meter, pending_meter = pending_meter, None
             key.update(pending_key)
             pending_key = {}
-            for x, m in sigs:
-                kk, late = home(x)
-                if kk == k:
-                    if late:
-                        pending_meter = m
-                    else:
-                        meter = m
+            mine = [(x, m) for x, m in sigs if home(x)[0] == k]
+            for x, m in mine:
+                if home(x)[1]:
+                    pending_meter = m
+                else:
+                    meter = m
+            if pages is not None and k > 0 and not mine and _sectional(bar["left"]):
+                # The digits are not read here: Tesseract on small engraved
+                # digits misread both test scores (3/4 as 4/4, 2/4 as 9/4),
+                # and a wrong meter spoils every bar after it.
+                held = _held_meter(systems, system, k, meter)
+                if held:
+                    print(f"  time signature from what the bars hold: bar {len(meters) + 1} "
+                          f"{held[0]}/{held[1]}")
+                    meter = held
             for x, slot, fifths in kys:
                 kk, late = home(x)
                 if kk == k:
@@ -1893,7 +1979,7 @@ def convert(work: Path, out: Path) -> dict:
     if not systems:
         raise NoSystems(no_systems_reason(omr))
     parts = number_staves(systems, pages)
-    meters, keys, clefs = read_signatures(systems)
+    meters, keys, clefs = read_signatures(systems, pages)
     locator = Locator(systems)
     n_measures = sum(len(s.bars) for s in systems)
     bar_lens = [Fraction(m[0] * 4, m[1]) for m in meters]
