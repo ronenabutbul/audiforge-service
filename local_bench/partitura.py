@@ -1142,6 +1142,19 @@ def time_pitched(events: list[Event], bar_len: Fraction, il: float,
                 streams[2] = free
             else:
                 streams[3] = free
+        # A long note (a quarter or more) whose stem points the same way
+        # as a note standing right after it, closer than any value that
+        # long is ever spaced, is not in that voice: two voices start
+        # together, the long one held under the moving one (a half note
+        # with a dotted eighth on the same beat). Chained in one voice it
+        # would push the whole moving line late.
+        for v in (1, 2):
+            evs = sorted(streams.get(v, []), key=lambda e: e.x)
+            held = [a for a, b in zip(evs, evs[1:])
+                    if a.value >= 1 and b.x - a.x < 1.6 * il and abs(b.y - a.y) < 3 * il]
+            if held and len(evs) - len(held) >= 2:
+                streams[v] = [e for e in evs if e not in held]
+                streams[max(streams) + 1] = held
         best = None
         mean_y = {v: float(np.mean([e.y for e in evs])) for v, evs in streams.items() if evs}
         voices = [v for v in streams if streams[v]] or [1]
