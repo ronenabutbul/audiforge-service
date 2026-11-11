@@ -741,6 +741,205 @@ def test_every_movement_is_joined_on_the_bench_as_on_the_service():
 
 
 # --------------------------------------------------------------------------- #
+# Bar counts: a rest of N bars is N bars, once.
+# --------------------------------------------------------------------------- #
+
+def _rest_bar() -> str:
+    return note(16, None, whole_bar=True)
+
+
+def _marked(count: int, body: str = "") -> str:
+    return (f"<attributes><measure-style><multiple-rest>{count}</multiple-rest>"
+            f"</measure-style></attributes>{body}")
+
+
+def _bars(path: Path) -> list:
+    return ET.parse(path).getroot().find("part").findall("measure")
+
+
+def _marks(path: Path) -> list[tuple[int, int]]:
+    """(measure index, count) of every multirest marker."""
+    return [(i, int(m.find(".//multiple-rest").text))
+            for i, m in enumerate(_bars(path)) if m.find(".//multiple-rest") is not None]
+
+
+def test_multirest_is_expanded_once_however_often_the_step_runs():
+    """homr writes a rest of 4 bars as one empty measure with the marker;
+    expanding gives 4 bars. The expanded form (and Audiveris's, the same
+    standard encoding) is left alone, so running the step on a finished
+    file, or twice, adds nothing. It used to add N-1 bars every time."""
+    path = write("multirest_once.musicxml", score([
+        homr_attributes(4, 4, 4) + note(16),
+        _marked(4),                                  # homr: one empty measure
+        note(16),
+        _marked(2, _rest_bar()),                     # standard: marker on a rest bar
+        _rest_bar(),
+        note(16),
+    ]))
+    assert postprocess.expand_multirests(path) == 3, "bars added: 4 - 1"
+    assert len(_bars(path)) == 9 and _marks(path) == [(1, 4), (6, 2)]
+    before = path.read_bytes()
+    assert postprocess.expand_multirests(path) == 0
+    assert path.read_bytes() == before, "a second pass changes nothing"
+
+
+def test_beamed_notes_are_not_a_multirest_bar():
+    """A multirest bar is one long flat stroke on the middle line with
+    nothing crossing it. A double beam of sixteenths is a thick dark run
+    there too; its stems cross it, and a stem standing outside the middle
+    of the run used to slip past the stem test (Abba Gold Trombone 1 (MS):
+    four bars of sixteenths read as rests of 4, 4, 2 and 4 bars)."""
+    import numpy as np
+    from app import fix_hbars
+
+    il, top = 20, 100
+    bottom = top + 4 * il
+    centre = (top + bottom) // 2
+    page = np.zeros((300, 600), dtype=bool)
+    page[centre - 6:centre + 6, 100:500] = True              # the bar
+    page[centre - il:centre + il, 98:102] = True             # its end strokes
+    page[centre - il:centre + il, 498:502] = True
+    assert fix_hbars._bar_shaped(page, 100, 500, centre, top, bottom, il)
+
+    beam = page.copy()
+    beam[centre - 3 * il:centre, 140:143] = True             # one stem, near an end
+    assert not fix_hbars._bar_shaped(beam, 100, 500, centre, top, bottom, il)
+
+    assert not fix_hbars._bar_shaped(page, 100, 125, centre, top, bottom, il), \
+        "a run shorter than a bar is a beam fragment"
+
+    omr = next((replay.RESULTS / "audiveris" / "work"
+                / "Abba Gold - Trombone 1 (MS)").glob("*.omr"))
+    counts = [h["count"] for h in quiet(fix_hbars.detect_hbars, omr)]
+    assert counts == [5, 2, 5, 5], counts                    # what the page prints
+
+
+def test_rests_printed_side_by_side_are_one_run_counted_once():
+    """Page: bar 1 music, then rests of 2, 5 and 5 bars in three stacks,
+    then music. The XML holds one run of 12 silent bars. Each rest takes
+    its own part of the run; none is inserted again (the third used to
+    find no span left and was inserted as 5 new bars)."""
+    from app import fix_hbars
+
+    path = write("side_by_side.musicxml", score(
+        [homr_attributes(4, 4, 4) + note(16)] + [_rest_bar()] * 12 + [note(16)]))
+    hbars = [{"stack": 1, "count": 2, "read": True},
+             {"stack": 2, "count": 5, "read": True},
+             {"stack": 3, "count": 5, "read": True}]
+    numbers = [1, 2, 4, 9, 14]          # printed number of each stack's first bar
+    quiet(fix_hbars.reconcile, path, hbars, numbers)
+    assert len(_bars(path)) == 14
+    assert _marks(path) == [(1, 2), (3, 5), (8, 5)]
+
+
+def test_whole_rest_before_a_multirest_is_not_a_lost_bar():
+    """Page: bar 1 music, bar 2 a whole rest, bars 3-6 a rest of 4. The XML
+    run starts one bar before the marker; that bar is the printed whole
+    rest, not a bar the export lost, so no "?" bar is put in."""
+    from app import fix_hbars
+
+    path = write("whole_then_multirest.musicxml", score([
+        homr_attributes(4, 4, 4) + note(16), _rest_bar(),
+        _marked(4, _rest_bar()), _rest_bar(), _rest_bar(), _rest_bar(), note(16)]))
+    quiet(fix_hbars.reconcile, path, [{"stack": 2, "count": 4, "read": True}],
+          [1, 2, 3, 7])
+    assert len(_bars(path)) == 7
+    assert _marks(path) == [(2, 4)]
+    assert not any(w.text == "?" for w in ET.parse(path).getroot().iter("words"))
+
+
+def test_a_signature_standing_alone_is_not_a_bar():
+    """A key or time signature with nothing else in its stack is not a
+    bar: the courtesy 2/4 after a system's last barline, or a 4/4 between
+    a double barline and a repeat sign. Counted as bars they pushed every
+    printed number after them one too high, and rests placed by number
+    landed a bar late. James Bond Tenor Sax: the numbers at the start of
+    every system must be the ones printed there."""
+    from app import fix_hbars
+
+    omr = next((replay.RESULTS / "convert" / "James Bond - Tenor Sax").glob("*.omr"))
+    hbars = quiet(fix_hbars.detect_hbars, omr)
+    numbers = fix_hbars.stack_numbers(omr, hbars)
+    starts, previous = [], None
+    for stack in fix_hbars._iter_stacks(omr):
+        system = (id(stack[0]), round(stack[2]))
+        if system != previous:
+            starts.append(numbers[stack[7]])
+        previous = system
+    printed = [1, 11, 15, 21, 28, 33, 39, 47, 55, 64, 70, 78, 89, 96, 101, 109,
+               116, 123, 133, 142, 148, 154, 160, 166]
+    assert starts == printed, starts
+
+
+def test_barline_crossed_by_a_slur_is_still_a_barline():
+    """A slur or tie drawn through a barline widens the stroke for a few
+    rows, ink running out on both sides. That bar line still divides two
+    bars (Adele Alto Sax 1 (MS) bar 18|19: the missed barline put every
+    later number one low). A stem with its notehead hung on one side is
+    not a barline, and neither is a column crossed twice (a time
+    signature's digits)."""
+    import numpy as np
+    from app import fix_hbars
+
+    il, top = 20, 100
+    bottom = top + 4 * il
+    page = np.zeros((300, 400), dtype=bool)
+    for k in range(5):
+        page[top + k * il:top + k * il + 2, 0:400] = True     # staff lines
+    page[top:bottom + 2, 200:203] = True                       # the barline
+    slur = page.copy()
+    slur[top + 6:top + 9, 180:225] = True                      # slur through it
+    assert fix_hbars._interior_barline_xs(slur, top, bottom, 0, 400, il) == [200]
+
+    stem = page.copy()
+    stem[top + 30:top + 46, 182:202] = True                    # head on one side
+    assert fix_hbars._interior_barline_xs(stem, top, bottom, 0, 400, il) == []
+
+    digits = slur.copy()
+    digits[top + 50:top + 53, 180:225] = True                  # a second crossing
+    assert fix_hbars._interior_barline_xs(digits, top, bottom, 0, 400, il) == []
+
+
+def test_rest_expanded_from_a_misread_count_is_cut_to_the_page():
+    """homr read an "8" over a rest the page prints as "4" and expanded it
+    to 8 bars; the count is corrected to 4 but the bars stayed 8. The page
+    has music in the very next bar, so the run is cut back to 4. Without
+    knowing which printed bars hold notes nothing is removed."""
+    from app import fix_hbars
+
+    xml = score([homr_attributes(4, 4, 4) + note(16), _marked(8, _rest_bar())]
+                + [_rest_bar()] * 7 + [note(16)])
+    hbars = [{"stack": 1, "count": 4, "read": True}]
+    numbers = [1, 2, 6]
+    kept = write("misread_kept.musicxml", xml)
+    quiet(fix_hbars.reconcile, kept, hbars, numbers)
+    assert len(_bars(kept)) == 10, "no page evidence: never removes a bar"
+
+    cut = write("misread_cut.musicxml", xml)
+    quiet(fix_hbars.reconcile, cut, hbars, numbers, stack_sounds=[True, False, True])
+    assert len(_bars(cut)) == 6 and _marks(cut) == [(1, 4)]
+
+    after_silence = write("misread_then_whole.musicxml", xml)
+    quiet(fix_hbars.reconcile, after_silence, hbars, numbers,
+          stack_sounds=[True, False, False, True])
+    assert len(_bars(after_silence)) == 7, "a silent bar printed after the rest stays"
+
+    # Silent means Audiveris saw a rest there and no head. A bar where it
+    # saw neither (a whole note it missed) is music, so the trim stops.
+    import zipfile
+    sheet = ('<sheet><system><staff><lines>' + '<line/>' * 5 + '</lines></staff>'
+             '<stack left="0" right="10"/><stack left="10" right="20"/>'
+             '<stack left="20" right="30"/><part>'
+             '<measure><head-chords>1</head-chords></measure>'
+             '<measure><rest-chords>2</rest-chords></measure>'
+             '<measure></measure></part></system></sheet>')
+    omr = scratch("omr") / "silence.omr"
+    with zipfile.ZipFile(omr, "w") as z:
+        z.writestr("sheet#1/sheet#1.xml", sheet)
+    assert fix_hbars.stacks_with_notes(omr) == [True, False, True]
+
+
+# --------------------------------------------------------------------------- #
 
 def main() -> int:
     wanted = sys.argv[1:]

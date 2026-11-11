@@ -147,6 +147,10 @@ def _run_width(pixels, r: int, x: int) -> int:
     return g - l + 1
 
 
+# Tallest run of wide rows a slur or tie may add where it crosses a barline.
+SLUR_CROSSING_MAX_IL = 0.35
+
+
 def _interior_barline_xs(pixels, top: float, bottom: float, x0: int, x1: int,
                          interline: float) -> list[int]:
     """x of every barline strictly inside a stack, i.e. the boundaries of
@@ -167,9 +171,15 @@ def _interior_barline_xs(pixels, top: float, bottom: float, x0: int, x1: int,
         never exceeds two - rather than by where the lines should be:
         on a skewed scan they sit pixels from the predicted row."""
         notehead, staff_line = 0.75 * interline, 3 * interline
+        # A slur or tie crossing the barline widens a few rows only: the
+        # curve is a thin line. A notehead joined to a stem is wide for
+        # most of an interline, a beam for half of one.
+        crossing = SLUR_CROSSING_MAX_IL * interline
         skip_until = 0
+        wide_run = crossings = 0
         for r in range(t + 3, b - 2):
             if not pixels[r, x] or r < skip_until:
+                wide_run = 0
                 continue
             l = x
             while l > 0 and pixels[r, l - 1]:
@@ -190,7 +200,18 @@ def _interior_barline_xs(pixels, top: float, bottom: float, x0: int, x1: int,
                 skip_until = r + 3
                 continue
             if width > notehead:
-                return False
+                # A slur passes THROUGH the stroke: ink runs well out on
+                # both sides. A notehead hangs on one side of its stem.
+                # One slur, once: two crossings in one column are the
+                # cross-bars of a stacked time signature's digits.
+                through = min(x - l, rgt - x) > 0.25 * interline
+                if wide_run == 0:
+                    crossings += 1
+                wide_run += 1
+                if not through or wide_run > crossing or crossings > 1:
+                    return False
+            else:
+                wide_run = 0
         return True
 
     def continuous(seg) -> bool:
@@ -544,6 +565,29 @@ def detect_block_rests(omr_path: Path) -> list[dict]:
     return found
 
 
+# The shortest multirest bar seen in the corpus is 3.4 interlines (a boxed
+# rest in a narrow bar); the beam fragments that fooled the detector were
+# 1.2 to 1.3 interlines.
+HBAR_MIN_LENGTH_IL = 2.5
+
+
+def _bar_shaped(pixels, run_x0: int, run_x1: int, centre_row: int,
+                top: float, bottom: float, interline: float) -> bool:
+    """A multirest bar is one long flat stroke with nothing crossing it.
+
+    A double or triple beam of sixteenths is also a thick dark run on the
+    middle line, and the stem test above only looks at the run's middle
+    three fifths, with two columns allowed: one stem standing there passes.
+    The bar itself has no stem anywhere along it (its short end strokes
+    reach a line either side, never 2.5 interlines), so every column of the
+    run is asked, and a run shorter than a bar is a beam fragment."""
+    if run_x1 - run_x0 < HBAR_MIN_LENGTH_IL * interline:
+        return False
+    lo, hi = int(top - 3 * interline), int(bottom + 3 * interline)
+    return not any(_ink_through(pixels, x, centre_row, lo, hi) >= 2.5 * interline
+                   for x in range(run_x0, run_x1))
+
+
 def detect_hbars(omr_path: Path) -> list[dict]:
     """Every multirest on the page, whichever way it was engraved, in
     reading order: {count, read, x0, x1, stack} per printed bar."""
@@ -627,6 +671,9 @@ def _detect_hbars_only(omr_path: Path) -> list[dict]:
         # than any bar; an H-bar has none inside its ends. Two allowed
         # for noise.
         if stems > 2:
+            return None
+        if not _bar_shaped(pixels, run_x0, run_x1, centre_row, top, bottom,
+                           interline):
             return None
         # And a bar has ink along its own centre line. The thick rows of
         # a bar-repeat slash or a bar of notes are staff lines and
@@ -745,6 +792,54 @@ def _detect_hbars_only(omr_path: Path) -> list[dict]:
     return merged
 
 
+# A signature-only stack wider than this is a real bar that happens to
+# hold no chords Audiveris read; the narrowest signature stack seen in the
+# corpus between barlines is 4.8 interlines (a 4/4 between a double
+# barline and a repeat sign), a full bar is rarely under 7.
+SIGNATURE_STACK_MAX_IL = 6.0
+
+
+def courtesy_stacks(omr_path: Path) -> set[int]:
+    """Ordinals of stacks that hold only a key or time signature: no note,
+    no rest, nothing but the signature and a barline. Such a stack is not a
+    bar. At a system's end it is the courtesy signature after the final
+    barline (Audiveris marks it CAUTIONARY, and it may be wider than the
+    3-interline sliver test catches: a 2/4 at 3.2 interlines, a key of
+    three flats at 5.4). Inside a system it is a new signature standing
+    between a double barline and the next bar's repeat sign. Counting it
+    put every bar number after it one too high."""
+    out, ordinal = set(), 0
+    with zipfile.ZipFile(omr_path) as z:
+        sheets = sorted(
+            {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+            key=lambda s: int(s.split("#")[1]))
+        for sheet in sheets:
+            root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml")
+                                 .decode("utf-8", "replace"))
+            interline = root.find("scale/interline")
+            il = float(interline.get("main")) if interline is not None else 0
+            for system in root.iter("system"):
+                staff = system.find(".//staff")
+                if staff is None or len(staff.findall("lines/line")) < 5:
+                    continue
+                stacks = system.findall("stack")
+                parts = system.findall("part")
+                measures = parts[0].findall("measure") if len(parts) == 1 else []
+                for k, stack in enumerate(stacks[:len(measures)]):
+                    kinds = {child.tag for child in measures[k]}
+                    signature = kinds & {"keys", "times"}
+                    if not signature or kinds - {"keys", "times", "right-barline"}:
+                        continue
+                    width = float(stack.get("right")) - float(stack.get("left"))
+                    trailing = (k == len(stacks) - 1
+                                and stack.get("special") == "CAUTIONARY"
+                                and "right-barline" not in kinds)
+                    if trailing or (il and width < SIGNATURE_STACK_MAX_IL * il):
+                        out.add(ordinal + k)
+                ordinal += len(stacks)
+    return out
+
+
 def stack_numbers(omr_path: Path, hbars: list[dict]) -> list[int]:
     """Printed measure number for every stack (in reading order), advancing
     by the verified H-bar count on multirest stacks — the numbering the
@@ -760,10 +855,11 @@ def stack_numbers(omr_path: Path, hbars: list[dict]) -> list[int]:
     # bars shifts every number after it, and every letter and rest
     # placed by number with them.
     medians = _row_median_widths(omr_path)
+    courtesy = courtesy_stacks(omr_path)
     counts = {}
     for (_, pixels, top, bottom, il, x0, x1, ordinal,
          _sx0) in _iter_stacks(omr_path):
-        if x1 - x0 < 3 * il:
+        if x1 - x0 < 3 * il or ordinal in courtesy:
             # A sliver at a system's end holds a courtesy clef or time
             # signature, not a bar.
             counts[ordinal] = 0
@@ -811,6 +907,12 @@ def _rest_spans(measures) -> list[list[int]]:
         spans.append([i, marked, j - i])
         i = j
     return spans
+
+
+def _first_marker(measures, lo: int, hi: int) -> int | None:
+    """Index of the first measure in [lo, hi) that carries a multirest mark."""
+    return next((i for i in range(lo, min(hi, len(measures)))
+                 if measures[i].find(".//multiple-rest") is not None), None)
 
 
 def _measure_durations(measures) -> list[int]:
@@ -865,8 +967,20 @@ def _mark_multirest(measure, count: int) -> None:
 PLACEMENT_TOLERANCE = 3
 
 
+def _silence_after(stack: int, hbars_by_stack: dict, stack_sounds: list[bool]) -> int:
+    """Bars of silence the page prints right after the multirest at
+    `stack`: each following stack with no note head is one bar, or its own
+    count when it is a multirest too, up to the first bar with music."""
+    bars, k = 0, stack + 1
+    while k < len(stack_sounds) and (k in hbars_by_stack or not stack_sounds[k]):
+        bars += hbars_by_stack.get(k, 1)
+        k += 1
+    return bars
+
+
 def reconcile(result_path: Path, hbars: list[dict],
-              numbers: list[int]) -> tuple[int, int]:
+              numbers: list[int],
+              stack_sounds: list[bool] | None = None) -> tuple[int, int]:
     """Make the XML's multirests match the ones printed on the page.
 
     Each detected multirest carries the printed number of its first bar
@@ -876,13 +990,17 @@ def reconcile(result_path: Path, hbars: list[dict],
     the engine, so it is inserted there. A rest span is the marked
     measure plus any bare whole-bar rests right after it: an engine that
     read an 8 as "4 and then some rests" wrote one printed rest as two
-    things. Never removes a measure. Returns (counts_updated, inserted).
+    things. With `stack_sounds` (which printed bars hold notes), a run of
+    silence longer than the page's rest and the silent bars after it is cut
+    back to that; otherwise no measure is removed.
+    Returns (counts_updated, inserted).
     """
     tree = ET.parse(result_path)
     part = tree.getroot().find("part")
 
-    updated = inserted = padded = 0
+    updated = inserted = padded = trimmed = 0
     used = set()
+    hbars_by_stack = {h["stack"]: h["count"] for h in hbars if h["read"]}
     # How far the XML runs ahead of the printed numbering at the last
     # rest matched. Bars the export lost are padded as they are found,
     # so the XML never lags for long; bars it invented are never removed,
@@ -902,12 +1020,20 @@ def reconcile(result_path: Path, hbars: list[dict],
         # already given to it is the next rest's span.
         spans = []
         for start, marked, length in _rest_spans(measures):
-            if start in assigned:
-                given = assigned[start]
-                if length > given:
-                    spans.append((start + given, 0, length - given))
-            else:
+            # What is left of a run starts after the last rest already
+            # given out inside it: three printed rests side by side ("2",
+            # "5", "5") are one run, and the third's span starts after
+            # BOTH earlier ones, not after the first alone (which left it
+            # no span, so it was inserted again as a new rest). A given
+            # rest need not sit at the run's head either: a whole rest
+            # printed before it, or a bar padded in, can lead the run.
+            end = start + length
+            taken = [at + assigned[at] for at in assigned if start <= at < end]
+            first = max(taken, default=start)
+            if not taken:
                 spans.append((start, marked, length))
+            elif first < end:
+                spans.append((first, 0, end - first))
         near = [s for s in spans
                 if s[0] not in used
                 and abs(s[0] - (target + ahead)) <= PLACEMENT_TOLERANCE]
@@ -923,6 +1049,14 @@ def reconcile(result_path: Path, hbars: list[dict],
             if not h["read"] and marked >= count:
                 used.add(start)
                 continue  # an unread H-bar defaults to 1; keep the XML's
+            marker = _first_marker(measures, start, min(start + length, target + 1))
+            if start < target and marker is not None and marker > start:
+                # Silent bars ahead of the multirest's own marker are other
+                # rests printed before it (a "1" over a whole rest, the end
+                # of a phrase): the multirest starts at its marker, and
+                # only the distance from there is bars the export lost.
+                length -= marker - start
+                start = marker
             if start < target:
                 # The rest sits earlier than the page numbers it: the
                 # export lost bars before it (a measure it could not
@@ -953,6 +1087,19 @@ def reconcile(result_path: Path, hbars: list[dict],
                 at = list(part).index(measures[start + length - 1]) + 1
                 for k in range(count - length):
                     part.insert(at + k, _rest_measure(durations[start]))
+            elif h["read"] and stack_sounds is not None:
+                # A rest of N bars is N bars once. An engine that misread
+                # the printed count (an "8" over a "4") expanded it into
+                # more bars of silence than the page has; a later count
+                # repair fixes the number but not the bars. What the page
+                # allows is this rest plus the silent bars printed right
+                # after it, up to the next bar with music; the rest of the
+                # run is invented and goes.
+                allowed = count + _silence_after(h["stack"], hbars_by_stack,
+                                                 stack_sounds)
+                for measure in measures[start + allowed:start + length]:
+                    part.remove(measure)
+                    trimmed += 1
             if marked != count:
                 updated += 1
         else:
@@ -972,7 +1119,10 @@ def reconcile(result_path: Path, hbars: list[dict],
             used.add(at_measure)
             inserted += 1
 
-    if updated or inserted or padded:
+    if trimmed:
+        logger.info("%d bar(s) of silence the page does not print taken out "
+                    "after misread multirest counts", trimmed)
+    if updated or inserted or padded or trimmed:
         for number, m in enumerate(part.findall("measure"), start=1):
             m.set("number", str(number))
         tree.write(result_path, encoding="UTF-8", xml_declaration=True)
@@ -991,7 +1141,43 @@ def fix(work_dir: Path, result_path: Path) -> tuple[int, int]:
         return (0, 0)
     print(f"  {len(hbars)} multirests detected on the page: "
           f"{[h['count'] for h in hbars]}", flush=True)
-    return reconcile(result_path, hbars, stack_numbers(omr_files[0], hbars))
+    return reconcile(result_path, hbars, stack_numbers(omr_files[0], hbars),
+                     stack_sounds=stacks_with_notes(omr_files[0]))
+
+
+def stacks_with_notes(omr_path: Path) -> list[bool]:
+    """Per stack ordinal (as _iter_stacks counts them): may the printed
+    bar hold music? Only a bar where Audiveris found a rest and no note
+    head counts as silent (False). A bar with heads is music, and so is a
+    bar where it found neither: it misses whole notes now and then, and a
+    missed note must never let a run of silence grow over it."""
+    out = []
+    with zipfile.ZipFile(omr_path) as z:
+        sheets = sorted(
+            {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+            key=lambda s: int(s.split("#")[1]))
+        for sheet in sheets:
+            root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml")
+                                 .decode("utf-8", "replace"))
+            for system in root.iter("system"):
+                staff = system.find(".//staff")
+                if staff is None or len(staff.findall("lines/line")) < 5:
+                    continue
+                parts = system.findall("part")
+                measures = parts[0].findall("measure") if len(parts) == 1 else []
+                stacks = system.findall("stack")
+                for k, _ in enumerate(stacks):
+                    # Several parts to a system, or a stack the part has no
+                    # measure for: unknown, which counts as music (nothing
+                    # is then trimmed on its word).
+                    if k < len(measures):
+                        heads = (measures[k].findtext("head-chords") or "").split()
+                        rests = (measures[k].findtext("rest-chords") or "").split()
+                        sounds = bool(heads) or not rests
+                    else:
+                        sounds = True
+                    out.append(sounds)
+    return out
 
 
 
