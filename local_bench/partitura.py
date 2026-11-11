@@ -1865,6 +1865,7 @@ def convert(work: Path, out: Path) -> dict:
     per_measure: list[list[Event]] = []
     rulers: list[list[tuple[float, Fraction]]] = []
     clef_changes: list[list[tuple[float, int, str]]] = []
+    in_force: dict[int, str] = {}
     tally = {"streams": 0, "sure": 0, "ruled": 0}
     ink_sheets: dict[str, object] = {}
     index = 0
@@ -1894,9 +1895,20 @@ def convert(work: Path, out: Path) -> dict:
             marks = sorted(set(anchors + [(e.x, e.onset) for e in mine if e.onset is not None]))
             rulers.append(marks)
             per_measure.append(mine)
-            clef_changes.append([(cx, slot, kind) for slot, changes in track.items()
-                                 for cx, kind in changes[1:] if bar["x0"] <= cx < bar["x1"]
-                                 and slot in pitched_slots])
+            changes_here = [(cx, slot, kind) for slot, changes in track.items()
+                            for cx, kind in changes[1:] if bar["x0"] <= cx < bar["x1"]
+                            and slot in pitched_slots]
+            if k == 0:
+                # a new system may open with another clef than the one
+                # the last system ended in: a change at its head
+                for slot, changes in track.items():
+                    head = changes[0][1]
+                    if slot in pitched_slots and head in ("G", "F", "C") \
+                            and in_force.get(slot, head) != head:
+                        changes_here.insert(0, (bar["x0"] - system.il, slot, head))
+                for slot, changes in track.items():
+                    in_force[slot] = changes[-1][1]
+            clef_changes.append(changes_here)
             index += 1
     _link_open_ties(per_measure, bar_lens)
     if pitched_slots:
