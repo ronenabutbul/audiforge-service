@@ -370,8 +370,10 @@ def no_systems_reason(omr: Path) -> str:
            f"{il:.1f} px apart on {len(gaps)} sheets")
     if il < 12:
         msg += (f". That is below what Audiveris accepts as an interline, so it dropped every "
-                f"sheet at its scale step. Re-run Audiveris on pages rendered at about "
-                f"{int(np.ceil(20 / il))}x the resolution (interline near 20 px)")
+                f"sheet at its scale step. Re-run Audiveris with the PDF rendered about "
+                f"{int(np.ceil(20 / il))}x finer (interline near 20 px), e.g. "
+                f"-option org.audiveris.omr.image.ImageLoading.pdfResolution=600 "
+                f"for a page now at 300 dpi")
     return msg
 
 
