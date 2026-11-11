@@ -286,8 +286,9 @@ class System:
         self.il = float(self.bottom(mid) - self.top(mid)) / 4
         self.thick = max(int(round(float(self.lines[0].get("thickness", "2")))), 1)
         il = self.il
-        # room above: as far as the staff before, but never past nine spaces
-        self.up = int(max(min(9.0 * il, self.top(mid) - ceiling), 2.5 * il))
+        # room above: as far as the staff before, but never past twelve spaces
+        # high enough for a rehearsal box set over an ending bracket
+        self.up = int(max(min(12.0 * il, self.top(mid) - ceiling), 2.5 * il))
         self.down = int(6.0 * il)
         xs = np.arange(self.x0, self.x1)
         tops = np.round(np.interp(xs, [p[0] for p in self._top], [p[1] for p in self._top])).astype(int)
@@ -1446,7 +1447,7 @@ def convert(omr: Path, out: Path, verbose: bool = False, overlay: str | None = N
     first = bars[0]
     meta.update(beats=first["time"][0], beat_type=first["time"][1], fifths=first["key"])
     write_musicxml(bars, meta, out)
-    structure = place_structure(omr, out)
+    structure = place_structure(omr, out, _stack_numbers(omr, bars))
     if overlay:
         draw_overlay(pages, overlay)
     return {"bars": len(bars), "chords": chords, "unread": unread, "problems": sorted(problems),
@@ -1456,7 +1457,25 @@ def convert(omr: Path, out: Path, verbose: bool = False, overlay: str | None = N
             "marks": [(n, m["text"]) for n, b in enumerate(bars, 1) for m in b["marks"]]}
 
 
-def place_structure(omr: Path, out: Path) -> str:
+def _stack_numbers(omr: Path, bars: list[dict]) -> list[int]:
+    """The bar number each Audiveris stack starts, in this reader's own
+    numbering: a stack that holds no bar (only the clef, key and a start
+    repeat, which Audiveris may cut off as a stack of its own) takes the
+    number of the bar after it, so a mark found there lands on that bar."""
+    with zipfile.ZipFile(omr) as z:
+        total = sum(z.read(f"{name}/{name}.xml").count(b"<stack ") for name in _sheets(z))
+    first: dict[int, int] = {}
+    for n, b in enumerate(bars, 1):
+        if b.get("stack") is not None:
+            first.setdefault(b["stack"], n)
+    numbers, after = [0] * total, len(bars) + 1
+    for k in range(total - 1, -1, -1):
+        after = first.get(k, after)
+        numbers[k] = after
+    return numbers
+
+
+def place_structure(omr: Path, out: Path, numbers: list[int] | None = None) -> str:
     """HOOK: repeat barlines, first and second endings, segno, coda and
     the jump texts are not read here. `app/structure_marks.py` finds them
     on the page and writes them into any MusicXML; when it is there it is
@@ -1469,7 +1488,7 @@ def place_structure(omr: Path, out: Path) -> str:
     except ImportError:
         return "not placed: app/structure_marks.py is not here"
     try:
-        return f"{place(omr, out)} marks placed"
+        return f"{place(omr, out, numbers=numbers)} marks placed"
     except Exception as e:                         # the chart stands without its road map
         return f"not placed: {type(e).__name__}: {e}"
 
