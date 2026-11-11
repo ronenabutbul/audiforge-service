@@ -590,9 +590,20 @@ def _tied(system: System, a: dict, b: dict) -> bool:
     span = b["x1"] - a["x1"]
     if span < 1.5 * il or span > 14 * il:
         return False
-    box = system.band(-2.4 * il, -(system.thick + 1))[:, max(xa, 0):xb].astype(np.uint8)
+    # the arc may dip under the top line into the first space (the slashes
+    # start lower, at the second line): the strip is level, so the top line
+    # is the same rows all along and is blanked out
+    t = system.thick + 1
+    box = system.band(-2.4 * il, 0.6 * il)[:, max(xa, 0):xb].astype(np.uint8).copy()
     if not box.size:
         return False
+    line = int(2.4 * il)
+    # a barline under the arc: solid all the way down through the first space
+    solid = box[line + t + 1:].all(axis=0) if box.shape[0] > line + t + 1 else np.zeros(box.shape[1], bool)
+    box[line - t:line + t + 1] = 0
+    box[line - t:, solid] = 0
+    # bridge the arc where it ran along the blanked line
+    box = cv2.morphologyEx(box, cv2.MORPH_CLOSE, np.ones((2 * t + 3, 1), np.uint8))
     n, lab, stats, _c = cv2.connectedComponentsWithStats(box, connectivity=8)
     for i in range(1, n):
         x, y, w, h, _area = (int(v) for v in stats[i])
