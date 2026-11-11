@@ -1136,6 +1136,24 @@ def _drop_head_columns(sheet) -> None:
     sheet._frames = None
 
 
+def _waisted(sheet, hx: float, hy: float, il: float) -> bool:
+    """A cross squeezed between two staff lines prints as a dark knot and
+    passes for a filled head, but it keeps its waist: through its middle
+    the ink is a third of an interline wide, where a filled head is a
+    whole one."""
+    widths = []
+    for dy in (-0.12, 0.0, 0.12):
+        y = int(round(hy + dy * il))
+        if not 0 <= y < sheet.ink.shape[0]:
+            continue
+        x0 = max(int(hx - 1.6 * il), 0)
+        row = sheet.nolines[y, x0:int(hx + 1.6 * il)]
+        near = [b - a for a, b in _runs(row) if a + x0 <= hx + 0.5 * il and b + x0 >= hx - 0.5 * il]
+        if near:
+            widths.append(max(near))
+    return bool(widths) and float(np.median(widths)) < 0.72 * il
+
+
 def _simile(sheet, bar: dict) -> bool:
     """The repeat-the-bar sign: one slanted stroke in the middle of the
     staff with a dot either side, and nothing else in the bar."""
@@ -1190,6 +1208,10 @@ def read_drums(systems: list[System], pages: dict, slot: int, meters: list[tuple
                     # nothing but the line's own notes: no rests from the staves above
                     read["events"] = [e for e in read["events"] if not e.get("rest")
                                       or abs(e["y"] - geo["top"] - 2 * geo["il"]) < 1.5 * geo["il"]]
+                for e in read["events"]:
+                    if e.get("heads"):
+                        e["heads"] = [(hx, hy, "x" if kind == "normal" and _waisted(sheet, hx, hy, geo["il"])
+                                       else kind) for hx, hy, kind in e["heads"]]
                 events, problem = drum_ink.time_bar(read, geo["il"])
                 notes = [e for e in events if not e.get("rest")]
                 if not notes and _simile(sheet, geo):
@@ -1477,14 +1499,16 @@ def write_pitched_measure(m: ET.Element, part: Part, events: list[Event], bar_le
     staff_no = {slot: k + 1 for k, slot in enumerate(part.slots)}
     total = int(bar_len * DIVISIONS)
     wrote_any = False
+    at = 0                             # where the writing stands, in divisions
     pending_clefs = sorted(clef_changes)
     for slot in part.slots:
         mine = [e for e in events if e.slot == slot]
         voices = sorted({e.voice for e in mine})
         if not voices:
             # an empty staff rests for the bar
-            if wrote_any:
-                ET.SubElement(ET.SubElement(m, "backup"), "duration").text = str(total)
+            if at:
+                ET.SubElement(ET.SubElement(m, "backup"), "duration").text = str(at)
+            at = total
             note = ET.SubElement(m, "note")
             ET.SubElement(note, "rest", measure="yes")
             ET.SubElement(note, "duration").text = str(total)
@@ -1494,8 +1518,9 @@ def write_pitched_measure(m: ET.Element, part: Part, events: list[Event], bar_le
             wrote_any = True
             continue
         for v in voices:
-            if wrote_any:
-                ET.SubElement(ET.SubElement(m, "backup"), "duration").text = str(total)
+            if at:
+                ET.SubElement(ET.SubElement(m, "backup"), "duration").text = str(at)
+            at = 0
             wrote_any = True
             cursor = Fraction(0)
             stream = sorted((e for e in mine if e.voice == v), key=lambda e: (e.onset, e.x))
@@ -1513,6 +1538,7 @@ def write_pitched_measure(m: ET.Element, part: Part, events: list[Event], bar_le
                 if e.onset > cursor:
                     f = ET.SubElement(m, "forward")
                     ET.SubElement(f, "duration").text = str(int((e.onset - cursor) * DIVISIONS))
+                    at += int((e.onset - cursor) * DIVISIONS)
                     cursor = e.onset
                 elif e.onset < cursor:
                     continue                      # two readings of one instant: keep the first
@@ -1523,6 +1549,7 @@ def write_pitched_measure(m: ET.Element, part: Part, events: list[Event], bar_le
                 else:
                     length, name, dots = _shape(e.length, e.tuplet)
                 duration = max(int(round(length * DIVISIONS)), 1)
+                at += duration
                 heads = e.heads if not e.rest else [None]
                 for k, h in enumerate(heads):
                     note = ET.SubElement(m, "note")
