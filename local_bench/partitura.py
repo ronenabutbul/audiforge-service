@@ -445,6 +445,31 @@ def _margin_names(system: System, root: ET.Element) -> list[tuple[float, str]]:
     return [(y, " ".join(v for _, v in sorted(ws))) for y, ws in rows]
 
 
+CLEF_SHAPES = {"G_CLEF": "G", "G_CLEF_SMALL": "G", "G_CLEF_8VB": "G", "F_CLEF": "F",
+               "F_CLEF_SMALL": "F", "C_CLEF": "C", "PERCUSSION_CLEF": "PERC"}
+
+
+def _carry_clefs(system: System, last: dict[int, str]) -> None:
+    """Update `last` (slot -> clef) with the clef each staff of the system
+    ends with: its header clef, then the rightmost clef change on it."""
+    by_sid = {s.sid: s for s in system.staves if s.sid}
+    for s in system.staves:
+        if s.clef:
+            last[s.slot] = s.clef
+    inters = system.element.find("sig/inters")
+    seen: dict[int, tuple[float, str]] = {}
+    for el in inters if inters is not None else []:
+        b = el.find("bounds")
+        kind = CLEF_SHAPES.get(el.get("shape") or "")
+        if el.tag != "clef" or b is None or not kind or el.get("staff") not in by_sid:
+            continue
+        slot, x = by_sid[el.get("staff")].slot, float(b.get("x"))
+        if slot not in seen or x > seen[slot][0]:
+            seen[slot] = (x, kind)
+    for slot, (_x, kind) in seen.items():
+        last[slot] = kind
+
+
 def number_staves(systems: list[System], pages: dict) -> list[Part]:
     """Give every staff its slot in the score and group the slots into
     parts. The first system that shows the most staves is the model; a
@@ -453,11 +478,17 @@ def number_staves(systems: list[System], pages: dict) -> list[Part]:
     model = max(systems, key=lambda s: len(s.staves))
     model = next(s for s in systems if len(s.staves) == len(model.staves))
     kinds = [(s.count, s.clef) for s in model.staves]
+    # the clef each slot ended the previous system with: a system that
+    # hides staves is matched against that, not against the model's first
+    # clefs, since a part may have changed clef (timpani to castanets in
+    # treble) and a staff left alone on a line keeps the clef it had
+    last = {k: c for k, (_n, c) in enumerate(kinds)}
     for system in systems:
         mine = [(s.count, s.clef) for s in system.staves]
         if len(mine) == len(kinds):
             for k, s in enumerate(system.staves):
                 s.slot = k
+            _carry_clefs(system, last)
             continue
         # order-preserving match: fewest disagreements
         best: tuple[int, list[int]] | None = None
@@ -470,12 +501,14 @@ def number_staves(systems: list[System], pages: dict) -> list[Part]:
                 best = (cost, picked)
                 return
             for jj in range(j, len(kinds) - (len(mine) - i) + 1):
-                miss = (mine[i][0] != kinds[jj][0]) * 4 + (bool(mine[i][1]) and bool(kinds[jj][1])
-                                                           and mine[i][1] != kinds[jj][1])
+                was = last.get(jj) or kinds[jj][1]
+                miss = (mine[i][0] != kinds[jj][0]) * 4 + (bool(mine[i][1]) and bool(was)
+                                                           and mine[i][1] != was)
                 walk(i + 1, jj + 1, cost + miss, picked + [jj])
         walk(0, 0, 0, [])
         for s, k in zip(system.staves, best[1] if best else range(len(mine))):
             s.slot = k
+        _carry_clefs(system, last)
     # names from the margin of the model system
     names = _margin_names(model, pages[model.name][1])
     left = min(s.left for s in model.staves)
