@@ -266,6 +266,7 @@ class Sheet:
         self._rests(root)
         self._signs()
         self._graces(root)
+        self._drags()
 
     # -- filled heads -----------------------------------------------------
     def _heads(self):
@@ -601,6 +602,7 @@ class Sheet:
                   for tag in ("word", "dynamics", "rest", "clef", "time-whole", "time-pair",
                               "time-number") for el in root.iter(tag)
                   if el.find("bounds") is not None]
+        self.words = [b for b in barred]
         n, _lab, stats, cents = cv2.connectedComponentsWithStats(small)
         upright = cv2.morphologyEx(self.nolines.astype(np.uint8), cv2.MORPH_OPEN,
                                    np.ones((max(int(1.1 * il), 5), 1), np.uint8))
@@ -656,6 +658,52 @@ class Sheet:
                        for hx, hy in self.filled + self.crosses):
                 continue
             self.graces.append((cx, cy, float(stem[0])))
+
+    def _drags(self):
+        """A drag: two grace notes smaller again than a flam's, each with
+        a short stem, the stems joined at the top by one beam. Found from
+        the stems: two short uprights (no taller than two and a half
+        interlines) side by side, a beam across their tops, and a small
+        head at the foot of each on its left. The beam has an x's crossing
+        strokes where it meets the stems, so a cross found there goes."""
+        il = self.il
+        k = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (max(int(0.35 * il), 3), max(int(0.28 * il), 3)))
+        tiny = cv2.morphologyEx(self.u8, cv2.MORPH_OPEN, k)
+        tiny &= 1 - cv2.dilate(self.solid, np.ones((5, 5), np.uint8))
+        short = [s for s in self.stems if 1.2 * il <= s[2] - s[1] <= 2.6 * il]
+        for a in short:
+            for b in short:
+                if not 0.6 * il <= b[0] - a[0] <= 1.6 * il or abs(a[1] - b[1]) > 0.3 * il \
+                        or abs(a[2] - b[2]) > 0.3 * il:
+                    continue
+                top = int(min(a[1], b[1]))
+                beam = self.nolines[top:top + max(int(0.3 * il), 3), int(a[0]):int(b[0]) + 1]
+                if not beam.size or not (beam.mean(axis=1) > 0.85).any():
+                    continue
+                heads = []
+                for sx, _y0, y1 in (a, b):
+                    box = tiny[int(y1 - 0.6 * il):int(y1 + 0.4 * il),
+                               int(sx - 0.7 * il):int(sx + 0.1 * il)]
+                    ys, xs = np.nonzero(box)
+                    if len(ys) < 0.08 * il * il:
+                        break
+                    heads.append((int(sx - 0.7 * il) + xs.mean(), int(y1 - 0.6 * il) + ys.mean(), sx))
+                if len(heads) != 2:
+                    continue
+                # on the staff, not in its words ("In", "Ro" have the shape)
+                home = self.home_bar(*heads[0][:2])
+                if home is None or not (self.bars[home]["top"] - 1.6 * il <= heads[0][1]
+                                        <= self.bars[home]["top"] + 5.6 * il):
+                    continue
+                if any(bx - 0.3 * il <= hx <= bx + bw + 0.3 * il
+                       and by - 0.3 * il <= hy <= by + bh + 0.3 * il
+                       for hx, hy, _s in heads for bx, by, bw, bh in self.words):
+                    continue
+                self.graces += heads
+                self.crosses = [(x, y) for x, y in self.crosses
+                                if not (a[0] - 0.5 * il <= x <= b[0] + 0.5 * il
+                                        and top - 0.6 * il <= y <= top + 0.8 * il)]
 
     def home_bar(self, x: float, y: float) -> int | None:
         """Index of the printed bar a mark at (x, y) belongs to: the one it
@@ -1229,6 +1277,84 @@ def bar_tuplets(events: list[dict], brackets: dict | None = None) -> list[dict]:
         out.append({"voice": members[0]["voice"], "start": str(start),
                     "end": str(last["slot"] + last["value"]), "actual": 3, "normal": 2,
                     "bracket": bool((brackets or {}).get(tid))})
+    return out
+
+
+def staff_text_runs(sheet: "Sheet") -> list[tuple[int, int, int, int]]:
+    """(x, y, w, h) of every run of small letters printed INSIDE a staff
+    ("rim." beside the first note, "snare" under the cymbal line), which
+    Audiveris does not read as words. Letters are what is left of the ink
+    once lines, stems, heads and beams are gone: three or more pieces
+    about half an interline tall standing on one baseline, close together."""
+    il = sheet.il
+    ink = sheet.nolines.astype(np.uint8).copy()
+    stems = np.zeros_like(ink)
+    for sx, y0, y1 in sheet.stems:
+        stems[int(y0):int(y1) + 1, max(int(sx) - 2, 0):int(sx) + 3] = 1
+    ink &= 1 - stems
+    ink &= 1 - cv2.dilate(sheet.solid, np.ones((5, 5), np.uint8))
+    # a cross head hangs on a stem; letters can pass for crosses, but
+    # stand free of stems
+    for x, y in sheet.crosses:
+        if any(abs(sx - x) < 0.85 * il and y0 - 0.6 * il <= y <= y1 + 0.6 * il
+               for sx, y0, y1 in sheet.stems):
+            ink[max(int(y - 0.6 * il), 0):int(y + 0.6 * il),
+                max(int(x - 0.7 * il), 0):int(x + 0.7 * il)] = 0
+    n, _lab, stats, cents = cv2.connectedComponentsWithStats(ink)
+    out = []
+    for b in sheet.bars:
+        top, x0, x1 = b["top"], b["x0"], b["x1"]
+        pieces = sorted(
+            (int(stats[i][0]), int(stats[i][1]), int(stats[i][2]), int(stats[i][3]))
+            for i in range(1, n)
+            if x0 <= cents[i][0] < x1 and top - 0.3 * il <= cents[i][1] <= top + 4.3 * il
+            and 0.12 * il <= stats[i][3] <= 1.3 * il and stats[i][2] <= 1.6 * il)
+        runs: list[list] = []
+        for p in pieces:
+            if runs and p[0] - max(q[0] + q[2] for q in runs[-1]) <= 0.45 * il:
+                runs[-1].append(p)
+            else:
+                runs.append([p])
+        for r in runs:
+            # letters stand on one baseline (an i's dot does not count)
+            feet = sorted(p[1] + p[3] for p in r)
+            base = feet[len(feet) // 2]
+            if sum(abs(f - base) <= 0.3 * il for f in feet) < 3:
+                continue
+            # the letters and what sits over them (dots); a note's remains
+            # hanging below the baseline are not part of the word
+            r = [p for p in r if p[1] + p[3] <= base + 0.3 * il and p[1] >= base - 1.6 * il]
+            xa, ya = min(p[0] for p in r), min(p[1] for p in r)
+            xb, yb = max(p[0] + p[2] for p in r), max(p[1] + p[3] for p in r)
+            if xb - xa >= 1.2 * il:
+                out.append((xa, ya, xb - xa, yb - ya))
+    return out
+
+
+def staff_words(sheet: "Sheet") -> list[tuple[float, float, float, str]]:
+    """[(x, y, width, kind)] of the kit words printed inside the staff
+    (`staff_text_runs`), read by Tesseract; kind as `_kit_word` gives it.
+    A run cut short by a note (the e of "snare" under a cross) still names
+    the snare from its first four letters."""
+    from chord_chart import ocr
+    from PIL import Image
+    il = sheet.il
+    out = []
+    for x, y, w, h in staff_text_runs(sheet):
+        pad = int(0.5 * il)
+        crop = sheet.nolines[max(y - pad, 0):y + h + pad, max(x - pad, 0):x + w + pad]
+        img = Image.fromarray(((1 - crop.astype(np.uint8)) * 255).astype(np.uint8))
+        scale = 48 / max(h, 1)
+        img = img.resize((max(int(img.width * scale), 1), max(int(img.height * scale), 1)),
+                         Image.LANCZOS)
+        text = ocr(img, False, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.")
+        letters = "".join(c for c in text.lower() if c.isalpha())
+        from difflib import SequenceMatcher
+        kind = _kit_word(text) or (
+            "snare" if len(letters) >= 4 and SequenceMatcher(None, letters, "snare").ratio() >= 0.75
+            else None)
+        if kind:
+            out.append((float(x), float(y + h / 2), float(w), kind))
     return out
 
 
@@ -1912,6 +2038,7 @@ def read_chart(omr: Path) -> list[dict]:
     merged = merged_bars(omr)
     out = []
     ordinal = 0
+    inside = {}         # sheet name: kit words printed inside the staff
     with zipfile.ZipFile(omr) as z:
         from PIL import Image
         import io
@@ -1920,6 +2047,7 @@ def read_chart(omr: Path) -> list[dict]:
             ink = np.asarray(Image.open(io.BytesIO(
                 z.read(f"{name}/BINARY.png"))).convert("L")) < 128
             sheet = Sheet(ink, root)
+            inside[name] = staff_words(sheet)
             for whole in sheet.bars:
                 slots = bar_slots(meters.get(ordinal, (4, 4)))
                 edges = [whole["x0"], *merged.get(ordinal, []), whole["x1"]]
@@ -1945,6 +2073,8 @@ def read_chart(omr: Path) -> list[dict]:
         words = {name: kit_words(ET.fromstring(
             z.read(f"{name}/{name}.xml").decode("utf-8", "replace")))
             for name in _sheets(z)}
+    for name, found in inside.items():
+        words[name] = sorted(words.get(name, []) + found)
     apply_kit_words(out, words)
     apply_rim_words(out, words)
     return out
