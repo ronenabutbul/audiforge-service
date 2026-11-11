@@ -1946,6 +1946,35 @@ def _mend_boxed_numbers(path: Path) -> None:
         print(f"  boxed numbers mended to their bars: {mended}", flush=True)
 
 
+def _place_rehearsals_by(omr: Path, out: Path, hbars: list[dict],
+                         marks: list, numbers: list[int]) -> int:
+    """Rehearsal letters and boxed bar numbers placed as `place_rehearsals`
+    places them, but by `numbers`, the printed number of every stack in
+    the bars this score wrote (`numbers_for_bars`)."""
+    from fix_hbars import _REHEARSAL_NUMBER, _REHEARSAL_VALUE, _locate_marks
+    marks = [m for m in marks
+             if _REHEARSAL_VALUE.match(m[3]) or _REHEARSAL_NUMBER.match(m[3])]
+    at = _locate_marks(omr, hbars, marks, numbers=numbers)
+    tree = ET.parse(out)
+    measures = tree.getroot().find("part").findall("measure")
+    for m in measures:
+        for d in list(m.findall("direction")):
+            if any(dt.find("rehearsal") is not None for dt in d.findall("direction-type")):
+                m.remove(d)
+    by_number = {m.get("number"): m for m in measures}
+    placed = 0
+    for number, value in at:
+        m = by_number.get(str(number))
+        if m is None:
+            continue
+        direction = ET.Element("direction", placement="above")
+        ET.SubElement(ET.SubElement(direction, "direction-type"), "rehearsal").text = value
+        m.insert(0, direction)
+        placed += 1
+    tree.write(out, encoding="UTF-8", xml_declaration=True)
+    return placed
+
+
 def _known_term(text: str) -> str | None:
     """Keep an instruction only when the page plausibly printed it."""
     from difflib import SequenceMatcher
@@ -2106,6 +2135,7 @@ def place_breaks(omr_path: Path, out: Path, crops: list[dict],
     import zipfile as _zipfile
     starts: list[tuple[int, int, bool]] = []    # (first stack, end stack, new page)
     ordinal = 0
+    size = None         # the first sheet's (width, height, interline, staff left, right, top)
     with _zipfile.ZipFile(omr_path) as z:
         sheets = sorted(
             {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
@@ -2113,10 +2143,22 @@ def place_breaks(omr_path: Path, out: Path, crops: list[dict],
         for si, sheet in enumerate(sheets):
             root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml").decode("utf-8", "replace"))
             first_on_sheet = True
+            pic = root.find(".//picture")
             for system in root.iter("system"):
                 staff = system.find(".//staff")
                 if staff is None or len(staff.findall("lines/line")) < 2:
                     continue
+                if size is None and pic is not None and staff.get("left") \
+                        and len(staff.findall("lines/line")) == 5:
+                    ys = [float(ln.find("point").get("y")) for ln in staff.findall("lines/line")
+                          if ln.find("point") is not None]
+                    if len(ys) == 5:
+                        lefts = [float(st.get("left")) for sy in root.iter("system")
+                                 for st in sy.iter("staff") if st.get("left")]
+                        rights = [float(st.get("right")) for sy in root.iter("system")
+                                  for st in sy.iter("staff") if st.get("right")]
+                        size = (float(pic.get("width")), float(pic.get("height")),
+                                (ys[-1] - ys[0]) / 4, min(lefts), max(rights), ys[0])
                 n = len(system.findall("stack"))
                 if n:
                     starts.append((ordinal, ordinal + n, si > 0 and first_on_sheet))
@@ -2152,8 +2194,40 @@ def place_breaks(omr_path: Path, out: Path, crops: list[dict],
             pages += 1
         else:
             systems += 1
+    if size:
+        _page_defaults(tree.getroot(), *size)
     tree.write(out, encoding="UTF-8", xml_declaration=True)
     return systems, pages
+
+
+def _page_defaults(score: ET.Element, width: float, height: float, il: float,
+                   left: float, right: float, top: float) -> None:
+    """Lay the score out on the original's page at the original's staff
+    size (`<defaults>`, in tenths: 40 tenths are one staff height). The
+    line breaks are the page's, and a row the engraver fitted at a small
+    staff no longer overflows a renderer's default staff and breaks in
+    two. Only the page's size is assumed: A4 if it is as tall as A4."""
+    mm_per_px = 210.0 / width if abs(height / width - 297 / 210) < 0.03 else 215.9 / width
+    staff_mm = 4 * il * mm_per_px
+    tenths = 40 / (4 * il)          # tenths per pixel
+    old = score.find("defaults")
+    if old is not None:
+        score.remove(old)
+    d = ET.Element("defaults")
+    sc = ET.SubElement(d, "scaling")
+    ET.SubElement(sc, "millimeters").text = f"{staff_mm:.4f}"
+    ET.SubElement(sc, "tenths").text = "40"
+    pl = ET.SubElement(d, "page-layout")
+    ET.SubElement(pl, "page-height").text = f"{height * tenths:.0f}"
+    ET.SubElement(pl, "page-width").text = f"{width * tenths:.0f}"
+    pm = ET.SubElement(pl, "page-margins", type="both")
+    ET.SubElement(pm, "left-margin").text = f"{left * tenths:.0f}"
+    ET.SubElement(pm, "right-margin").text = f"{max(width - right, 0) * tenths:.0f}"
+    ET.SubElement(pm, "top-margin").text = f"{max(top - 6 * il, 0) * tenths:.0f}"
+    ET.SubElement(pm, "bottom-margin").text = f"{max(top - 6 * il, 0) * tenths:.0f}"
+    # after work / identification, before part-list
+    at = next((k for k, el in enumerate(score) if el.tag == "part-list"), 0)
+    score.insert(at, d)
 
 
 def place_fermatas(omr_path: Path, out: Path, crops: list[dict],
@@ -2267,6 +2341,11 @@ def apply_structure(work_dir: Path, out: Path, omr: Path,
     if ink_marks is not None:
         placed = place_rehearsals(omr, out, hbars, extra_marks=ink_marks,
                                   use_omr=False)
+        if numbers is not None:
+            # place them again by the bars this score wrote: the standard
+            # count runs one bar late after every stack the score dropped
+            # (the sliver after a closing double barline)
+            placed = _place_rehearsals_by(omr, out, hbars, ink_marks, numbers)
         _mend_boxed_numbers(out)
     else:
         placed = place_rehearsals(omr, out, hbars)
