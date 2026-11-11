@@ -1523,12 +1523,16 @@ def bar_tuplets(events: list[dict], brackets: dict | None = None) -> list[dict]:
     return out
 
 
-def staff_text_runs(sheet: "Sheet") -> list[tuple[int, int, int, int]]:
+def staff_text_runs(sheet: "Sheet", band: tuple[float, float] = (-0.3, 4.3),
+                    tallest: float = 1.3) -> list[tuple[int, int, int, int]]:
     """(x, y, w, h) of every run of small letters printed INSIDE a staff
     ("rim." beside the first note, "snare" under the cymbal line), which
     Audiveris does not read as words. Letters are what is left of the ink
     once lines, stems, heads and beams are gone: three or more pieces
-    about half an interline tall standing on one baseline, close together."""
+    about half an interline tall standing on one baseline, close together.
+    `band`: the rows searched, in interlines below the top line (the
+    default is the staff itself); `tallest`: the tallest letter, in
+    interlines (words outside the staff are printed larger)."""
     il = sheet.il
     ink = sheet.nolines.astype(np.uint8).copy()
     stems = np.zeros_like(ink)
@@ -1550,8 +1554,9 @@ def staff_text_runs(sheet: "Sheet") -> list[tuple[int, int, int, int]]:
         pieces = sorted(
             (int(stats[i][0]), int(stats[i][1]), int(stats[i][2]), int(stats[i][3]))
             for i in range(1, n)
-            if x0 <= cents[i][0] < x1 and top - 0.3 * il <= cents[i][1] <= top + 4.3 * il
-            and 0.12 * il <= stats[i][3] <= 1.3 * il and stats[i][2] <= 1.6 * il)
+            if x0 <= cents[i][0] < x1
+            and top + band[0] * il <= cents[i][1] <= top + band[1] * il
+            and 0.12 * il <= stats[i][3] <= tallest * il and stats[i][2] <= 1.6 * il)
         runs: list[list] = []
         for p in pieces:
             if runs and p[0] - max(q[0] + q[2] for q in runs[-1]) <= 0.45 * il:
@@ -1567,6 +1572,8 @@ def staff_text_runs(sheet: "Sheet") -> list[tuple[int, int, int, int]]:
             # the letters and what sits over them (dots); a note's remains
             # hanging below the baseline are not part of the word
             r = [p for p in r if p[1] + p[3] <= base + 0.3 * il and p[1] >= base - 1.6 * il]
+            if not r:
+                continue
             xa, ya = min(p[0] for p in r), min(p[1] for p in r)
             xb, yb = max(p[0] + p[2] for p in r), max(p[1] + p[3] for p in r)
             if xb - xa >= 1.2 * il:
@@ -1599,6 +1606,155 @@ def staff_words(sheet: "Sheet") -> list[tuple[float, float, float, str]]:
         if kind:
             out.append((float(x), float(y + h / 2), float(w), kind))
     return out
+
+
+# Abbreviated names of the kit printed in small italics over (or under) a
+# staff whose noteheads are all plain ovals ("H.H.", "R.C.", "H.T.",
+# "F.T."): the word, not the head's shape, says which drum
+# a line means. Compared as letters only, lower case. Tesseract reads an
+# italic F as E ("E.T." for "F.T."), so both spellings are kept. "Stick",
+# "Brushes", "Stick/stick" say how to play, not what, and are not here.
+_LABELS = {
+    "hh": "hh_closed", "hihat": "hh_closed", "hithat": "hh_closed",
+    "hhped": "hh_pedal", "hhpedal": "hh_pedal", "hhpd": "hh_pedal",
+    "rc": "ride", "ride": "ride", "ridecym": "ride",
+    "cymcup": "ride_bell", "cup": "ride_bell", "bell": "ride_bell",
+    "cc": "crash", "crash": "crash", "crashcym": "crash",
+    "ht": "tom_high", "hightom": "tom_high", "mt": "tom_mid", "midtom": "tom_mid",
+    "lt": "tom_low", "lowtom": "tom_low",
+    "ft": "tom_floor", "et": "tom_floor", "floortom": "tom_floor",
+}
+
+
+def kit_labels(sheet: "Sheet") -> list[tuple[float, float, str, bool]]:
+    """[(left x, y centre, instrument, above)] of the kit labels printed
+    over or under a staff (`_LABELS`), read from the ink by Tesseract.
+    Audiveris reads few of them (an italic "H.H." becomes "_.,") and
+    joins others into a direction's sentence, so the ink is read again:
+    runs of letters up to about two interlines tall (`staff_text_runs`)
+    in the bands over and under the staff. Only a run that is one known
+    label as a whole counts, so titles, tempo words and lyrics never do."""
+    from chord_chart import ocr
+    from PIL import Image
+    il = sheet.il
+    out = []
+    for band, above in (((-6.0, -0.4), True), ((4.4, 8.0), False)):
+        for x, y, w, h in staff_text_runs(sheet, band, 1.9):
+            if w > 10 * il:
+                continue
+            pad = int(0.5 * il)
+            crop = sheet.nolines[max(y - pad, 0):y + h + pad, max(x - pad, 0):x + w + pad]
+            img = Image.fromarray(((1 - crop.astype(np.uint8)) * 255).astype(np.uint8))
+            scale = 48 / max(h, 1)
+            img = img.resize((max(int(img.width * scale), 1), max(int(img.height * scale), 1)),
+                             Image.LANCZOS)
+            text = ocr(img, False, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ./")
+            inst = _LABELS.get("".join(c for c in text.lower() if c.isalpha()))
+            if inst:
+                out.append((float(x), y + h / 2, inst, above))
+    return out
+
+
+def _oval(kind: str) -> str:
+    """A void head is the same line's instrument as a filled one."""
+    return "normal" if kind == "void" else kind
+
+
+def apply_kit_labels(chart: list[dict], labels: dict[str, list]) -> None:
+    """A kit label takes effect where it is printed, and the two families
+    of label say different things:
+    - a cymbal label ("H.H.", "R.C.", "Cym. cup", "Crash") sets the
+      timekeeping cymbal: it names the line of the highest head within a
+      few interlines after it (a label is often printed a little before
+      its note, over a kick or tom that ends the fill before), and every
+      later head with that shape on that line, until a cymbal label names
+      the line anew;
+    - a drum label ("H.T.", "F.T.") marks a fill: every up-stem head after
+      it that is not on the snare, the kick or a named cymbal line is that
+      drum, until the
+      next label or the end of the following bar; after the fill the
+      cymbal names hold again.
+    The snare line is never renamed by a label. On a chart of plain ovals
+    the label is the only word on the instrument and holds until the next
+    one; over x heads it names the passage it is printed over and lapses
+    once that line falls silent for a bar."""
+    if not any(labels.values()):
+        return
+    from collections import Counter
+    from drum_grid import STEP_MAP
+    snare = {s for s, row in STEP_MAP.items() if row.get("normal") == "snare"}
+    down = Counter(st["step"] for b in chart for st in b["strikes"] if st.get("voice") == 2)
+    kick = down.most_common(1)[0][0] if down else None
+    cymbal_family = {"hh_closed", "hh_open", "hh_pedal", "ride", "ride_bell", "crash"}
+    claims = []         # (bar index, x where it starts, instrument, line or None)
+    for i, b in enumerate(chart):
+        bar = b["bar"]
+        il, top = bar["il"], bar["top"]
+        for x, y, inst, above in labels.get(b["sheet"], []):
+            if not (bar["x0"] - 0.5 * il <= x < bar["x1"]
+                    and top - 7 * il <= y <= top + 9 * il):
+                continue
+            others = [c for c in chart if c["sheet"] == b["sheet"] and c is not b
+                      and c["bar"]["x0"] - 0.5 * il <= x < c["bar"]["x1"]
+                      and abs(c["bar"]["top"] + 2 * il - y) < abs(top + 2 * il - y)]
+            if others:
+                continue
+            start = x - 1.0 * il
+            if inst not in cymbal_family:
+                claims.append((i, start, inst, None))
+                continue
+            near = [(k, st) for k in range(i, min(i + 2, len(chart)))
+                    if chart[k]["sheet"] == b["sheet"] and chart[k]["bar"]["top"] == top
+                    for st in chart[k]["strikes"] if not st.get("grace")
+                    and start <= st.get("x", 0) <= x + 5 * il
+                    and st["step"] not in snare and st["step"] != kick
+                    and (above or st["step"] > 4)]
+            if not near:
+                continue
+            k, st = min(near, key=lambda n: n[1]["step"]) if above else \
+                max(near, key=lambda n: n[1]["step"])
+            # the name holds from its note on: a fill drum printed before
+            # that note, under the label, is still the fill's
+            claims.append((k, st.get("x", 0) - 0.3 * il, inst,
+                           (st["step"], _oval(st["kind"]))))
+    if not claims:
+        return
+    claims.sort(key=lambda c: (c[0], c[1]))
+    named, heard, fill, ci = {}, {}, None, 0
+    for i, b in enumerate(chart):
+        if fill and i > fill[1]:
+            fill = None
+        # a label over x heads only adds a name the head already half says,
+        # for the passage it is printed over: it lapses once its line falls
+        # silent for a bar (Abba's "ride" over three crosses must not make
+        # every later crash a ride)
+        for line in [ln for ln in named if ln[1] != "normal" and heard[ln] < i - 1]:
+            del named[line]
+        for st in sorted(b["strikes"], key=lambda s: s.get("x", 0)):
+            while ci < len(claims) and (claims[ci][0] < i or claims[ci][0] == i
+                                        and claims[ci][1] <= st.get("x", 0)):
+                _bi, _x, inst, line = claims[ci]
+                if line is None:
+                    fill = (inst, claims[ci][0] + 1)
+                else:
+                    named[line] = inst
+                    heard[line] = claims[ci][0]
+                    fill = None
+                ci += 1
+            if st.get("grace") or st["step"] in snare:
+                continue
+            line = (st["step"], _oval(st["kind"]))
+            if line in named:
+                heard[line] = i
+            inst = named.get(line)
+            if fill and inst is None and st.get("voice") == 1 and st["step"] != kick \
+                    and st["kind"] in ("normal", "void"):
+                inst = fill[0]
+            if inst is None:
+                continue
+            if inst == "hh_closed" and "open" in st["marks"]:
+                inst = "hh_open"
+            st["inst"] = inst
 
 
 def _read_digit(mask: np.ndarray) -> list[str]:
@@ -2402,6 +2558,7 @@ def read_chart(omr: Path) -> list[dict]:
     out = []
     ordinal = 0
     inside = {}         # sheet name: kit words printed inside the staff
+    labels = {}         # sheet name: kit labels printed over / under the staff
     with zipfile.ZipFile(omr) as z:
         from PIL import Image
         import io
@@ -2411,6 +2568,7 @@ def read_chart(omr: Path) -> list[dict]:
                 z.read(f"{name}/BINARY.png"))).convert("L")) < 128
             sheet = Sheet(ink, root)
             inside[name] = staff_words(sheet)
+            labels[name] = kit_labels(sheet)
             for whole in sheet.bars:
                 slots = bar_slots(meters.get(ordinal, (4, 4)))
                 edges = [whole["x0"], *merged.get(ordinal, []), whole["x1"]]
@@ -2440,6 +2598,7 @@ def read_chart(omr: Path) -> list[dict]:
         words[name] = sorted(words.get(name, []) + found)
     apply_kit_words(out, words)
     apply_rim_words(out, words)
+    apply_kit_labels(out, labels)
     return out
 
 
