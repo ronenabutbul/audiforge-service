@@ -1355,6 +1355,10 @@ def read_drums(systems: list[System], pages: dict, slot: int, meters: list[tuple
                     if e.get("heads"):
                         e["heads"] = [(hx, hy, "x" if kind == "normal" and _waisted(sheet, hx, hy, geo["il"])
                                        else kind) for hx, hy, kind in e["heads"]]
+                    e.pop("signs", None)
+                # the signs again, now that the crosses are known ("o" and
+                # "+" go to a cross only)
+                drum_ink._attach_signs(sheet, geo, read["events"])
                 _roll_slashes(sheet, read["events"], geo["il"])
                 events, problem = drum_ink.time_bar(read, geo["il"])
                 notes = [e for e in events if not e.get("rest")]
