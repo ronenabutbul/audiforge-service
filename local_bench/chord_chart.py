@@ -108,13 +108,17 @@ def parse_chord(text: str) -> dict | None:
                                      "subtract" if m.group(1) in ("no", "omit") else "add"))
         s = s[:paren.start()]
     while True:
-        tail = re.search(r"(?<=\d)(b|#|add)(\d{1,2})$", s)
+        # "Gadd9": an added note straight after the root, with no quality
+        tail = re.search(r"(?:(?<=\d)(b|#|add)|^(add))(\d{1,2})$", s)
         if not tail:
             break
-        if not 2 <= int(tail.group(2)) <= 13:              # b51: no such degree
+        sign, degree = tail.group(1) or tail.group(2), int(tail.group(3))
+        if not 2 <= degree <= 13:                          # b51: no such degree
             return None
-        acc = tail.group(1) if tail.group(1) != "add" else ""
-        chord["degrees"].insert(0, (int(tail.group(2)), ALTER[acc], "add"))
+        if sign in ("b", "#") and degree not in (5, 6, 9, 11, 13):
+            return None                                    # a #3 is a misread #5
+        acc = sign if sign != "add" else ""
+        chord["degrees"].insert(0, (degree, ALTER[acc], "add"))
         s = s[:tail.start()]
     kind = QUALITIES.get(s) or QUALITIES.get(s.lower())
     if kind is None:
