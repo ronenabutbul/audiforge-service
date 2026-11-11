@@ -280,7 +280,8 @@ class Sheet:
                         if not self.in_dynamic(x, y) and not self.in_time(x, y)]
         self.filled = [(x, y) for x, y in self.filled if not self.in_time(x, y)]
         self._rings()
-        self.rings = [r for r in self.rings if not self.in_dynamic(r[0], r[1])]
+        # (rings are not checked against dynamics: Audiveris takes a row of
+        # circled crosses for a "p" four interlines tall)
         self._stems()
         self._rests(root)
         # an eighth rest's hook and a quarter rest's zigzag cross like an x;
