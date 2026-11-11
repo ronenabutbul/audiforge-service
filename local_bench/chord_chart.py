@@ -136,6 +136,11 @@ def tidy(raw: str) -> str:
     s = s.replace("acld", "add").replace("aclcl", "add")
     s = re.sub(r"m[io](?=\d)", "m", s)                    # Cmi11, Dbmo6: a letter that is not there
     s = re.sub(r"(?<=\d)i", "1", s)                       # F#m1i -> F#m11
+    # "sus" in a bold scanned face: the s's bowls fill in (saus, sas, 8us)
+    s = re.sub(r"(?<=[A-G#b\d])(?:sa|8)us|(?<=[A-G#b\d])sas(?=[24]|$)", "sus", s)
+    s = re.sub(r"sus[d8a]$", "sus4", s)                   # the 4 of sus4 read as a d
+    s = re.sub(r"(?<=[A-G#b])[85]/9", "6/9", s)            # the stacked 6 of 6/9 (no 8/9 or 5/9 chord)
+    s = re.sub(r"m\(maj7?\)?|mi\(?maj", lambda m: m.group(0).replace("i", ""), s)   # Bm(maj7) Bmimaj7
     if s.count("(") > s.count(")"):
         s += ")"
     if s.count(")") > s.count("("):                       # F7b5) -> F7b5
@@ -219,10 +224,12 @@ class Names:
         tall = np.array([max((b - a for a, b in _runs(g[:, x])), default=0) for x in range(w)])
         left, right = tall[:max(int(0.45 * w), 1)].max(), tall[int(0.55 * w):].max()
         k = max(int(round(0.14 * h)), 1)
-        # a sharp: two long uprights with a small window between them; the
-        # right one stands out at the top, the left one at the foot
-        if left >= 0.6 * h and right >= 0.6 * h and hy.min() >= 0.15 * h \
-                and hy.max() <= 0.85 * h and np.ptp(hy) <= 0.5 * h \
+        # a sharp: two long uprights with a small window between them, in
+        # the middle; the right one stands out at the top, the left one at
+        # the foot. (A bold d also has a window and a tall right stroke, but
+        # its left side is only the bowl, and its window sits low.)
+        if left >= 0.75 * h and right >= 0.75 * h and hy.min() >= 0.15 * h \
+                and hy.max() <= 0.75 * h and np.ptp(hy) <= 0.5 * h \
                 and hx.min() >= 0.1 * w and hx.max() <= 0.9 * w \
                 and g[:k, int(0.5 * w):].any() and g[-k:, :int(0.5 * w) + 1].any():
             return "#"
@@ -450,9 +457,13 @@ def _split_names(names: Names, tok: list[dict], cap: float, base: float) -> list
     """Names printed so close that they read as one: cut the ink at its
     wider gaps, and start a new name at each capital A to G that follows a
     whole chord. None when that does not make chords of all of it."""
+    # a gap between names is wide next to this print's own letter spacing
+    gaps = [p["x"] - max(q["x"] + q["w"] for q in tok[:i]) for i, p in enumerate(tok) if i]
+    spacing = statistics.median([g for g in gaps if g > 0] or [0])
+    cut = min(0.3 * cap, max(2.5 * spacing, 0.15 * cap))
     pieces: list[list[dict]] = []
     for p in tok:
-        if pieces and p["x"] - max(q["x"] + q["w"] for q in pieces[-1]) < 0.3 * cap:
+        if pieces and p["x"] - max(q["x"] + q["w"] for q in pieces[-1]) < cut:
             pieces[-1].append(p)
         else:
             pieces.append([p])
