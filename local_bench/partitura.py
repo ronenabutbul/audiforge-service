@@ -327,6 +327,54 @@ def read_layout(omr: Path) -> tuple[list[System], dict]:
     return systems, pages
 
 
+def _ink_interline(ink: np.ndarray) -> float | None:
+    """Median gap between neighbouring staff lines on a page, read from the
+    ink (rows that are mostly black across the page)."""
+    rows = ink.mean(axis=1) > 0.4
+    ys, y = [], 0
+    while y < len(rows):
+        if rows[y]:
+            a = y
+            while y < len(rows) and rows[y]:
+                y += 1
+            ys.append((a + y) / 2)
+        y += 1
+    gaps = np.diff(ys)
+    gaps = gaps[gaps < 40]                   # within a staff, not between staves
+    return float(np.median(gaps)) if len(gaps) >= 4 else None
+
+
+class NoSystems(Exception):
+    """The Audiveris project holds no system to read."""
+
+
+def no_systems_reason(omr: Path) -> str:
+    """Why Audiveris left every sheet without a system. The usual cause is a
+    dense score engraved so small that its staff lines are under 10 pixels
+    apart: Audiveris' scale step refuses such a sheet ("too low interline"),
+    so nothing at all is read and no ink reader has staves to work on."""
+    from PIL import Image
+    gaps = []
+    with zipfile.ZipFile(omr) as z:
+        for name in _sheets(z):
+            png = f"{name}/BINARY.png"
+            if png in z.namelist():
+                ink = np.asarray(Image.open(io.BytesIO(z.read(png))).convert("L")) < 128
+                il = _ink_interline(ink)
+                if il:
+                    gaps.append(il)
+    if not gaps:
+        return "Audiveris found no systems and the pages show no staff lines"
+    il = float(np.median(gaps))
+    msg = (f"Audiveris found no systems on any sheet; the ink shows staff lines "
+           f"{il:.1f} px apart on {len(gaps)} sheets")
+    if il < 12:
+        msg += (f". That is below what Audiveris accepts as an interline, so it dropped every "
+                f"sheet at its scale step. Re-run Audiveris on pages rendered at about "
+                f"{int(np.ceil(20 / il))}x the resolution (interline near 20 px)")
+    return msg
+
+
 def _bars_of(ink: np.ndarray, system: System) -> None:
     """Bars between the barlines; the barline that opens the system and
     the gap after a closing one are not bars."""
@@ -528,7 +576,7 @@ def layout_debug(work: Path, out_dir: Path) -> None:
     omr = next(work.glob("*.omr"))
     systems, pages = read_layout(omr)
     if not systems:
-        print("no systems in the Audiveris project (it never got as far as the staves)")
+        print(no_systems_reason(omr))
         return
     parts = number_staves(systems, pages)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1840,6 +1888,8 @@ def _link_open_ties(per_measure: list[list[Event]], bar_lens: list[Fraction]) ->
 def convert(work: Path, out: Path) -> dict:
     omr = next(work.glob("*.omr"))
     systems, pages = read_layout(omr)
+    if not systems:
+        raise NoSystems(no_systems_reason(omr))
     parts = number_staves(systems, pages)
     meters, keys, clefs = read_signatures(systems)
     locator = Locator(systems)
@@ -2165,7 +2215,11 @@ def main():
     if "--layout" in sys.argv:
         layout_debug(work, Path(sys.argv[sys.argv.index("--layout") + 1]))
         return
-    convert(work, Path(sys.argv[2]))
+    try:
+        convert(work, Path(sys.argv[2]))
+    except NoSystems as e:
+        print(f"cannot convert: {e}")
+        sys.exit(3)
 
 
 if __name__ == "__main__":
