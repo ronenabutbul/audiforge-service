@@ -1859,6 +1859,9 @@ def main():
                 for k in range(1, h.get("span", 1))}
     crops = [c for c in crops if c["stack"] not in absorbed]
     if "--ink" in sys.argv:
+        from drum_ink import sliver_bars
+        slivers = sliver_bars(omr) - set(rest_counts)
+        crops = [c for c in crops if c["stack"] not in slivers]
         from drum_ink import spans_from_numbers, system_numbers
         before = dict(rest_counts)
         rest_counts = spans_from_numbers(

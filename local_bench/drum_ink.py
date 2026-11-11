@@ -65,12 +65,13 @@ def page_layout(root: ET.Element) -> list[dict]:
         lines = staff.findall("lines/line") if staff is not None else []
         if len(lines) < 5:
             continue
-        for stack in system.findall("stack"):
+        for si, stack in enumerate(system.findall("stack")):
             x0, x1 = float(stack.get("left")), float(stack.get("right"))
             mid = (x0 + x1) / 2
             ys = [_line_y(ln, mid) for ln in lines]
             bars.append({"x0": x0, "x1": x1, "top": ys[0],
-                         "il": (ys[-1] - ys[0]) / 4, "lines": lines})
+                         "il": (ys[-1] - ys[0]) / 4, "lines": lines,
+                         "first": si == 0})
     return bars
 
 
@@ -108,6 +109,31 @@ class Sheet:
         tall = cv2.morphologyEx(self.u8, cv2.MORPH_OPEN,
                                 np.ones((2 * thick + 3, 1), np.uint8)).astype(bool)
         self.nolines = ink & ~(self.linemask & ~tall)
+        # printed words are not beams: the marks at a stem tip are read
+        # from a copy with every recognised word blanked
+        self.marksink = self.nolines.copy()
+        self.equals = []
+        for w in root.iter("word"):
+            b = w.find("bounds")
+            value = (w.get("value") or "").strip()
+            if b is None:
+                continue
+            if value.startswith("=") or value[:1].isdigit() and "=" in value:
+                self.equals.append((float(b.get("x")), float(b.get("y")) + float(b.get("h")) / 2))
+            # words, and the open/closed marks over a hi-hat line
+            if sum(ch.isalpha() for ch in value) < 3 and not (
+                    value and all(ch in "+o0O°" for ch in value)):
+                continue
+            x, y = int(float(b.get("x"))), int(float(b.get("y")))
+            self.marksink[max(y, 0):y + int(float(b.get("h"))) + 1,
+                          max(x, 0):x + int(float(b.get("w"))) + 1] = False
+        self.timesigs = []
+        for el in root.iter():
+            if el.tag.startswith("time-"):
+                b = el.find("bounds")
+                if b is not None:
+                    self.timesigs.append((float(b.get("x")), float(b.get("y")),
+                                          float(b.get("w")), float(b.get("h"))))
         self._heads()
         self._crosses()
         self._rings()
@@ -282,31 +308,31 @@ class Sheet:
         the next stem; a flag hangs on one side only; a slash is a short
         stroke centred on the stem, so it shows on both sides and stops."""
         il = self.il
-        ya, yb = tip - 0.45 * il, tip + toward * reach
+        ya, yb = tip - toward * 0.45 * il, tip + toward * reach
         y0, y1 = max(int(min(ya, yb)), 0), max(int(max(ya, yb)), 1)
 
         def marks_at(dx):
             col = int(round(x + dx))
             if not 0 <= col < self.ink.shape[1]:
                 return []
-            return [((a + b) / 2 + y0) for a, b in _runs(self.nolines[y0:y1, col])
+            return [((a + b) / 2 + y0) for a, b in _runs(self.marksink[y0:y1, col])
                     if 0.16 * il <= b - a <= 1.0 * il]
 
         def ink_near(dx, y):
             col = int(round(x + dx))
             if not 0 <= col < self.ink.shape[1]:
                 return False
-            return bool(self.nolines[max(int(y - 0.55 * il), 0):int(y + 0.55 * il), col].any())
+            return bool(self.marksink[max(int(y - 0.55 * il), 0):int(y + 0.55 * il), col].any())
 
         left, right = marks_at(-0.38 * il), marks_at(0.38 * il)
         best = (0, 0)
         for side, other, sign in ((left, right, -1), (right, left, 1)):
             beams = slashes = 0
             for y in side:
-                if ink_near(sign * 1.25 * il, y):
+                if ink_near(sign * 1.25 * il, y) and ink_near(sign * 1.65 * il, y):
                     beams += 1          # goes on: a beam (or a long flag)
-                elif any(abs(y - oy) < 0.45 * il for oy in other) \
-                        and not ink_near(-sign * 1.25 * il, y):
+                elif any(abs(y - oy) < 0.75 * il for oy in other) \
+                        and not ink_near(-sign * 1.65 * il, y):
                     slashes += 1
                 else:
                     beams += 1          # a stub or a flag
@@ -352,6 +378,19 @@ class Sheet:
                           max(int(y0), 0) + (a + b) / 2, kind))
         return found
 
+    def in_time(self, x: float, y: float) -> bool:
+        return any(tx - 2 <= x <= tx + tw + 2 and ty - 2 <= y <= ty + th + 2
+                   for tx, ty, tw, th in self.timesigs)
+
+    def block(self, hx: float, hy: float) -> bool:
+        """A rest block: wider than a head, half an interline tall, flat."""
+        il = self.il
+        row = self.ink[int(hy), max(int(hx - 1.5 * il), 0):int(hx + 1.5 * il)]
+        col = self.ink[max(int(hy - 1.5 * il), 0):int(hy + 1.5 * il), int(hx)]
+        wide = max((b - a for a, b in _runs(row)), default=0)
+        tall = max((b - a for a, b in _runs(col)), default=0)
+        return wide >= 1.05 * il and tall <= 0.8 * il
+
     def dotted(self, hx: float, hy: float, edge: float | None = None) -> bool:
         il = self.il
         x0, x1 = int(hx + 0.75 * il), int(hx + 2.0 * il)
@@ -388,7 +427,17 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
         + [(x, y, "circled_x") for x, y in sheet.rings if inside(x, y)
            and not any(abs(x - vx) < il and abs(y - vy) < il for vx, vy in sheet.voids)]
     stems = [s for s in sheet.stems
-             if x0 + 0.3 * il < s[0] < x1 - 0.3 * il and s[2] > ylo and s[1] < yhi]
+             if x0 + 0.3 * il < s[0] < x1 - 0.3 * il and s[2] > ylo and s[1] < yhi
+             # a stem touches the staff's neighbourhood; the sides of a
+             # boxed rehearsal letter float above it
+             and s[2] >= top - 1.8 * il and s[1] <= top + 5.8 * il
+             # the clef's own bars at the head of a system are not stems
+             and not (bar.get("first") and s[0] < x0 + 2.6 * il
+                      and s[1] > top - 0.4 * il and s[2] < top + 4.4 * il)
+             and not sheet.in_time(s[0], (s[1] + s[2]) / 2)
+             # the little note of a metronome mark ("note = 136")
+             and not any(0 < ex - s[0] < 4.5 * il and s[1] - 1.5 * il < ey < s[2] + 1.5 * il
+                         and s[2] < top for ex, ey in sheet.equals)]
     # hang heads on stems
     chords: dict[int, list] = {}
     loose = []
@@ -401,7 +450,8 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
             if best_d is None or d < best_d:
                 best, best_d = k, d
         if best is None:
-            if kind != "circled_x":
+            # a cross or a ring with no stem is a letter of some text
+            if kind not in ("circled_x", "x"):
                 loose.append((hx, hy, kind))
         else:
             chords.setdefault(best, []).append((hx, hy, kind))
@@ -425,8 +475,18 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
         ys = [hy for _, hy, _ in members]
         up = (sum(ys) / len(ys)) > (sy0 + sy1) / 2   # heads low on the stem
         tip = sy0 if up else sy1
+        right_side = [m for m in members if (m[0] < sx) == up]
+        if right_side and len(right_side) < len(members):
+            members = [m for m in members if (m[0] < sx) == up or m[2] != "x"
+                       or abs(m[1] - tip) > 1.6 * il]
+            ys = [hy for _, hy, _ in members]
         reach = max(min(abs(tip - (min(ys) if up else max(ys))) - 0.9 * il, 2.6 * il), 0.5 * il)
         marks, tremolo = sheet.tip_marks(sx, tip, 1 if up else -1, reach)
+        # a "head" centred on the stem itself is a roll slash through it
+        through = [m for m in members if abs(m[0] - sx) < 0.3 * il and m[2] == "normal"]
+        if through and len(through) < len(members):
+            members = [m for m in members if m not in through]
+            tremolo += len(through)
         value = {0: Fraction(4), 1: Fraction(2), 2: Fraction(1)}.get(marks, Fraction(1, 2))
         if any(k == "void" for _, _, k in members):
             value, tremolo, marks = Fraction(8), tremolo + marks, 0
@@ -436,7 +496,10 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
                        "value": value, "heads": members, "marks": marks,
                        "tremolo": tremolo})
     for hx, hy, kind in loose:
-        if kind in ("circled_x", "void") and False:
+        if kind == "normal" and sheet.block(hx, hy):
+            # a half or whole rest printed off the staff for one voice
+            events.append({"x": hx, "voice": 2 if hy > top + 2 * il else 1,
+                           "value": Fraction(8), "rest": True, "y": hy})
             continue
         events.append({"x": hx, "voice": 0, "value": None,
                        "heads": [(hx, hy, kind)], "marks": None})
@@ -458,9 +521,13 @@ def time_bar(read: dict, il: float) -> tuple[list[dict], str | None]:
     stems alone tell the hands from the feet)."""
     import copy
     first = None
-    for mode in ("voices", "ruler", "stream"):
+    for mode in ("assign", "voices", "ruler", "stream"):
         attempt = {"events": copy.deepcopy(read["events"]), "slots": read["slots"]}
-        if mode == "ruler":
+        if mode == "assign":
+            events, problem = _time_assign(attempt, il)
+            if problem is not None:
+                continue
+        elif mode == "ruler":
             events, problem = _time_ruler(attempt, il, read.get("x1"))
         else:
             events, problem = _time_once(attempt, il, mode)
@@ -469,6 +536,76 @@ def time_bar(read: dict, il: float) -> tuple[list[dict], str | None]:
         if problem is None:
             return events, None
     return first
+
+
+def _time_assign(read: dict, il: float) -> tuple[list[dict], str | None]:
+    """Both voices write their own rests: try every way of dealing the
+    rests to the two voices and keep the one where each voice adds up
+    to the bar and notes printed in one column sound together."""
+    from itertools import product
+    events, slots = read["events"], read["slots"]
+    rests = [e for e in events if e.get("rest")]
+    notes = [e for e in events if not e.get("rest")]
+    if not notes or any(e["voice"] not in (1, 2) for e in notes) or len(rests) > 10:
+        return events, "not tried"
+    best = None
+    for deal in product((1, 2), repeat=len(rests)):
+        voice = {id(r): v for r, v in zip(rests, deal)}
+        times, ok, cost = {}, True, 0
+        for v in (1, 2):
+            line = [e for e in events if (voice.get(id(e)) or e["voice"]) == v]
+            t, k = Fraction(0), 0
+            while k < len(line):
+                e = line[k]
+                chord = [e]
+                if not e.get("rest"):
+                    while k + 1 < len(line) and not line[k + 1].get("rest") \
+                            and line[k + 1]["x"] - e["x"] < 0.7 * il:
+                        k += 1
+                        chord.append(line[k])
+                value = min(c["value"] for c in chord)
+                if e.get("rest") and value >= 8 and len(line) == 1:
+                    value = Fraction(slots)
+                for c in chord:
+                    times[id(c)] = (t, value)
+                t += value
+                k += 1
+            if line and t != slots:
+                ok = False
+                break
+        if not ok:
+            continue
+        for r, v in zip(rests, deal):
+            if r["voice"] and r["voice"] != v:
+                cost += 1
+        seq = sorted(notes, key=lambda e: e["x"])
+        for a, b in zip(seq, seq[1:]):
+            ta, tb = times[id(a)][0], times[id(b)][0]
+            if b["x"] - a["x"] < 0.7 * il:
+                if ta != tb:
+                    ok = False
+            elif tb <= ta:
+                ok = False
+        # two rests in one column: the higher is the hands'
+        for a in rests:
+            for b in rests:
+                if a is not b and abs(a["x"] - b["x"]) < 0.7 * il:
+                    if voice[id(a)] == voice[id(b)]:
+                        ok = False
+                    elif a["y"] < b["y"] and voice[id(a)] == 2:
+                        cost += 2
+        if ok and (best is None or cost < best[0]):
+            best = (cost, voice, times)
+    if best is None:
+        return events, "no deal of the rests adds up"
+    _, voice, times = best
+    for e in events:
+        if e.get("rest"):
+            e["voice"] = voice[id(e)]
+        e["slot"], e["value"] = times[id(e)]
+    if any(e["slot"].denominator != 1 for e in notes):
+        return events, "off-grid"
+    return events, None
 
 
 def _time_ruler(read: dict, il: float, x1: float | None) -> tuple[list[dict], str | None]:
@@ -587,6 +724,20 @@ def _time_once(read: dict, il: float, mode: str) -> tuple[list[dict], str | None
     return events, problem
 
 
+def sliver_bars(omr: Path) -> set[int]:
+    """Ordinals of 'bars' too narrow to hold music: the gap an engraver
+    leaves between a closing double barline and the end of the staff."""
+    out, ordinal = set(), 0
+    with zipfile.ZipFile(omr) as z:
+        for name in _sheets(z):
+            root = ET.fromstring(z.read(f"{name}/{name}.xml").decode("utf-8", "replace"))
+            for bar in page_layout(root):
+                if bar["x1"] - bar["x0"] < 4.5 * bar["il"]:
+                    out.add(ordinal)
+                ordinal += 1
+    return out
+
+
 def read_chart(omr: Path) -> list[dict]:
     """Every printed bar of the chart, in order: {'strikes': [(slot, step,
     head, value)], 'problem': str | None}."""
@@ -663,22 +814,31 @@ def system_numbers(omr: Path) -> dict[int, int]:
                         keep[lab == i] = 1
                 if not keep.any():
                     continue
-                img = Image.fromarray(((1 - keep) * 255).astype(np.uint8))
-                img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
-                path = f"{tmp}/n.png"
-                img.save(path)
+                ys_, xs_ = np.nonzero(keep)
+                keep = keep[ys_.min():ys_.max() + 1, xs_.min():xs_.max() + 1]
+                pad = int(il)
                 votes: dict[int, int] = {}
-                for psm in ("7", "8", "13"):
-                    r = subprocess.run(
-                        ["tesseract", path, "-", "--psm", psm, "-c",
-                         "tessedit_char_whitelist=0123456789"],
-                        capture_output=True, text=True, env=env)
-                    digits = "".join(ch for ch in r.stdout if ch.isdigit())
-                    if digits and len(digits) <= 3:
-                        votes[int(digits)] = votes.get(int(digits), 0) + 1
+                # bar numbers are often italic: read them upright as well
+                for slant in (0.0, 0.25):
+                    h, w = keep.shape
+                    m = np.float32([[1, slant, pad], [0, 1, pad]])
+                    up = cv2.warpAffine(keep * 255, m, (w + 2 * pad + int(slant * h), h + 2 * pad),
+                                        flags=cv2.INTER_NEAREST)
+                    img = Image.fromarray((255 - up).astype(np.uint8))
+                    img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
+                    path = f"{tmp}/n.png"
+                    img.save(path)
+                    for psm in ("7", "8", "13"):
+                        r = subprocess.run(
+                            ["tesseract", path, "-", "--psm", psm, "-c",
+                             "tessedit_char_whitelist=0123456789"],
+                            capture_output=True, text=True, env=env)
+                        digits = "".join(ch for ch in r.stdout if ch.isdigit())
+                        if digits and len(digits) <= 3:
+                            votes[int(digits)] = votes.get(int(digits), 0) + 1
                 if votes:
                     value, hits = max(votes.items(), key=lambda kv: kv[1])
-                    if hits >= 2:
+                    if hits >= 3:
                         out[first] = value
     return out
 
