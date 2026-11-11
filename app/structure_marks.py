@@ -629,6 +629,38 @@ def _ending_number(sheet: _Sheet, words, x: int, y: int, floor: float, il: float
     return ", ".join(numbers) if numbers and len(numbers) <= 4 else None
 
 
+def _closed_below(sheet: _Sheet, line: dict, hooks, il: float) -> bool:
+    """A rehearsal box: hooks at both ends whose feet are joined by a
+    floor. Its floor is often lost as a line of its own where a beam or
+    a stem below touches it, so it is looked for in the ink at the feet."""
+    ends = [(h, n) for h, n in hooks
+            if h - line["x0"] <= 0.4 * il or line["x1"] - h <= 0.4 * il]
+    if len(ends) < 2:
+        return False
+    # The legs need not match: one can run on into ink below the box.
+    nl, nr = ends[0][1], ends[-1][1]
+    ink = sheet.ink
+    a, b = int(line["x0"] + 0.3 * il), int(line["x1"] - 0.3 * il)
+    if b - a < il:
+        return False
+    reach = max(2, int(0.6 * il))
+    lo, hi = int(line["x0"]) - reach, int(line["x1"]) + reach
+    if lo < 0 or hi > ink.shape[1]:
+        return False
+    for foot in (nl, nr):
+        for dy in range(-2, 3):
+            y = int(round(_line_y(line, (a + b) / 2) + foot + dy))
+            if not 0 <= y < ink.shape[0] or ink[y, a:b].mean() < 0.85:
+                continue
+            # a floor stops at the box's corners; a staff line that a
+            # bracket's legs reach down to runs on past them
+            band = ink[max(0, y - 2):y + 3]
+            if not band[:, lo:lo + reach - 2].any() \
+                    or not band[:, hi - reach + 2:hi].any():
+                return True
+    return False
+
+
 def _endings(sheet: _Sheet, words) -> list[dict]:
     """Volta brackets on one sheet, in reading order: {system, x0, x1, y,
     left, right, number}. `left` and `right` say whether the bracket has a
@@ -650,6 +682,8 @@ def _endings(sheet: _Sheet, words) -> list[dict]:
                    and abs(o["y0"] - line["y0"]) < 5 * il for j, o in enumerate(lines)):
                 continue
             hooks = _hooks(sheet, line, il)
+            if _closed_below(sheet, line, hooks, il):
+                continue
             ends = [n for h, n in hooks
                     if h - line["x0"] <= 0.4 * il or line["x1"] - h <= 0.4 * il]
             left = any(h - line["x0"] <= 0.4 * il for h, _n in hooks)
