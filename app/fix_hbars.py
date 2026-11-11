@@ -114,6 +114,28 @@ def _ink_through(pixels, x: int, centre: int, lo: int, hi: int) -> int:
     return d - u + 1
 
 
+# Off by default. When on, a barline may carry the hook of an ending
+# bracket above it: the stroke goes on past the top staff line and ends in
+# a long flat line. The drum pipeline turns this on (drum_grid.main), so
+# its own bar splitting and stack_numbers() agree on the bar count.
+VOLTA_HOOK_BARLINES = False
+
+
+def _hook_above(pixels, x: int, top_row: int, interline: float) -> bool:
+    """The ink above a barline is the downstroke of an ending bracket: a
+    thin stroke that stops, within a few interlines, at a flat line
+    running on to the right."""
+    r = top_row
+    limit = max(top_row - int(6 * interline), 1)
+    while r > limit and pixels[r - 1, x - 1:x + 2].any():
+        r -= 1
+    if top_row - r < interline or r <= limit:
+        return False
+    span = int(2.5 * interline)
+    band = pixels[max(r - 2, 0):r + 4, x + 2:x + 2 + span]
+    return bool(band.size) and float(band.any(axis=0).mean()) > 0.9
+
+
 def _interior_barline_xs(pixels, top: float, bottom: float, x0: int, x1: int,
                          interline: float) -> list[int]:
     """x of every barline strictly inside a stack, i.e. the boundaries of
@@ -171,7 +193,9 @@ def _interior_barline_xs(pixels, top: float, bottom: float, x0: int, x1: int,
     for x in range(x0 + inset, x1 - inset):
         col = pixels[:, x]
         is_bar = (continuous(col[t + 2:b - 1])
-                  and not col[max(t - 4, 0)] and not col[min(b + 4, len(col) - 1)]
+                  and (not col[max(t - 4, 0)]
+                       or VOLTA_HOOK_BARLINES and _hook_above(pixels, x, t, interline))
+                  and not col[min(b + 4, len(col) - 1)]
                   and thin_all_the_way(x))
         if is_bar and (last is None or x - last > interline):
             found.append(x)
