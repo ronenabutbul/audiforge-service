@@ -276,6 +276,19 @@ def calibrate(readings: list["BarReading"]) -> dict:
             if kick_step > snare_step:
                 step_map.setdefault(snare_step, {})["normal"] = "snare"
                 step_map.setdefault(kick_step, {})["normal"] = "kick"
+        # Toms: every plain-head place the chart uses for one is its own
+        # drum. Where the fixed table gives two of those places the same
+        # tom (a fill stepping down from the top line: top line and second
+        # line both "high tom"), one instrument would put both on one line
+        # in the render; then the places are dealt the toms high to low in
+        # order of height.
+        toms = sorted(st for st in plain_steps
+                      if step_map.get(st, {}).get("normal", "").startswith("tom"))
+        given = [step_map[st]["normal"] for st in toms]
+        if len(set(given)) < len(given):
+            names = ["tom_high", "tom_mid", "tom_low", "tom_floor"]
+            for k, st in enumerate(toms):
+                step_map[st]["normal"] = names[min(k, len(names) - 1)]
     return step_map
 
 
@@ -379,6 +392,7 @@ def bar_crops(omr_path: Path) -> list[dict]:
                                  .decode("utf-8", "replace"))
             image = Image.open(io.BytesIO(z.read(f"{sheet}/BINARY.png"))) \
                 .convert("L")
+            ink = None
             # Audiveris records every printed time signature with bounds;
             # collected per sheet, matched to bars by position below.
             sigs = []
@@ -411,6 +425,19 @@ def bar_crops(omr_path: Path) -> list[dict]:
                         meter = pending_sig
                         pending_sig = None
                     fragment = False
+                    printed = [s for s in sigs
+                               if top - 2 * interline <= s["y"] <= bottom + 2 * interline
+                               and x0 - 4 <= s["x"] <= x1]
+                    if not printed:
+                        # a mid-line meter change Audiveris left out
+                        from drum_ink import ink_time_signature
+                        if ink is None:
+                            import numpy as np
+                            ink = np.asarray(image) < 128
+                        seen = ink_time_signature(ink, top, interline, x0)
+                        if seen:
+                            print(f"  time signature read from the ink: stack {stack_ordinal} {seen[0]}/{seen[1]}", file=sys.stderr)
+                            meter = seen
                     for sig in sigs:
                         if not (top - 2 * interline <= sig["y"]
                                 <= bottom + 2 * interline):
@@ -1886,7 +1913,32 @@ _TERMS = [
     "Cym.", "Hi-hat", "Hit hat", "Ride", "Cup", "Bell", "Sticks", "Brushes",
     "Snare", "Toms", "Bass drum", "Fill", "Cue", "Vamp", "Open", "Choke",
     "Cym. Dome", "Dome", "Ride Bell", "Sus. Cym.", "Crash",
+    # kit words one letter away from a tempo word: "rim." (rim click) must
+    # match itself before the one-letter rule makes it "rit."
+    "rim.", "Rim shot", "Cross stick", "t.t.", "Molto rit.",
 ]
+
+
+def _mend_boxed_numbers(path: Path) -> None:
+    """A boxed bar number IS the number of the bar it stands over. Where
+    the OCR reading differs from that bar's number in one digit only
+    ("37" over bar 57: the 5's flag lost in the frame), the reading is the
+    misread; anything further off is left as printed, since the numbering
+    itself may be what is wrong."""
+    tree = ET.parse(path)
+    mended = []
+    for measure in tree.getroot().iter("measure"):
+        number = measure.get("number", "")
+        for reh in measure.iter("rehearsal"):
+            text = (reh.text or "").strip()
+            if not (text.isdigit() and number.isdigit()) or text == number:
+                continue
+            if len(text) == len(number) and sum(a != b for a, b in zip(text, number)) == 1:
+                mended.append((text, number))
+                reh.text = number
+    if mended:
+        tree.write(path, encoding="UTF-8", xml_declaration=True)
+        print(f"  boxed numbers mended to their bars: {mended}", flush=True)
 
 
 def _known_term(text: str) -> str | None:
@@ -1931,12 +1983,17 @@ def place_words(omr_path: Path, out: Path, crops: list[dict],
     """
     import zipfile as _zipfile
 
-    # measure number of each crop, once multirests are expanded
-    measure_of: dict[int, int] = {}
+    # measure number of each crop, once multirests are expanded (a stack
+    # holding two printed bars gives each its own measure)
+    measure_of: dict[tuple[int, int], int] = {}
     measure = 0 if crops and crops[0].get("pickup") else 1
     for i, crop in enumerate(crops):
-        measure_of.setdefault(crop["stack"], measure)
+        measure_of.setdefault((crop["stack"], crop.get("part", 0)), measure)
         measure += rest_bars.get(i, 1)
+    inner: dict[int, list[int]] = {}
+    if any(c.get("part", 0) for c in crops):
+        from drum_ink import merged_bars
+        inner = merged_bars(omr_path)
 
     found: list[tuple[int, str]] = []  # (stack ordinal, text)
     stack_ordinal = 0
@@ -2002,7 +2059,8 @@ def place_words(omr_path: Path, out: Path, crops: list[dict],
                             if starts[i] <= cx <= ends[i]]
                     si = over[0] if over else min(
                         range(len(starts)), key=lambda i: abs(starts[i] - cx))
-                    found.append((stack_ordinal + si, text))
+                    k = stack_ordinal + si
+                    found.append(((k, sum(1 for x in inner.get(k, []) if x <= cx)), text))
                 stack_ordinal += len(stacks)
 
     if not found:
@@ -2028,6 +2086,69 @@ def place_words(omr_path: Path, out: Path, crops: list[dict],
     if placed:
         tree.write(out, encoding="UTF-8", xml_declaration=True)
     return placed
+
+
+def place_breaks(omr_path: Path, out: Path, crops: list[dict],
+                 rest_bars: dict[int, int]) -> tuple[int, int]:
+    """Break lines and pages where the page does, so the render can be laid
+    beside the original bar for bar: `<print new-system="yes"/>` on the
+    first measure of every system after the first, `new-page` on the first
+    measure of every sheet after the first. A system starts at its first
+    stack; the measure is that of the first bar read at or after it (a
+    multirest is one printed bar: its first measure; a sliver or a bar
+    absorbed into a multirest gives way to the next bar of the system).
+    Returns (system breaks, page breaks)."""
+    import zipfile as _zipfile
+    starts: list[tuple[int, int, bool]] = []    # (first stack, end stack, new page)
+    ordinal = 0
+    with _zipfile.ZipFile(omr_path) as z:
+        sheets = sorted(
+            {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+            key=lambda s: int(s.split("#")[1]))
+        for si, sheet in enumerate(sheets):
+            root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml").decode("utf-8", "replace"))
+            first_on_sheet = True
+            for system in root.iter("system"):
+                staff = system.find(".//staff")
+                if staff is None or len(staff.findall("lines/line")) < 2:
+                    continue
+                n = len(system.findall("stack"))
+                if n:
+                    starts.append((ordinal, ordinal + n, si > 0 and first_on_sheet))
+                    first_on_sheet = False
+                ordinal += n
+    measure_of: dict[int, int] = {}
+    measure = 0 if crops and crops[0].get("pickup") else 1
+    order = []
+    for i, crop in enumerate(crops):
+        order.append((crop["stack"], measure))
+        measure += rest_bars.get(i, 1)
+    tree = ET.parse(out)
+    part = tree.getroot().find("part")
+    measures = part.findall("measure")
+    for m in measures:
+        for pr in list(m.findall("print")):
+            pr.attrib.pop("new-system", None)
+            pr.attrib.pop("new-page", None)
+            if not pr.attrib and not len(pr):
+                m.remove(pr)
+    by_number = {m.get("number"): m for m in measures}
+    systems = pages = 0
+    for k, (a, b, page) in enumerate(starts):
+        if k == 0:
+            continue
+        number = next((num for stack, num in order if a <= stack < b), None)
+        m = by_number.get(str(number)) if number is not None else None
+        if m is None or m is measures[0]:
+            continue
+        pr = ET.Element("print", {"new-page" if page else "new-system": "yes"})
+        m.insert(0, pr)
+        if page:
+            pages += 1
+        else:
+            systems += 1
+    tree.write(out, encoding="UTF-8", xml_declaration=True)
+    return systems, pages
 
 
 def place_fermatas(omr_path: Path, out: Path, crops: list[dict],
@@ -2141,6 +2262,7 @@ def apply_structure(work_dir: Path, out: Path, omr: Path,
     if ink_marks is not None:
         placed = place_rehearsals(omr, out, hbars, extra_marks=ink_marks,
                                   use_omr=False)
+        _mend_boxed_numbers(out)
     else:
         placed = place_rehearsals(omr, out, hbars)
     # Drum charts engrave hairpins above the staff, under the dynamics
@@ -2192,8 +2314,18 @@ def main():
                 for k in range(1, h.get("span", 1))}
     crops = [c for c in crops if c["stack"] not in absorbed]
     inner: dict[int, list[int]] = {}
+    ink_chart = None
     if "--ink" in sys.argv:
-        from drum_ink import boxed_marks, boxed_numbers, sliver_bars
+        from drum_ink import boxed_marks, boxed_numbers, read_chart, sliver_bars
+        ink_chart = read_chart(omr)
+        # Audiveris calls a first bar a pickup when it holds less than its
+        # meter by its own reading; the ink says whether it does. A first
+        # bar whose voices fill the whole meter is bar 1.
+        if crops and crops[0].get("pickup"):
+            first = next((b for b in ink_chart if b["ordinal"] == crops[0]["stack"]), None)
+            if first is not None and not first["problem"] and first["strikes"]:
+                crops[0] = dict(crops[0], pickup=False)
+                print("  first bar fills its meter: not a pickup", flush=True)
         ink_marks = boxed_marks(omr)
         slivers = sliver_bars(omr) - set(rest_counts)
         crops = [c for c in crops if c["stack"] not in slivers]
@@ -2239,7 +2371,7 @@ def main():
     raw_cache = out.with_suffix(".readings.json")
     if "--ink" in sys.argv:
         from drum_ink import ink_readings
-        readings, unsure = ink_readings(crops, omr, rest_counts)
+        readings, unsure = ink_readings(crops, omr, rest_counts, chart=ink_chart)
         print(f"read {len(readings)} bars from the ink alone; "
               f"{len(unsure)} did not add up: {unsure[:20]}", flush=True)
         transcribe_gemini.last_readings = readings
@@ -2341,6 +2473,8 @@ def main():
                     ink_marks if "--ink" in sys.argv else None)
     words = place_words(omr, out, crops, rest_bars)
     fermatas = place_fermatas(omr, out, crops, rest_bars)
+    breaks = place_breaks(omr, out, crops, rest_bars)
+    print(f"  line breaks as printed: {breaks[0]} systems, {breaks[1]} pages", flush=True)
     if fermatas:
         print(f"  {fermatas} fermatas placed", flush=True)
     if words:

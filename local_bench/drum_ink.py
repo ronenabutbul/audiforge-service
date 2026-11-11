@@ -173,10 +173,23 @@ class Sheet:
     """Ink layers of one page, each answering one question."""
 
     def __init__(self, ink: np.ndarray, root: ET.Element, bars: list[dict] | None = None):
-        self.ink = ink
-        self.u8 = ink.astype(np.uint8)
         # `bars`: another staff's bars (a score reads its drum staff this way)
         self.bars = page_layout(root) if bars is None else bars
+        # a boxed bar number or letter over the staff is read on its own
+        # (`boxed_marks`); its upright sides would pass for stems and its
+        # corners for cross heads, so the boxes leave this copy of the ink
+        self.frames = []
+        for top, il, x0, x1 in {(b["top"], b["il"], b["x0"], b["x1"]) for b in self.bars}:
+            ya, yb = max(int(top - 7 * il), 0), int(top - 0.15 * il)
+            xa, xb = max(int(x0 - 2 * il), 0), int(x1)
+            for x, y, w, h in _frames(ink[ya:yb, xa:xb], il):
+                self.frames.append((xa + x, ya + y, w, h))
+        if self.frames:
+            ink = ink.copy()
+            for x, y, w, h in self.frames:
+                ink[y:y + h, x:x + w] = False
+        self.ink = ink
+        self.u8 = ink.astype(np.uint8)
         for k, b in enumerate(self.bars):
             b["k"] = k
         self.il = float(np.median([b["il"] for b in self.bars])) if self.bars else 20.0
@@ -240,13 +253,58 @@ class Sheet:
                 if b is not None:
                     self.timesigs.append((float(b.get("x")), float(b.get("y")),
                                           float(b.get("w")), float(b.get("h"))))
+        clefs = [tuple(float(el.find("bounds").get(q)) for q in "xywh")
+                 for el in root.iter("clef") if el.find("bounds") is not None]
+        # a clef is never a note (Audiveris can take a faint 4/4 for one)
+        self.timesigs += clefs
+        # a signature Audiveris missed (start of the piece, mid line):
+        # its digits are not notes either
+        for b in self.bars:
+            if not any(b["x0"] - 4 <= tx <= b["x0"] + 4 * b["il"] and
+                       b["top"] - 2 * b["il"] <= ty <= b["top"] + 6 * b["il"]
+                       for tx, ty, _tw, _th in self.timesigs):
+                # after the clef at the head of a system
+                start = max([cx + cw for cx, cy, cw, ch in clefs
+                             if b["x0"] - 4 <= cx <= b["x0"] + 5 * b["il"]
+                             and b["top"] - 3 * b["il"] <= cy + ch / 2 <= b["top"] + 7 * b["il"]]
+                            + [b["x0"]])
+                ink_time_signature(self.ink, b["top"], b["il"], start, self.timesigs)
         self._heads()
         self._crosses()
+        # a dynamic's letters ("ff" printed against a stem) have the
+        # crossing strokes of an x; inside a dynamic Audiveris read, no
+        # cross is a note head
+        self.dynamics = [tuple(float(el.find("bounds").get(q)) for q in "xywh")
+                         for el in root.iter("dynamics") if el.find("bounds") is not None]
+        self.crosses = [(x, y) for x, y in self.crosses
+                        if not self.in_dynamic(x, y) and not self.in_time(x, y)]
+        self.filled = [(x, y) for x, y in self.filled if not self.in_time(x, y)]
         self._rings()
+        # (rings are not checked against dynamics: Audiveris takes a row of
+        # circled crosses for a "p" four interlines tall)
         self._stems()
+        # A "dynamic" a stem runs straight through is not one: Audiveris
+        # reads the slashes of a roll on a stem as "p", and a row of
+        # circled crosses as a giant "p". Its ink is given back.
+        fake = []
+        for bx, by, bw, bh in self.dynamics:
+            if any(bx + bw / 3 <= sx <= bx + 2 * bw / 3 and y0 < by + bh / 2 < y1
+                   for sx, y0, y1 in self.stems):
+                fake.append((bx, by, bw, bh))
+                x, y = int(bx), int(by)
+                ys, xs = slice(max(y, 0), y + int(bh) + 1), slice(max(x, 0), x + int(bw) + 1)
+                self.marksink[ys, xs] = (self.nolines & ~self.thinlines)[ys, xs]
+        self.dynamics = [b for b in self.dynamics if b not in fake]
         self._rests(root)
+        # an eighth rest's hook and a quarter rest's zigzag cross like an x;
+        # inside a rest Audiveris recognised, no cross is a head
+        self.crosses = [(x, y) for x, y in self.crosses
+                        if not any(r[4] - 0.15 * self.il <= x <= r[4] + r[6] + 0.15 * self.il
+                                   and r[5] - 0.15 * self.il <= y <= r[5] + r[7] + 0.15 * self.il
+                                   for r in self.rests)]
         self._signs()
         self._graces(root)
+        self._drags()
 
     # -- filled heads -----------------------------------------------------
     def _heads(self):
@@ -401,7 +459,17 @@ class Sheet:
             a, g = 0.36 * il, 0.26 * il
             axes = sum(patch(dx, dy) for dx, dy in ((0, a), (0, -a)))
             diag = sum(patch(dx, dy) for dx, dy in ((g, g), (-g, g), (g, -g), (-g, -g)))
-            if diag == 4 and axes == 0 and patch(0, 0):
+            # and the circle itself: ink on its sides, level with the
+            # centre (a heavy cross filling a space has its notches there,
+            # the staff lines above and below closing it into a "ring")
+            sides = 0
+            for sgn in (-1, 1):
+                q = self.nolines[int(cy - 0.12 * il):int(cy + 0.12 * il) + 1,
+                                 int(cx + sgn * 0.95 * il):int(cx + sgn * 0.5 * il) + 1] if sgn < 0 else \
+                    self.nolines[int(cy - 0.12 * il):int(cy + 0.12 * il) + 1,
+                                 int(cx + 0.5 * il):int(cx + 0.95 * il) + 1]
+                sides += bool(q.size) and q.any()
+            if diag == 4 and axes == 0 and patch(0, 0) and sides == 2:
                 self.rings.append((cx, cy))
         # a ring swallows the cross drawn inside it
         self.crosses = [(x, y) for x, y in self.crosses
@@ -426,28 +494,83 @@ class Sheet:
             if w > 0.4 * il or hh < 1.2 * il:
                 continue
             cx = x + (w - 1) / 2
-            col = v[:, max(int(round(cx)) - 1, 0):int(round(cx)) + 2].any(axis=1)
             y0, y1 = int(y), int(y + hh)
-            while y0 > 0 and y - y0 < reach and col[y0 - 1]:
-                y0 -= 1
-            while y1 < len(col) and y1 - (y + hh) < reach and col[y1]:
-                y1 += 1
+
+            # follow the stroke row by row; a scanned stem can step a
+            # couple of pixels sideways (a skewed scan's staircase)
+            # follow the stroke row by row; a scanned stem can step a
+            # couple of pixels sideways (a skewed scan's staircase), and
+            # the stepped piece can be too short for the opening: past
+            # the opened stroke it goes on through thin upright ink only
+            thin_max = max(int(0.35 * il), 3)
+
+            def follow(yy, step, limit):
+                at = int(round(cx))
+                while 0 <= yy + step < v.shape[0] and abs(yy + step - (y if step < 0 else y + hh)) <= limit:
+                    lo = max(at - 3, 0)
+                    near = np.flatnonzero(v[yy + step, lo:at + 4])
+                    if not near.size:
+                        row = self.nolines[yy + step]
+                        near = np.flatnonzero(row[lo:at + 4])
+                        if not near.size:
+                            break
+                        c = lo + int(near[np.argmin(np.abs(near - (at - lo)))])
+                        a, b = c, c
+                        while a > 0 and row[a - 1]:
+                            a -= 1
+                        while b < len(row) - 1 and row[b + 1]:
+                            b += 1
+                        if b - a + 1 > thin_max:
+                            break
+                        at = (a + b) // 2
+                    else:
+                        at = lo + int(near[np.argmin(np.abs(near - (at - lo)))])
+                    yy += step
+                return yy
+            y0 = follow(y0, -1, reach)
+            y1 = follow(y1 - 1, 1, reach) + 1
             if y1 - y0 < h:
                 continue
+            # a worn scan breaks a stem short of its beam: a gap of a few
+            # pixels, then a beam (wide ink) right over it - the stem
+            # reaches the beam. Only towards a beam: a head stands beside
+            # the stem, not across it.
+            cxi = int(round(cx))
+            gap = max(int(0.3 * il), 3)
+            for end, step in ((y0, -1), (y1 - 1, 1)):
+                for d in range(2, gap + 1):
+                    yy = end + step * d
+                    if not 0 <= yy < self.u8.shape[0]:
+                        break
+                    # (a staff line is wide ink too, and is not a beam)
+                    row = self.nolines[yy, max(cxi - int(0.6 * il), 0):cxi + int(0.6 * il) + 1]
+                    if row.mean() > 0.9:
+                        # on through the beam to its far edge, as a stem goes
+                        while 0 < yy < self.u8.shape[0] - 1 and self.nolines[yy + step, cxi]:
+                            yy += step
+                        if step < 0:
+                            y0 = yy
+                        else:
+                            y1 = yy + 1
+                        break
             self.stems.append((cx, float(y0), float(y1)))
 
     def _rests(self, root: ET.Element):
         self.voids = []
+        # whole notes: a hollow oval with no stem (a snare roll held over
+        # bars, "Z" on its stem-less head); Audiveris finds them, the ink
+        # confirms the paper inside
+        self.wholes = []
         for el in root.iter("head"):
             b = el.find("bounds")
-            if b is None or el.get("shape") != "NOTEHEAD_VOID":
+            if b is None or el.get("shape") not in ("NOTEHEAD_VOID", "WHOLE_NOTE"):
                 continue
             cx = float(b.get("x")) + float(b.get("w")) / 2
             cy = float(b.get("y")) + float(b.get("h")) / 2
             ring = self.ink[int(cy - 0.15 * self.il):int(cy + 0.15 * self.il) + 1,
                             int(cx - 0.2 * self.il):int(cx + 0.2 * self.il) + 1]
             if ring.size and ring.mean() < 0.35:   # a ring, paper in the middle
-                self.voids.append((cx, cy))
+                (self.voids if el.get("shape") == "NOTEHEAD_VOID" else self.wholes).append((cx, cy))
         self.rests = []
         for el in root.iter("rest"):
             b = el.find("bounds")
@@ -459,6 +582,10 @@ class Sheet:
                                float(b.get("x")) + float(b.get("w")),
                                float(b.get("x")), float(b.get("y")),
                                float(b.get("w")), float(b.get("h"))))
+        # a digit inside a boxed bar number is not a rest (the 7 of "57")
+        self.rests = [r for r in self.rests
+                      if not any(fx <= r[0] <= fx + fw and fy <= r[1] <= fy + fh
+                                 for fx, fy, fw, fh in self.frames)]
 
     # -- signs over and under the notes -----------------------------------------
     def _signs(self):
@@ -547,17 +674,35 @@ class Sheet:
         k = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (max(int(0.5 * il), 3), max(int(0.38 * il), 3)))
         small = cv2.morphologyEx(self.nolines.astype(np.uint8), cv2.MORPH_OPEN, k)
+        # a small head ON a staff line loses its middle with the line and
+        # falls apart into two slivers; the opening on the full ink keeps
+        # it whole (the line itself is too thin to survive)
+        full = cv2.morphologyEx(self.u8, cv2.MORPH_OPEN, k)
+        m, flab, fstats, _fc = cv2.connectedComponentsWithStats(full)
+        online = np.unique(flab[(full > 0) & self.linemask])
+        small |= np.isin(flab, online[online > 0]).astype(np.uint8)
         # what a real head, a beam or a block leaves is not a small head
         small &= 1 - cv2.dilate(self.solid, np.ones((5, 5), np.uint8))
         barred = [tuple(float(el.find("bounds").get(q)) for q in "xywh")
                   for tag in ("word", "dynamics", "rest", "clef", "time-whole", "time-pair",
                               "time-number") for el in root.iter(tag)
                   if el.find("bounds") is not None]
+        self.words = [b for b in barred]
+        self.word_values = [(float(el.find("bounds").get("x")) + float(el.find("bounds").get("w")) / 2,
+                             float(el.find("bounds").get("y")) + float(el.find("bounds").get("h")) / 2,
+                             el.get("value") or "")
+                            for el in root.iter("word") if el.find("bounds") is not None]
         n, _lab, stats, cents = cv2.connectedComponentsWithStats(small)
+        upright = cv2.morphologyEx(self.nolines.astype(np.uint8), cv2.MORPH_OPEN,
+                                   np.ones((max(int(1.1 * il), 5), 1), np.uint8))
+        thin = upright & (1 - cv2.morphologyEx(upright, cv2.MORPH_OPEN,
+                                               np.ones((1, max(int(0.3 * il), 3)), np.uint8)))
+        clear = self.nolines & ~thin.astype(bool)
         self.graces = []
         for i in range(1, n):
             x, y, w, h, area = stats[i]
-            if not (0.45 * il <= w <= 0.9 * il and 0.4 * il <= h <= 0.75 * il
+            # (one on a staff line keeps a stub of the line each side)
+            if not (0.45 * il <= w <= 1.0 * il and 0.4 * il <= h <= 0.75 * il
                     and 0.18 * self.head_area <= area <= 0.45 * self.head_area):
                 continue
             cx, cy = float(cents[i][0]), float(cents[i][1])
@@ -573,7 +718,8 @@ class Sheet:
             # the head stands free: paper to its left and below-left (the
             # slash of a repeat-bar sign or of a roll runs on that way)
             def paper(xa, xb, ya, yb):
-                box = self.nolines[max(int(ya), 0):int(yb) + 1, max(int(xa), 0):int(xb) + 1]
+                # a stem there is the stem of the grace before (a drag)
+                box = clear[max(int(ya), 0):int(yb) + 1, max(int(xa), 0):int(xb) + 1]
                 return not box.size or box.mean() < 0.08
             if not (paper(cx - 1.1 * il, cx - 0.6 * il, cy - 0.25 * il, cy + 0.25 * il)
                     and paper(cx - 0.9 * il, cx - 0.4 * il, cy + 0.3 * il, cy + 0.8 * il)):
@@ -601,6 +747,81 @@ class Sheet:
                        for hx, hy in self.filled + self.crosses):
                 continue
             self.graces.append((cx, cy, float(stem[0])))
+
+    def _drags(self):
+        """A drag: two grace notes smaller again than a flam's, each with
+        a short stem, the stems joined at the top by one beam. Found from
+        the stems: two short uprights (no taller than two and a half
+        interlines) side by side, a beam across their tops, and a small
+        head at the foot of each on its left. The beam has an x's crossing
+        strokes where it meets the stems, so a cross found there goes."""
+        il = self.il
+        k = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (max(int(0.35 * il), 3), max(int(0.28 * il), 3)))
+        tiny = cv2.morphologyEx(self.u8, cv2.MORPH_OPEN, k)
+        tiny &= 1 - cv2.dilate(self.solid, np.ones((5, 5), np.uint8))
+        short = [s for s in self.stems if 1.2 * il <= s[2] - s[1] <= 2.6 * il]
+        for a in short:
+            for b in short:
+                if not 0.6 * il <= b[0] - a[0] <= 1.6 * il or abs(a[1] - b[1]) > 0.3 * il \
+                        or abs(a[2] - b[2]) > 0.3 * il:
+                    continue
+                top = int(min(a[1], b[1]))
+                beam = self.nolines[top:top + max(int(0.3 * il), 3), int(a[0]):int(b[0]) + 1]
+                if not beam.size or not (beam.mean(axis=1) > 0.85).any():
+                    continue
+                heads = []
+                for sx, _y0, y1 in (a, b):
+                    box = tiny[int(y1 - 0.6 * il):int(y1 + 0.4 * il),
+                               int(sx - 0.7 * il):int(sx + 0.1 * il)]
+                    ys, xs = np.nonzero(box)
+                    if len(ys) < 0.08 * il * il:
+                        break
+                    heads.append((int(sx - 0.7 * il) + xs.mean(), int(y1 - 0.6 * il) + ys.mean(), sx))
+                if len(heads) != 2:
+                    continue
+                # on the staff, not in its words ("In", "Ro" have the shape)
+                home = self.home_bar(*heads[0][:2])
+                if home is None or not (self.bars[home]["top"] - 1.6 * il <= heads[0][1]
+                                        <= self.bars[home]["top"] + 5.6 * il):
+                    continue
+                if any(bx - 0.3 * il <= hx <= bx + bw + 0.3 * il
+                       and by - 0.3 * il <= hy <= by + bh + 0.3 * il
+                       for hx, hy, _s in heads for bx, by, bw, bh in self.words):
+                    continue
+                self.graces += heads
+                self.crosses = [(x, y) for x, y in self.crosses
+                                if not (a[0] - 0.5 * il <= x <= b[0] + 0.5 * il
+                                        and top - 0.6 * il <= y <= top + 0.8 * il)]
+
+    def whole_tremolo(self, x: float, y: float) -> int:
+        """Roll marks on a stem-less note: slashes printed over the head
+        (a buzz roll's "Z" counts as three)."""
+        il = self.il
+        for wx, wy, value in getattr(self, "word_values", []):
+            # (Audiveris' OCR reads the italic Z as "2" as often as not)
+            if value.strip(".").lower() in ("z", "2") and abs(wx - x) < 1.6 * il \
+                    and 0.8 * il < y - wy < 6 * il:
+                return 3
+        # Audiveris may not have read the letter at all: one glyph about an
+        # interline tall standing alone over the head, read as a letter
+        box = self.marksink[max(int(y - 6 * il), 0):int(y - 1.2 * il),
+                            max(int(x - 1.6 * il), 0):int(x + 1.6 * il)].astype(np.uint8)
+        if not box.size:
+            return 0
+        n, lab, st, _c = cv2.connectedComponentsWithStats(box)
+        glyphs = [i for i in range(1, n) if 0.6 * il <= st[i][3] <= 1.6 * il
+                  and 0.4 * il <= st[i][2] <= 1.4 * il]
+        if len(glyphs) != 1:
+            return 0
+        from chord_chart import ocr
+        from PIL import Image
+        bx, by, bw, bh, _a = st[glyphs[0]]
+        g = (lab[by:by + bh, bx:bx + bw] == glyphs[0]).astype(np.uint8)
+        g = np.pad(g, max(int(0.5 * il), 4))
+        img = Image.fromarray(((1 - g) * 255).astype(np.uint8))
+        img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
+        return 3 if ocr(img, True, "Zz").strip().lower() == "z" else 0
 
     def home_bar(self, x: float, y: float) -> int | None:
         """Index of the printed bar a mark at (x, y) belongs to: the one it
@@ -666,6 +887,55 @@ class Sheet:
                 best = (beams, slashes)
         return best
 
+    def stem_slashes(self, x: float, tip: float, toward: int, inside: float = 0.6,
+                     outside: float = 2.6) -> int:
+        """Roll slashes at the tip end of a stem: short strokes rising to
+        the right that cross the stem, each about an interline wide and
+        under one tall, standing apart from each other, in the band from
+        two and a half interlines past the tip to half an interline inside
+        it. A beam or a flag runs on past the band's sides or hangs on one
+        side; a slash does neither."""
+        il = self.il
+        ya, yb = sorted((tip - toward * outside * il, tip + toward * inside * il))
+        xa, xb = int(x - 1.2 * il), int(x + 1.2 * il)
+        ya, yb = max(int(ya), 0), int(yb)
+        box = self.marksink[ya:yb, max(xa, 0):xb].astype(np.uint8).copy()
+        if not box.size:
+            return 0
+        c = int(round(x)) - max(xa, 0)
+        box[:, max(c - 2, 0):c + 3] = 0       # the stem itself
+        n, lab, st, _cc = cv2.connectedComponentsWithStats(box)
+        pieces = []
+        for i in range(1, n):
+            px, py, pw, ph, pa = st[i]
+            if pa < 0.08 * il * il:
+                continue
+            pieces.append((px, py, pw, ph, i))
+        # each slash shows as two halves, one either side of the stem (the
+        # stem column was taken out), the right half higher as it rises
+        left = [p for p in pieces if p[0] + p[2] >= c - 4 and p[0] + p[2] <= c - 1]
+        right = [p for p in pieces if c + 1 <= p[0] <= c + 4]
+        if any(p[0] == 0 for p in left) or any(p[0] + p[2] >= box.shape[1] for p in right):
+            return 0                           # runs on sideways: a beam
+        count = 0
+        for px, py, pw, ph, i in left:
+            if ph > 1.3 * il or pw < 0.3 * il:
+                continue
+            partner = [q for q in right if 0 <= (py + ph / 2) - (q[1] + q[3] / 2) <= 1.0 * il]
+            g = lab[py:py + ph, px:px + pw] == i
+            cols = np.nonzero(g.any(axis=0))[0]
+            if not partner or len(cols) < 2:
+                continue
+            lft = np.nonzero(g[:, cols[0]])[0].mean()
+            rgt = np.nonzero(g[:, cols[-1]])[0].mean()
+            if lft > rgt:
+                count += 1
+        return count if count <= 4 else 0
+
+    def in_dynamic(self, x: float, y: float) -> bool:
+        return any(bx <= x <= bx + bw and by <= y <= by + bh
+                   for bx, by, bw, bh in getattr(self, "dynamics", []))
+
     def stem_blobs(self, sx: float, y0: float, y1: float, side: int,
                    narrow: bool = False) -> list[tuple[float, float, str]]:
         """Heads the shape detectors missed, found the way a reader finds
@@ -701,6 +971,25 @@ class Sheet:
                 continue
             fill = float(blob[:, cols[0]:cols[-1] + 1].mean())
             kind = "normal" if fill >= 0.62 else ("circled_x" if h >= 1.25 * il else "x")
+            if kind == "normal":
+                # a heavy cross filling a space is as dark as a head, but
+                # has notches: paper at the middle of its top and bottom
+                # edges and of its sides, ink at all four corners
+                g = blob[:, cols[0]:cols[-1] + 1]
+                gh, gw = g.shape
+                e = max(int(0.15 * min(gh, gw)), 1)
+                mid_r, mid_c = slice(gh // 2 - e, gh // 2 + e + 1), slice(gw // 2 - e, gw // 2 + e + 1)
+                notches = [g[:2 * e, mid_c].mean(), g[-2 * e:, mid_c].mean(),
+                           g[mid_r, :2 * e].mean(), g[mid_r, -2 * e:].mean()]
+                corners = [g[:2 * e, :2 * e].mean(), g[:2 * e, -2 * e:].mean(),
+                           g[-2 * e:, :2 * e].mean(), g[-2 * e:, -2 * e:].mean()]
+                if sum(n < 0.25 for n in notches) >= 3 and min(corners) > 0.5:
+                    kind = "x"
+            # a beam runs on past the window's outer edge; a head ends
+            # inside it
+            outer = blob[:, -1] if side > 0 else blob[:, 0]
+            if outer.mean() > 0.3:
+                continue
             if narrow and kind != "x":
                 continue
             if kind == "x":
@@ -714,8 +1003,10 @@ class Sheet:
                     kind = "void"
                 elif narrow:
                     continue
-            found.append((max(int(xa), 0) + (cols[0] + cols[-1]) / 2,
-                          max(int(y0), 0) + (a + b) / 2, kind))
+            fx, fy = max(int(xa), 0) + (cols[0] + cols[-1]) / 2, max(int(y0), 0) + (a + b) / 2
+            if self.in_dynamic(fx, fy):
+                continue            # "ff" printed against the stem
+            found.append((fx, fy, kind))
         return found
 
     def frame_sides(self) -> set[int]:
@@ -971,6 +1262,40 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
             for bx, by, kind in sheet.stem_blobs(sx, sy0 + 1.3 * il, sy1 + 0.7 * il, -1,
                                                  narrow=True):
                 chords.setdefault(k, []).append((bx, by, kind))
+    # A cymbal x whose arm runs into its stem on a worn scan is neither a
+    # cross nor a blob beside the stem. A stem that ends level with its
+    # neighbours' cymbal heads (same direction, same end, an interline or
+    # three away) and has head-sized ink against that end carries the same
+    # head: beamed hi-hat or ride eighths all look alike.
+    for k, (sx, sy0, sy1) in enumerate(stems):
+        if chords.get(k) or sheet.hangs_from_line(sx, sy0):
+            continue
+        # the second half of a stem already carrying heads (the stroke
+        # split where a head joins it) is that stem
+        if any(chords.get(j) and abs(ox - sx) < 0.5 * il and oy0 < sy1 and sy0 < oy1
+               for j, (ox, oy0, oy1) in enumerate(stems) if j != k):
+            continue
+        like = []
+        for j, (ox, oy0, oy1) in enumerate(stems):
+            heads = chords.get(j, [])
+            if j == k or not heads or not 0.8 * il <= abs(ox - sx) <= 3.5 * il:
+                continue
+            if not all(h[2] in ("x", "circled_x") for h in heads) or len(heads) != 1:
+                continue
+            hx, hy, kind = heads[0]
+            up = hx < ox
+            if up and abs(oy1 - sy1) < 0.35 * il and abs(hy - oy1) < 0.8 * il:
+                like.append((sx - (ox - hx), hy, "x"))
+            elif not up and abs(oy0 - sy0) < 0.35 * il and abs(hy - oy0) < 0.8 * il:
+                like.append((sx + (hx - ox), hy, "x"))
+        if not like:
+            continue
+        hx, hy, kind = like[0]
+        box = sheet.nolines[int(hy - 0.4 * il):int(hy + 0.4 * il) + 1,
+                            int(min(hx, sx) - 0.3 * il):int(max(hx, sx) + 0.3 * il) + 1]
+        if box.size and 0.15 <= box.mean() <= 0.6 and not sheet.in_dynamic(hx, hy) \
+                and sy0 - 0.5 * il <= hy <= sy1 + 0.5 * il:
+            chords[k] = [(hx, hy, kind)]
     events = []
     for k, members in chords.items():
         sx, sy0, sy1 = stems[k]
@@ -991,6 +1316,21 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
             ys = [hy for _, hy, _ in members]
         reach = max(min(abs(tip - (min(ys) if up else max(ys))) - 0.9 * il, 2.6 * il), 0.5 * il)
         marks, tremolo = sheet.tip_marks(sx, tip, 1 if up else -1, reach)
+        # (a beamed stem is no roll's: a beam runs on sideways from the tip)
+        rows = slice(max(int(tip - 0.6 * il), 0), int(tip + 0.6 * il) + 1)
+        beamed = any(sheet.marksink[rows, int(sx + sg * f * il)].any()
+                     for sg in (-1, 1) for f in (1.25, 1.65)
+                     if 0 <= int(sx + sg * f * il) < sheet.marksink.shape[1])
+        if marks <= 1 and not beamed:
+            # a roll's slashes may stand at and past the end of its stem
+            # (the stem stops inside them, and the lowest reads as a flag
+            # stub): count the slashes there. Two or more and no beam is a
+            # roll on an unbeamed note, not a flag.
+            # (inside the stem down to an interline short of its head)
+            span = abs((sy1 - sy0)) / il
+            t2 = sheet.stem_slashes(sx, tip, 1 if up else -1, max(0.6, min(2.4, span - 1.2)))
+            if t2 >= 2 and t2 > tremolo:
+                tremolo, marks = t2, 0
         # a "head" centred on the stem itself is a roll slash through it
         through = [m for m in members if abs(m[0] - sx) < 0.3 * il and m[2] == "normal"]
         if through and len(through) < len(members):
@@ -999,6 +1339,11 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
         tremolo += sum(1 for bx, by in sheet.small
                        if abs(bx - sx) < 0.3 * il and sy0 + 0.3 * il < by < sy1 - 0.3 * il
                        and all(abs(by - hy) > 0.8 * il for _, hy, _ in members))
+        # roll slashes stand between the tip and the heads: a stem whose
+        # tip is at a head (the piece of stem between the two heads of a
+        # second, read as its own stem) has room for none
+        if tremolo and min(abs(tip - hy) for _, hy, _ in members) < 1.0 * il:
+            tremolo = 0
         value = {0: Fraction(4), 1: Fraction(2), 2: Fraction(1)}.get(marks, Fraction(1, 2))
         if any(k == "void" for _, _, k in members):
             value, tremolo, marks = Fraction(8), tremolo + marks, 0
@@ -1007,8 +1352,13 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
         events.append({"x": sx - (0.55 * il if up else -0.55 * il), "voice": 1 if up else 2,
                        "value": value, "heads": members, "marks": marks,
                        "tremolo": tremolo, "tip": tip, "sx": sx})
+    # a faint head is a small blob too; once a stem carries it, it is not
+    # a rest block, however a slanting staff line runs through it
+    hung = [(hx, hy) for e in events for hx, hy, _k in e["heads"]]
     loose += [(bx, by, "block") for bx, by in sheet.small
-              if inside(bx, by) and not on_rest(bx, by) and sheet.block(bx, by)]
+              if inside(bx, by) and not on_rest(bx, by) and sheet.block(bx, by)
+              and not any(abs(bx - hx) < 0.6 * il and abs(by - hy) < 0.5 * il
+                          for hx, hy in hung)]
     for hx, hy, kind in loose:
         if kind == "block" or kind == "normal" and sheet.block(hx, hy):
             # a half or whole rest printed off the staff for one voice
@@ -1017,6 +1367,13 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
             continue
         events.append({"x": hx, "voice": 0, "value": None,
                        "heads": [(hx, hy, kind)], "marks": None})
+    for wx, wy in sheet.wholes:
+        if inside(wx, wy) and not any(abs(wx - hx) < 0.8 * il and abs(wy - hy) < 0.6 * il
+                                      for hx, hy in hung):
+            events.append({"x": wx, "voice": 1 if wy < top + 2.5 * il else 2,
+                           "value": Fraction(16), "heads": [(wx, wy, "normal")],
+                           "marks": 0, "tremolo": sheet.whole_tremolo(wx, wy), "tip": None,
+                           "sx": wx})
     for rx, ry, n, edge, *_box in sheet.rests:
         if x0 <= rx <= x1 and top - 3 * il <= ry <= top + 7 * il:
             value = Fraction(n).limit_denominator(4)
@@ -1041,7 +1398,11 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
         after = [e for e in events if not e.get("rest") and e["voice"]
                  and 0 < min(h[0] for h in e["heads"]) - gx < 3.2 * il]
         if after:
-            target = min(after, key=lambda e: (e["x"], abs(e["heads"][0][1] - gy)))
+            # the grace's note is the next one at its own height; a note of
+            # the other voice printed under the grace is not it
+            def dy(e):
+                return min(abs(h[1] - gy) for h in e["heads"])
+            target = min(after, key=lambda e: (dy(e) > 1.2 * il, e["x"], dy(e)))
             target.setdefault("graces", []).append((gx, gy))
     return {"events": events, "slots": slots, "x1": x1}
 
@@ -1160,6 +1521,185 @@ def bar_tuplets(events: list[dict], brackets: dict | None = None) -> list[dict]:
                     "end": str(last["slot"] + last["value"]), "actual": 3, "normal": 2,
                     "bracket": bool((brackets or {}).get(tid))})
     return out
+
+
+def staff_text_runs(sheet: "Sheet") -> list[tuple[int, int, int, int]]:
+    """(x, y, w, h) of every run of small letters printed INSIDE a staff
+    ("rim." beside the first note, "snare" under the cymbal line), which
+    Audiveris does not read as words. Letters are what is left of the ink
+    once lines, stems, heads and beams are gone: three or more pieces
+    about half an interline tall standing on one baseline, close together."""
+    il = sheet.il
+    ink = sheet.nolines.astype(np.uint8).copy()
+    stems = np.zeros_like(ink)
+    for sx, y0, y1 in sheet.stems:
+        stems[int(y0):int(y1) + 1, max(int(sx) - 2, 0):int(sx) + 3] = 1
+    ink &= 1 - stems
+    ink &= 1 - cv2.dilate(sheet.solid, np.ones((5, 5), np.uint8))
+    # a cross head hangs on a stem; letters can pass for crosses, but
+    # stand free of stems
+    for x, y in sheet.crosses:
+        if any(abs(sx - x) < 0.85 * il and y0 - 0.6 * il <= y <= y1 + 0.6 * il
+               for sx, y0, y1 in sheet.stems):
+            ink[max(int(y - 0.6 * il), 0):int(y + 0.6 * il),
+                max(int(x - 0.7 * il), 0):int(x + 0.7 * il)] = 0
+    n, _lab, stats, cents = cv2.connectedComponentsWithStats(ink)
+    out = []
+    for b in sheet.bars:
+        top, x0, x1 = b["top"], b["x0"], b["x1"]
+        pieces = sorted(
+            (int(stats[i][0]), int(stats[i][1]), int(stats[i][2]), int(stats[i][3]))
+            for i in range(1, n)
+            if x0 <= cents[i][0] < x1 and top - 0.3 * il <= cents[i][1] <= top + 4.3 * il
+            and 0.12 * il <= stats[i][3] <= 1.3 * il and stats[i][2] <= 1.6 * il)
+        runs: list[list] = []
+        for p in pieces:
+            if runs and p[0] - max(q[0] + q[2] for q in runs[-1]) <= 0.45 * il:
+                runs[-1].append(p)
+            else:
+                runs.append([p])
+        for r in runs:
+            # letters stand on one baseline (an i's dot does not count)
+            feet = sorted(p[1] + p[3] for p in r)
+            base = feet[len(feet) // 2]
+            if sum(abs(f - base) <= 0.3 * il for f in feet) < 3:
+                continue
+            # the letters and what sits over them (dots); a note's remains
+            # hanging below the baseline are not part of the word
+            r = [p for p in r if p[1] + p[3] <= base + 0.3 * il and p[1] >= base - 1.6 * il]
+            xa, ya = min(p[0] for p in r), min(p[1] for p in r)
+            xb, yb = max(p[0] + p[2] for p in r), max(p[1] + p[3] for p in r)
+            if xb - xa >= 1.2 * il:
+                out.append((xa, ya, xb - xa, yb - ya))
+    return out
+
+
+def staff_words(sheet: "Sheet") -> list[tuple[float, float, float, str]]:
+    """[(x, y, width, kind)] of the kit words printed inside the staff
+    (`staff_text_runs`), read by Tesseract; kind as `_kit_word` gives it.
+    A run cut short by a note (the e of "snare" under a cross) still names
+    the snare from its first four letters."""
+    from chord_chart import ocr
+    from PIL import Image
+    il = sheet.il
+    out = []
+    for x, y, w, h in staff_text_runs(sheet):
+        pad = int(0.5 * il)
+        crop = sheet.nolines[max(y - pad, 0):y + h + pad, max(x - pad, 0):x + w + pad]
+        img = Image.fromarray(((1 - crop.astype(np.uint8)) * 255).astype(np.uint8))
+        scale = 48 / max(h, 1)
+        img = img.resize((max(int(img.width * scale), 1), max(int(img.height * scale), 1)),
+                         Image.LANCZOS)
+        text = ocr(img, False, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.")
+        letters = "".join(c for c in text.lower() if c.isalpha())
+        from difflib import SequenceMatcher
+        kind = _kit_word(text) or (
+            "snare" if len(letters) >= 4 and SequenceMatcher(None, letters, "snare").ratio() >= 0.75
+            else None)
+        if kind:
+            out.append((float(x), float(y + h / 2), float(w), kind))
+    return out
+
+
+def _read_digit(mask: np.ndarray) -> list[str]:
+    """Tesseract's readings of one printed digit (a binary mask), as one
+    character and as a word, the glyph scaled to 60 pixels tall."""
+    import os
+    import subprocess
+    import tempfile
+    ys, xs = np.nonzero(mask)
+    if not len(ys):
+        return []
+    m = mask[ys.min():ys.max() + 1, xs.min():xs.max() + 1].astype(np.uint8) * 255
+    f = 60 / m.shape[0]
+    m = cv2.resize(m, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+    img = 255 - np.pad(m, 30, constant_values=0)
+    env = {"TESSDATA_PREFIX": str(BENCH_DIR / "tools" / "tessdata"),
+           "PATH": "/opt/homebrew/bin:/usr/bin:/bin" + os.pathsep + os.environ.get("PATH", "")}
+    reads = []
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/t.png"
+        cv2.imwrite(path, img)
+        for psm in ("10", "8"):
+            r = subprocess.run(["tesseract", path, "-", "--psm", psm, "-c",
+                                "tessedit_char_whitelist=0123456789"],
+                               capture_output=True, text=True, env=env)
+            reads.append(r.stdout.strip())
+    return reads
+
+
+def ink_time_signature(ink: np.ndarray, top: float, il: float, x0: float,
+                       where: list | None = None) -> tuple[int, int] | None:
+    """A time signature printed right after the barline at x0 that
+    Audiveris did not report (a meter change in mid line): two digits
+    stacked into one column that spans the staff from top line to bottom
+    line, the upper one on the top half, the lower one on the bottom half.
+    Nothing else in a bar is that shape: a stem runs past the staff, a
+    note column has its head on one side, a repeat sign sits in the middle
+    spaces only. Read only when the shape is there, so the cost is nil on
+    a bar without one. Upper digit 1-16, lower one 2/4/8/16; Tesseract
+    may misread one of its two passes, so any reading that names a
+    possible value is taken, the first pass first."""
+    xa, xb = int(x0 + 0.3 * il), int(x0 + 4 * il)
+    ya, yb = int(top - 0.5 * il), int(top + 4.5 * il)
+    if ya < 0 or xa < 0 or yb > ink.shape[0] or xb > ink.shape[1]:
+        return None
+    # the staff's own lines here (a skewed scan moves them a few pixels
+    # from the system's left end)
+    rows = ink[max(ya - int(il), 0):yb + int(il), xa:xb].sum(axis=1)
+    base = max(ya - int(il), 0)
+    best = max(range(-int(0.6 * il), int(0.6 * il) + 1),
+               key=lambda dy: sum(rows[int(round(top + dy + k * il)) - base]
+                                  for k in range(5)
+                                  if 0 <= int(round(top + dy + k * il)) - base < len(rows)))
+    top += best
+    ya, yb = int(top - 0.5 * il), int(top + 4.5 * il)
+    if ya < 0 or yb > ink.shape[0]:
+        return None
+    box = ink[ya:yb, xa:xb].astype(np.uint8)
+    thick = max(int(round(0.14 * il)), 2)
+    tall = cv2.morphologyEx(box, cv2.MORPH_OPEN, np.ones((2 * thick + 3, 1), np.uint8))
+    lines = np.zeros_like(box)
+    for k in range(5):
+        y = int(round(top + k * il)) - ya
+        lines[max(y - thick, 0):y + thick + 1] = 1
+    clean = (box.astype(bool) & ~(lines.astype(bool) & ~tall.astype(bool))).astype(np.uint8)
+    blob = cv2.dilate(clean, np.ones((5, 5), np.uint8))
+    n, lab, stats, _c = cv2.connectedComponentsWithStats(blob)
+    for i in range(1, n):
+        x, y, w, h, _a = stats[i]
+        if not (3.5 * il <= h and 1.0 * il <= w <= 2.4 * il and x <= 2 * il):
+            continue
+        # wholly inside the staff: from about the top line to the bottom one
+        if y < 0.1 * il or y + h > box.shape[0] - 0.1 * il:
+            continue
+        # digits have small counters at most; a drawn box (the percussion
+        # clef) encloses a hole the height of the staff
+        comp = (lab[y:y + h, x:x + w] == i).astype(np.uint8)
+        holes = cv2.connectedComponentsWithStats(1 - np.pad(comp, 1))[2][2:]
+        if any(hs[3] > 1.5 * il for hs in holes):
+            continue
+        keep = cv2.dilate((lab == i).astype(np.uint8), np.ones((7, 7), np.uint8))
+        # the two digits meet on the middle line (the base of a 2, the top
+        # of a 4): each half is read without the other's edge
+        mid = int(round(2.5 * il))
+        edge = thick + 1
+        parts = [[], []]
+        # with the staff lines taken out, then left in: a digit stroke that
+        # runs along a line (the bar of a 4) only survives the second way
+        for src in (clean, box):
+            for j, (r0, r1) in enumerate(((0, mid + edge), (mid + edge, box.shape[0]))):
+                mask = (src[r0:r1] & keep[r0:r1]).astype(bool)
+                mask[:, :max(x - 3, 0)] = False
+                mask[:, x + w + 3:] = False
+                parts[j] += _read_digit(mask)
+        upper = next((int(t) for t in parts[0] if t.isdigit() and 1 <= int(t) <= 16), None)
+        lower = next((int(t) for t in parts[1] if t in ("2", "4", "8", "16")), None)
+        if upper and lower:
+            if where is not None:
+                where.append((float(xa + x), float(ya + y), float(w), float(h)))
+            return upper, lower
+    return None
 
 
 def repeat_signs(ink: np.ndarray, top: float, il: float, x0: float, x1: float
@@ -1376,6 +1916,10 @@ def _time_ruler(read: dict, il: float, x1: float | None) -> tuple[list[dict], st
             if e["voice"] != ruler:
                 continue
             marks.append((e["x"], t))
+            # a grace note takes room in front of its note; what the other
+            # voice prints under the grace sounds with the note
+            for gx, _gy in e.get("graces", []):
+                marks.append((gx, t))
             e["slot"] = t
             t += e["value"] or 0
         notes = [e for e in events if e["voice"] == ruler and not e.get("rest")]
@@ -1383,6 +1927,7 @@ def _time_ruler(read: dict, il: float, x1: float | None) -> tuple[list[dict], st
             continue
         if x1 is not None:
             marks.append((x1, Fraction(slots)))
+        marks.sort(key=lambda m: m[0])
         ok = True
         for e in events:
             if e["voice"] == ruler:
@@ -1480,6 +2025,106 @@ def _time_once(read: dict, il: float, mode: str) -> tuple[list[dict], str | None
     return events, problem
 
 
+def _frames(band: np.ndarray, il: float) -> list[tuple[int, int, int, int]]:
+    """(x, y, w, h) of every closed rectangular frame in a binary band
+    (a boxed bar number or letter), found by its four straight sides
+    (long flat and upright runs), not by connectivity, so print touching
+    the frame or a sign touching it from outside does not hide it. A
+    volta hook has no bottom and is not one. Uprights are looked for at
+    two lengths: long ones first, then short ones for a frame as short as
+    one interline (Abba's "100"), which would otherwise lose its sides."""
+    if band.size == 0:
+        return []
+    band = band.astype(np.uint8)
+    flat = cv2.morphologyEx(band, cv2.MORPH_OPEN, np.ones((1, max(int(1.2 * il), 4)), np.uint8))
+    out: list[tuple[int, int, int, int]] = []
+    edge = max(int(0.2 * il), 2)
+    for upright_len, min_h in ((1.2, 1.4), (0.75, 0.9)):
+        upright = cv2.morphologyEx(band, cv2.MORPH_OPEN,
+                                   np.ones((max(int(upright_len * il), 4), 1), np.uint8))
+        sides = flat | upright
+        n, _lab, stats, _c = cv2.connectedComponentsWithStats(
+            cv2.dilate(sides, np.ones((3, 3), np.uint8)))
+        for i in range(1, n):
+            x, y, w, h, _a = stats[i]
+            # a stem or a sign joined to the frame stretches the component:
+            # the frame is where its flat sides are
+            fl = flat[y:y + h, x:x + w] & (_lab[y:y + h, x:x + w] == i)
+            rows = np.nonzero(fl.sum(axis=1) >= 1.4 * il)[0]
+            if len(rows) >= 2 and rows[-1] - rows[0] >= min_h * il - 2 * edge:
+                cols = np.nonzero(fl[rows].any(axis=0))[0]
+                x, y = x + int(cols[0]), y + max(int(rows[0]) - 1, 0)
+                w, h = int(cols[-1] - cols[0] + 1), int(rows[-1] - rows[0] + 3)
+            if not (1.4 * il <= w <= 6 * il and min_h * il <= h <= 4 * il):
+                continue
+            if any(x < ox + ow and ox < x + w and y < oy + oh and oy < y + h
+                   for ox, oy, ow, oh in out):
+                continue
+            g = sides[y:y + h, x:x + w]
+            cover = sorted((g[:edge].any(axis=0).mean(), g[-edge:].any(axis=0).mean(),
+                            g[:, :edge].any(axis=1).mean(), g[:, -edge:].any(axis=1).mean()))
+            # one side may be broken by a faint scan, never missing
+            if cover[0] < 0.6 or cover[1] < 0.85:
+                continue
+            # a frame's uprights end at its corners; stems run on through
+            # a beam (two beams and their stems close a rectangle too)
+            run_on = 0
+            for cx in (x + edge // 2, x + w - 1 - edge // 2):
+                for ys in ((y + h, y + h + int(0.6 * il)), (max(y - int(0.6 * il), 0), y)):
+                    col = band[ys[0]:ys[1], max(cx - edge, 0):cx + edge + 1]
+                    if col.size and col.any(axis=1).mean() > 0.9:
+                        run_on += 1
+            if run_on >= 2:
+                continue
+            # and it holds print, most of its height (two beams joined by
+            # stems close a rectangle too, an empty one)
+            t = edge + 1
+            inner = band[y + t:y + h - t, x + t:x + w - t]
+            if inner.size == 0:
+                continue
+            m, _l2, st2, _c2 = cv2.connectedComponentsWithStats(inner)
+            # (a stem between two beams runs from one to the other; a
+            # letter does not touch both)
+            if not any(st2[j][3] > 0.5 * inner.shape[0]
+                       and not (st2[j][1] == 0 and st2[j][1] + st2[j][3] == inner.shape[0]
+                                and st2[j][2] <= 0.3 * il)
+                       for j in range(1, m)):
+                continue
+            out.append((int(x), int(y), int(w), int(h)))
+    return out
+
+
+def _framed_text(ink: np.ndarray, xa: int, xb: int, ya: int, yb: int, il: float,
+                 ocr) -> list[tuple[int, int, str]]:
+    """[(centre x, centre y, text)] of every frame (`_frames`) in the
+    band, with the print inside read after the sides are rubbed out."""
+    from PIL import Image
+    band = ink[ya:yb, xa:xb].astype(np.uint8)
+    out = []
+    for x, y, w, h in _frames(band, il):
+        edge = max(int(0.2 * il), 2)
+        # the sides' own thickness, then everything strictly inside
+        t = edge + 1
+        inner = band[y + t:y + h - t, x + t:x + w - t].copy()
+        if inner.sum() < 0.05 * inner.size:
+            continue
+        m, lab2, st2, _c2 = cv2.connectedComponentsWithStats(inner)
+        keep = np.zeros_like(inner)
+        for j in range(1, m):
+            if st2[j][3] > 0.5 * inner.shape[0]:
+                keep[lab2 == j] = 1
+        if not keep.any():
+            continue
+        pad = int(il)
+        img = Image.fromarray(((1 - np.pad(keep, pad)) * 255).astype(np.uint8))
+        scale = max(1.0, 64 / max(inner.shape[0], 1))
+        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+        text = ocr(img, False, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        if text:
+            out.append((xa + x + w // 2, ya + y + h // 2, text))
+    return out
+
+
 def boxed_marks(omr: Path) -> list[tuple[int, int, int, str]]:
     """(sheet ordinal, x, y, text) of every boxed letter or number above a
     staff, read from the ink. Audiveris finds the boxes but reads the
@@ -1507,6 +2152,7 @@ def boxed_marks(omr: Path) -> list[tuple[int, int, int, str]]:
                 il = (_line_y(lines[-1], left) - _line_y(lines[0], left)) / 4
                 x0, y0 = max(int(left - 2 * il), 0), max(int(top - 7 * il), 0)
                 names = Names(ink, x0, int(right), y0, int(top - 0.2 * il), il)
+                here = []
                 for box in names.boxes():
                     f = box["frame"]
                     if not box["inside"] or f["w"] > 6 * il or f["h"] > 4 * il:
@@ -1514,8 +2160,21 @@ def boxed_marks(omr: Path) -> list[tuple[int, int, int, str]]:
                     text = ocr(names.image(box["inside"]), len(box["inside"]) == 1,
                                "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
                     if text:
-                        found.append((index, x0 + f["x"] + f["w"] // 2,
-                                      y0 + f["y"] + f["h"] // 2, text))
+                        here.append((index, x0 + f["x"] + f["w"] // 2,
+                                     y0 + f["y"] + f["h"] // 2, text))
+                # a frame whose print touches it (the 2 of a boxed 20) or that
+                # touches a sign beside it (a segno): the frame is not a
+                # component of its own, so read it again from its straight sides
+                for cx, cy, text in _framed_text(ink, x0, int(right), y0,
+                                                 int(top - 0.2 * il), il, ocr):
+                    near = [k for k, m in enumerate(here)
+                            if abs(m[1] - cx) < il and abs(m[2] - cy) < il]
+                    if not near:
+                        here.append((index, cx, cy, text))
+                    elif len(text) > len(here[near[0]][3]) and \
+                            text.endswith(here[near[0]][3]):
+                        here[near[0]] = (*here[near[0]][:3], text)
+                found += here
             out.extend(found)
             il = Sheet(ink, root).il
             for m in theirs:
@@ -1635,6 +2294,76 @@ def _strikes_of(e: dict, bar: dict) -> list[dict]:
     return out
 
 
+def _touched_barlines(ink: np.ndarray, top: float, il: float, x0: int, x1: int,
+                      head: bool = False) -> list[int]:
+    """Barlines inside a stack that a word or a mark touches (the e of
+    "snare" printed against it), which `fix_hbars` turns down because the
+    stroke widens there. A barline still runs from exactly the top line to
+    exactly the bottom one, blank beyond both, a few pixels thick; it may
+    widen only for a sliver of rows (a letter's stroke), where a head
+    joined to a stem widens it for half an interline."""
+    t, b = int(round(top)), int(round(top + 4 * il))
+    if t < 6 or b + 6 >= ink.shape[0]:
+        return []
+    left = x0 + (6 if head else 1.5) * il
+    out, last = [], None
+    band = max(int(0.25 * il), 2)
+    for x in range(int(left), int(x1 - 1.5 * il)):
+        if not ink[t + 2:b - 1, x].mean() > 0.5:
+            continue
+        # follow the stroke down; a skewed scan steps it sideways a few
+        # pixels on the way, which a straight column would lose
+        at, wide, ok = x, [], True
+        for r in range(t + 2, b - 1):
+            row = ink[r]
+            lo = max(at - 4, 0)
+            near = np.flatnonzero(row[lo:at + 5])
+            if not near.size:
+                ok = False
+                break
+            c = lo + int(near[np.argmin(np.abs(near - (at - lo)))])
+            a = c
+            while a > 0 and row[a - 1]:
+                a -= 1
+            z = c
+            while z < len(row) - 1 and row[z + 1]:
+                z += 1
+            w = z - a + 1
+            if w > 3 * il:
+                wide.append(0)          # a staff line row
+                continue
+            if w <= 0.25 * il:      # where the stroke is alone, it sets the track
+                at = (a + z) // 2
+            wide.append(w)
+        if not ok:
+            continue
+        # blank just beyond both outer lines (their real edges here: a
+        # skewed scan moves them a few pixels), at the stroke's own ends
+        up = t + 2
+        while up > t - int(0.5 * il) and ink[up - 1, x]:
+            up -= 1
+        down = b - 2
+        while down < b + int(0.5 * il) and ink[down + 1, at]:
+            down += 1
+        if up <= t - int(0.5 * il) or down >= b + int(0.5 * il) or \
+                ink[up - 4:up - 1, max(x - 1, 0):x + 2].any() or \
+                ink[down + 2:down + 5, max(at - 1, 0):at + 2].any():
+            continue
+        thick = sorted(wide)[len(wide) // 2] if wide else 99
+        if thick > 0.3 * il:
+            continue
+        run = longest = 0
+        for w in wide:
+            run = run + 1 if w > 0.75 * il else 0
+            longest = max(longest, run)
+        if longest > band:
+            continue
+        if last is None or x - last > il:
+            out.append(x)
+        last = x
+    return out
+
+
 def merged_bars(omr: Path) -> dict[int, list[int]]:
     """{stack ordinal: x of every barline printed inside it}. Audiveris
     sometimes takes two printed bars for one (a barline under an ending
@@ -1648,6 +2377,16 @@ def merged_bars(omr: Path) -> dict[int, list[int]]:
     for (_img, pixels, top, bottom, il, x0, x1, ordinal, system_x0) in fix_hbars._iter_stacks(omr):
         xs = fix_hbars._merged_bar_xs(pixels, top, bottom, x0, x1, il,
                                       medians.get(ordinal, 0), head=x0 == system_x0)
+        for x in _touched_barlines(pixels, top, il, x0, x1, head=x0 == system_x0):
+            if not any(abs(x - q) < 2 * il for q in xs):
+                xs = sorted(xs + [x])
+        # a two-bar repeat sign stands on the barline between the two
+        # bars it fills; one in the middle of a stack marks a barline the
+        # engine merged over (the sign's slashes hide it)
+        for cx, n in repeat_signs(pixels, top, il, x0, x1):
+            if n == 2 and x0 + 2 * il < cx < x1 - 2 * il \
+                    and not any(abs(cx - x) < 2 * il for x in xs):
+                xs = sorted(xs + [int(round(cx))])
         if xs:
             out[ordinal] = xs
     return out
@@ -1662,6 +2401,7 @@ def read_chart(omr: Path) -> list[dict]:
     merged = merged_bars(omr)
     out = []
     ordinal = 0
+    inside = {}         # sheet name: kit words printed inside the staff
     with zipfile.ZipFile(omr) as z:
         from PIL import Image
         import io
@@ -1670,6 +2410,7 @@ def read_chart(omr: Path) -> list[dict]:
             ink = np.asarray(Image.open(io.BytesIO(
                 z.read(f"{name}/BINARY.png"))).convert("L")) < 128
             sheet = Sheet(ink, root)
+            inside[name] = staff_words(sheet)
             for whole in sheet.bars:
                 slots = bar_slots(meters.get(ordinal, (4, 4)))
                 edges = [whole["x0"], *merged.get(ordinal, []), whole["x1"]]
@@ -1695,7 +2436,10 @@ def read_chart(omr: Path) -> list[dict]:
         words = {name: kit_words(ET.fromstring(
             z.read(f"{name}/{name}.xml").decode("utf-8", "replace")))
             for name in _sheets(z)}
+    for name, found in inside.items():
+        words[name] = sorted(words.get(name, []) + found)
     apply_kit_words(out, words)
+    apply_rim_words(out, words)
     return out
 
 
@@ -1704,12 +2448,21 @@ def read_chart(omr: Path) -> list[dict]:
 _BELL_WORDS = ("bell", "cup", "dome", "cymdome", "ridebell")
 _CYMBAL_WORDS = ("ride", "ridecym", "suscym", "cym", "hh", "hihat", "hithat", "crash",
                  "choke")
+# Words that say how the snare is struck: "rim." (rim click) / cross stick
+# turn the snare notes after them into the rim sound until "snare" (or
+# "Sn.") says the head again. Exact only: "rim" is one letter from "rit".
+_RIM_WORDS = ("rim", "rimclick", "crossstick", "xstick", "sidestick", "cs")
+_SNARE_WORDS = ("snare", "sn", "sd")
 
 
 def _kit_word(text: str) -> str | None:
     """'bell', 'cymbal' (a word that ends a bell passage) or None. One
     wrong letter in a word of three or more is OCR ("Gym." for "Cym.")."""
     letters = "".join(c for c in text.lower() if c.isalpha())
+    if letters in _RIM_WORDS:
+        return "rim"
+    if letters in _SNARE_WORDS:
+        return "snare"
     for kind, terms in (("bell", _BELL_WORDS), ("cymbal", _CYMBAL_WORDS)):
         for t in terms:
             if letters == t or (len(t) >= 3 and len(letters) == len(t)
@@ -1791,6 +2544,43 @@ def apply_kit_words(chart: list[dict], words: dict[str, list]) -> None:
         while mi < len(marks) and marks[mi][0] == i:
             pending = marks[mi][2] == "bell"
             target = None if pending or marks[mi][2] == "cymbal" else target
+            mi += 1
+
+
+def apply_rim_words(chart: list[dict], words: dict[str, list]) -> None:
+    """A rim word ("rim.", "cross stick") makes every plain head on the
+    snare's place from that word on a rim click, until a snare word
+    ("snare", "Sn.") gives the head back. Printed in the staff or over it,
+    inside the bar it starts in. Other heads and places are untouched."""
+    from drum_grid import STEP_MAP
+    snare = {s for s, row in STEP_MAP.items() if row.get("normal") == "snare"}
+    marks = []          # (chart index, x, kind)
+    for i, b in enumerate(chart):
+        bar = b["bar"]
+        il, top = bar["il"], bar["top"]
+        for x, y, _w, kind in words.get(b["sheet"], []):
+            if kind not in ("rim", "snare"):
+                continue
+            if bar["x0"] - 0.5 * il <= x < bar["x1"] and top - 7 * il <= y <= top + 5 * il:
+                others = [c for c in chart if c["sheet"] == b["sheet"] and c is not b
+                          and c["bar"]["x0"] - 0.5 * il <= x < c["bar"]["x1"]
+                          and abs(c["bar"]["top"] + 2 * il - y) < abs(top + 2 * il - y)]
+                if not others:
+                    marks.append((i, x - 0.8 * il, kind))
+    if not any(k == "rim" for _i, _x, k in marks):
+        return
+    marks.sort(key=lambda m: (m[0], m[1]))
+    on, mi = False, 0
+    for i, b in enumerate(chart):
+        for st in sorted(b["strikes"], key=lambda s: s.get("x", 0)):
+            while mi < len(marks) and (marks[mi][0] < i or
+                                       marks[mi][0] == i and marks[mi][1] <= st.get("x", 0)):
+                on = marks[mi][2] == "rim"
+                mi += 1
+            if on and st["kind"] == "normal" and st["step"] in snare and not st.get("grace"):
+                st["inst"] = "rim"
+        while mi < len(marks) and marks[mi][0] == i:
+            on = marks[mi][2] == "rim"
             mi += 1
 
 
