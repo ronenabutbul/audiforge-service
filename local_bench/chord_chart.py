@@ -267,7 +267,7 @@ class System:
         self._top, self._bottom = pts
         mid = (self.x0 + self.x1) / 2
         self.il = float(self.bottom(mid) - self.top(mid)) / 4
-        self.thick = max(int(self.lines[0].get("thickness", "2")), 1)
+        self.thick = max(int(round(float(self.lines[0].get("thickness", "2")))), 1)
         il = self.il
         # room above: as far as the staff before, but never past nine spaces
         self.up = int(max(min(9.0 * il, self.top(mid) - ceiling), 2.5 * il))
@@ -542,23 +542,27 @@ def _dot_after(system: System, edge: float, repeat_dots: list[tuple[float, float
 
 
 def _tied(system: System, a: dict, b: dict) -> bool:
-    """A thin arc over the gap from one slash to the next. Where it runs
-    along a staff line it only makes the line thicker; anything as thick
-    as a beam or as tall as a stem is not an arc."""
+    """A tie from one slash to the next: one thin, low arc above the
+    staff that spans the gap between them. A chord name printed low over
+    the same gap is several pieces of ink, each narrow, with thick or tall
+    strokes, and it goes on upward out of the arc's room."""
     il = system.il
-    xa, xb = int(a["x1"] + 0.15 * il) - system.x0, int(b["cx"]) - system.x0
-    if xb - xa < 0.8 * il or xb - xa > 12 * il:
+    xa, xb = int(a["cx"]) - system.x0, int(b["x1"] + 0.3 * il) - system.x0
+    span = b["x1"] - a["x1"]
+    if span < 1.5 * il or span > 14 * il:
         return False
-    row0 = int(1.3 * il)
-    box = system.band(-row0, 0.85 * il)[:, xa:xb]
-    covered = 0
-    for col in box.T:
-        for r0, r1 in _runs(col):
-            on_line = abs((r0 + r1) / 2 - row0) <= 0.2 * il
-            if r1 - r0 <= 0.45 * il and (not on_line or r1 - r0 >= system.thick + 2):
-                covered += 1
-                break
-    return covered >= 0.8 * box.shape[1]
+    box = system.band(-2.4 * il, -(system.thick + 1))[:, max(xa, 0):xb].astype(np.uint8)
+    if not box.size:
+        return False
+    n, lab, stats, _c = cv2.connectedComponentsWithStats(box, connectivity=8)
+    for i in range(1, n):
+        x, y, w, h, _area = (int(v) for v in stats[i])
+        if w < 0.6 * span or h > 1.2 * il or y == 0:
+            continue
+        g = lab[y:y + h, x:x + w] == i
+        if g.sum(axis=0).max() <= 0.45 * il:
+            return True
+    return False
 
 
 def _stem_of(sheet: Sheet, system: System, s: dict) -> tuple[float, float, int] | None:
@@ -628,7 +632,11 @@ def read_items(sheet: Sheet, system: System, header: float, blocked: list[tuple[
             heads.append((b[0] + b[2] / 2, b[1] + b[3] / 2,
                           "void" if h.get("shape") == "NOTEHEAD_VOID" else "whole"))
     heads.sort()
+    counts = [b for b in (_bounds(e) for e in el.iter("measure-count")) if b]
     for hx, hy, kind in heads:
+        if any(x - 0.3 * il <= hx <= x + w + 0.3 * il and y - 0.3 * il <= hy <= y + h + 0.3 * il
+               for x, y, w, h in counts):
+            continue                                 # the number over a multirest
         step = int(round((hy - system.top(hx)) / (il / 2)))
         last = items[-1] if items else None
         if last and last["kind"] == "note" and abs(last["cx"] - hx) < 0.6 * il:
@@ -647,6 +655,8 @@ def read_items(sheet: Sheet, system: System, header: float, blocked: list[tuple[
                 break
         if it["q"] is not None and kind != "whole" and sheet.dotted(hx, hy):
             it["q"], it["dot"] = it["q"] * 3 / 2, True
+        if not it["stem"] and kind == "filled" and not -0.3 * il <= hy - system.top(hx) <= 4.3 * il:
+            continue          # a blob outside the staff with no stem: a digit, a bold letter
         items.append(it)
     for rx, ry, slots, edge in sheet.rests:
         rel = ry - system.top(rx)
@@ -1146,7 +1156,8 @@ def _multirests(omr: Path) -> dict[int, int]:
             sys.path.insert(0, str(APP_DIR))
         from fix_hbars import detect_hbars
         return {h["stack"]: int(h["count"]) for h in detect_hbars(omr) if h.get("count")}
-    except Exception:                                  # no reader, or a page it cannot take
+    except Exception as e:                             # no reader, or a page it cannot take
+        print(f"  multirests not read: {type(e).__name__}: {e}", file=sys.stderr)
         return {}
 
 
