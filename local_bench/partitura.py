@@ -1371,7 +1371,9 @@ def _simile(sheet, bar: dict) -> bool:
         _x, _y, w, h, area = stats[i]
         if 1.4 * il <= w <= 3.3 * il and 1.4 * il <= h <= 2.8 * il and area <= 0.5 * w * h:
             slash += 1
-        elif 0.15 * il <= w <= 0.6 * il and 0.15 * il <= h <= 0.6 * il and area >= 0.55 * w * h:
+        # the dots are up to most of a space across in older engraving,
+        # and taller where a staff line through them was taken out
+        elif 0.15 * il <= w <= 0.85 * il and 0.15 * il <= h <= 1.0 * il and area >= 0.5 * w * h:
             dots += 1
     return slash == 1 and dots >= 2
 
