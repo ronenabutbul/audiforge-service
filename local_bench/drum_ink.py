@@ -408,10 +408,20 @@ class Sheet:
             cx, cy = int(cents[i][0]), int(cents[i][1])
             if solid[max(cy - r, 0):cy + r, max(cx - r, 0):cx + r].any():
                 on_line[_lab == i] = 0
+        # a beam is a band of ink as thick as a third of an interline and
+        # longer than a head: a scan's pinholes in it, beside a stem, can
+        # pass for the paper round a cross's arms
+        closed = cv2.morphologyEx(self.nolines.astype(np.uint8), cv2.MORPH_CLOSE,
+                                  np.ones((3, 3), np.uint8))
+        beams = cv2.morphologyEx(closed, cv2.MORPH_OPEN, np.ones(
+            (max(int(0.35 * il), 3), max(int(1.6 * il), 5)), np.uint8))
         for mask, most in ((both, 0.42), (on_line, 0.28)):
             n, _lab, stats, cents = cv2.connectedComponentsWithStats(mask)
             for i in range(1, n):
                 cx, cy = float(cents[i][0]), float(cents[i][1])
+                if beams[max(int(cy - 0.2 * il), 0):int(cy + 0.2 * il) + 1,
+                         max(int(cx - 0.2 * il), 0):int(cx + 0.2 * il) + 1].any():
+                    continue
                 # a cross is as wide as it is tall and mostly paper
                 x0, x1 = int(cx - 0.75 * il), int(cx + 0.75 * il)
                 y0, y1 = int(cy - 0.6 * il), int(cy + 0.6 * il)
@@ -2143,6 +2153,16 @@ def _time_ruler(read: dict, il: float, x1: float | None) -> tuple[list[dict], st
             if abs(near[0] - e["x"]) < 0.75 * il:
                 e["slot"] = near[1]
                 continue
+            # a head set on the far side of its stem (the lower of a second
+            # with the other voice's head) stands half a head right of its
+            # column: its stem is still in the column
+            sx = e.get("sx", e["x"])
+            near = min(marks, key=lambda m: abs(m[0] - sx))
+            if abs(near[0] - sx) < 0.4 * il and any(
+                    abs(h[0] - sx) < 0.9 * il and (h[0] > sx) == (e["voice"] == 2)
+                    for h in e.get("heads", [])):
+                e["slot"] = near[1]
+                continue
             left = [m for m in marks if m[0] <= e["x"]]
             right = [m for m in marks if m[0] > e["x"]]
             if not left or not right:
@@ -2408,7 +2428,15 @@ def boxed_marks(omr: Path) -> list[tuple[int, int, int, str]]:
                 if keep.any():
                     img = Image.fromarray(((1 - np.pad(keep, int(il))) * 255).astype(np.uint8))
                     img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
-                    text = ocr(img, True, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+                    # a boxed bar number is read as a number: with letters
+                    # only, Tesseract turns 6 into U and 22 into Q
+                    digits = m[3].isdigit()
+                    text = ocr(img, not digits,
+                               "0123456789" if digits else "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+                    # (the crop is one letter wide: a number of more digits
+                    # than it shows is Audiveris' to keep)
+                    if digits and (not text.isdigit() or len(text) != len(m[3])):
+                        text = ""
                 out.append((m[0], m[1], m[2], text or m[3]))
                 doubtful.add((m[0], m[1], m[2]))
     # letters run in order down the chart: doubtful ones between two sure
@@ -2419,7 +2447,7 @@ def boxed_marks(omr: Path) -> list[tuple[int, int, int, str]]:
     for a, b in zip([None] + sure, sure + [None]):
         lo = -1 if a is None else a
         hi = len(out) if b is None else b
-        between = list(range(lo + 1, hi))
+        between = [k for k in range(lo + 1, hi) if not out[k][3].isdigit()]
         if not between:
             continue
         first = ord(out[a][3]) + 1 if a is not None else None
