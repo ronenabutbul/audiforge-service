@@ -180,12 +180,19 @@ def expand_multirests(result_path: Path) -> int:
             mr = measure.find(".//multiple-rest")
             if mr is None or not (mr.text or "").strip().isdigit():
                 continue
+            # homr writes a rest of N bars as ONE empty measure carrying
+            # the marker. The standard encoding (Audiveris's, and this
+            # function's own output) is the marker on a measure that rests
+            # its bar, with the other N-1 bars after it. Only the empty
+            # form is condensed; expanding the standard one again would
+            # count the rest twice, so a second pass changes nothing.
+            if measure.find("note") is not None:
+                continue
             count = int(mr.text)
             measure_dur = divisions * beats * 4 // beat_type
-            if measure.find("note") is None:
-                note = ET.SubElement(measure, "note")
-                ET.SubElement(note, "rest", measure="yes")
-                ET.SubElement(note, "duration").text = str(measure_dur)
+            note = ET.SubElement(measure, "note")
+            ET.SubElement(note, "rest", measure="yes")
+            ET.SubElement(note, "duration").text = str(measure_dur)
             at = list(part).index(measure)
             for k in range(count - 1):
                 extra = ET.Element("measure")
