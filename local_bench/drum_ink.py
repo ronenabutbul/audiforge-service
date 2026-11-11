@@ -2121,23 +2121,46 @@ def _touched_barlines(ink: np.ndarray, top: float, il: float, x0: int, x1: int,
     out, last = [], None
     band = max(int(0.25 * il), 2)
     for x in range(int(left), int(x1 - 1.5 * il)):
-        col = ink[t - 6:b + 7, max(x - 1, 0):x + 2].any(axis=1)
-        inner = col[8:-8]
-        if not inner.all() or col[:3].any() or col[-3:].any():
+        if not ink[t + 2:b - 1, x].mean() > 0.5:
             continue
-        # the stroke's own width on every row; staff-line rows are skipped
-        wide = []
+        # follow the stroke down; a skewed scan steps it sideways a few
+        # pixels on the way, which a straight column would lose
+        at, wide, ok = x, [], True
         for r in range(t + 2, b - 1):
             row = ink[r]
-            if not row[x]:
-                continue
-            a = x
+            lo = max(at - 4, 0)
+            near = np.flatnonzero(row[lo:at + 5])
+            if not near.size:
+                ok = False
+                break
+            c = lo + int(near[np.argmin(np.abs(near - (at - lo)))])
+            a = c
             while a > 0 and row[a - 1]:
                 a -= 1
-            z = x
+            z = c
             while z < len(row) - 1 and row[z + 1]:
                 z += 1
-            wide.append(0 if z - a + 1 > 3 * il else z - a + 1)
+            w = z - a + 1
+            if w > 3 * il:
+                wide.append(0)          # a staff line row
+                continue
+            if w <= 0.25 * il:      # where the stroke is alone, it sets the track
+                at = (a + z) // 2
+            wide.append(w)
+        if not ok:
+            continue
+        # blank just beyond both outer lines (their real edges here: a
+        # skewed scan moves them a few pixels), at the stroke's own ends
+        up = t + 2
+        while up > t - int(0.5 * il) and ink[up - 1, x]:
+            up -= 1
+        down = b - 2
+        while down < b + int(0.5 * il) and ink[down + 1, at]:
+            down += 1
+        if up <= t - int(0.5 * il) or down >= b + int(0.5 * il) or \
+                ink[up - 4:up - 1, max(x - 1, 0):x + 2].any() or \
+                ink[down + 2:down + 5, max(at - 1, 0):at + 2].any():
+            continue
         thick = sorted(wide)[len(wide) // 2] if wide else 99
         if thick > 0.3 * il:
             continue
