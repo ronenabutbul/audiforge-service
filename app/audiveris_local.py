@@ -1,12 +1,14 @@
-"""Run Audiveris inside this container, keeping the .omr project file.
+"""Run Audiveris, keeping the .omr project file.
 
 The remote audiveris service returns MusicXML only, but the livesheet
 structure pass needs the .omr (stack geometry, staff lines, BINARY
-images). Behaviours proven in local_bench/run_bench.py carry over:
-fail loudly when OCR was silently skipped (legacy tessdata missing),
-fall back to page-by-page transcription when one bad sheet kills the
-whole book, and never register `heb` (Audiveris 5.11's WordScanner
-dies on RTL and takes every TEXTS step with it).
+images). The Mac bench (local_bench/run_bench.py) runs Audiveris through
+this module too, with its own binary, so the service and the bench read a
+PDF the same way: fail loudly when OCR was silently skipped (legacy
+tessdata missing), fall back to page-by-page transcription when one bad
+sheet makes Audiveris refuse to export the whole book, join every movement
+it exports, and never register `heb` (Audiveris 5.11's WordScanner dies on
+RTL and takes every TEXTS step with it).
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import subprocess
 import xml.etree.ElementTree as ET
 import zipfile
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Same logger as the service, so a movement join shows up in the job log
@@ -30,6 +33,16 @@ AUDIVERIS_BIN = os.environ.get("AUDIVERIS_BIN", "/opt/audiveris/bin/Audiveris")
 # two paths are deliberately separate.
 TESSDATA_DIR = os.environ.get(
     "AUDIVERIS_TESSDATA", "/usr/local/share/audiveris-tessdata")
+
+# How long a whole book, and one page of the fallback, may take. The bench
+# allows these and real charts need them: at the 600 s the service used to
+# allow, a dense multi-page scan was cut off and the conversion went on
+# with homr alone and no structure repair. Settable without a deploy,
+# because the caller gives up on a job after its own ceiling.
+BOOK_TIMEOUT_SECONDS = int(os.environ.get("AUDIVERIS_TIMEOUT_SECONDS", "1800"))
+PAGE_TIMEOUT_SECONDS = int(os.environ.get("AUDIVERIS_PAGE_TIMEOUT_SECONDS", "900"))
+# The same resolution homr's pages are rendered at.
+RENDER_DPI = 300
 
 # one JVM at a time — Audiveris is memory-hungry and jobs are short
 _lock = threading.Lock()
@@ -51,29 +64,46 @@ def available() -> bool:
     return Path(AUDIVERIS_BIN).exists()
 
 
+def _run(source: Path, output_dir: Path, timeout: int,
+         binary: str | None = None, tessdata: str | None = None) -> str:
+    """One batch transcription of a PDF or a page image. Returns the
+    combined log; raises subprocess.TimeoutExpired."""
+    env = {**os.environ, "TESSDATA_PREFIX": str(tessdata or TESSDATA_DIR)}
+    with _lock:
+        proc = subprocess.run(
+            # -swap releases each sheet after its step, which keeps a
+            # dense multi-page scan inside the container's memory. It does
+            # not change what is read: the same PDF exports the same file
+            # with and without it.
+            [str(binary or AUDIVERIS_BIN), "-batch", "-export", "-swap",
+             "-output", str(output_dir), str(source)],
+            capture_output=True, text=True, timeout=timeout, env=env)
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
+def _ocr_was_skipped(log: str, work_dir: Path) -> bool:
+    """Legacy-mode tessdata missing or unusable: transcription continues
+    but every text (titles, tempo words, rehearsal marks) is silently
+    dropped. Audiveris says so on its console or in its own log file,
+    depending on how it was started."""
+    signs = ("Could not initialize TessBaseAPI", "Missing support for 'eng'")
+    texts = [log] + [f.read_text(errors="replace") for f in work_dir.glob("*.log")]
+    return any(sign in text for sign in signs for text in texts)
+
+
 def transcribe(pdf: Path, work_dir: Path, timeout: int = 600) -> Path:
     """Run batch transcription; return the .omr path."""
     if not available():
         raise AudiverisUnavailable(f"no Audiveris binary at {AUDIVERIS_BIN}")
-    env = {**os.environ, "TESSDATA_PREFIX": TESSDATA_DIR}
-    with _lock:
-        proc = subprocess.run(
-            # -swap releases each sheet after its step, which keeps a
-            # dense multi-page scan inside the container's memory
-            [AUDIVERIS_BIN, "-batch", "-export", "-swap",
-             "-output", str(work_dir), str(pdf)],
-            capture_output=True, text=True, timeout=timeout, env=env)
-    log = (proc.stdout or "") + (proc.stderr or "")
+    log = _run(pdf, work_dir, timeout)
     omr = next(work_dir.rglob("*.omr"), None)
     if omr is None:
         one_line = ("does not seem to contain multi-line staves" in log
                     or "too high interline" in log)
         raise PageUnreadable(
             "Audiveris could not read any page", one_line=one_line)
-    if "Could not initialize TessBaseAPI" in log:
-        # legacy-mode tessdata missing: transcription continues but every
-        # text (titles, tempo words) is silently dropped — refuse quietly
-        # degraded results, same guard as the local bench
+    if _ocr_was_skipped(log, work_dir):
+        # refuse quietly degraded results, same guard as the local bench
         raise AudiverisUnavailable(
             "tesseract legacy traineddata missing — OCR skipped")
     return omr
@@ -236,26 +266,116 @@ def _merge_movements(mxls: list[Path], dest: Path) -> Path | None:
     return dest
 
 
-def convert_musicxml(pdf: Path, dest: Path,
-                     timeout: int = 600) -> Path | None:
-    """Drop-in replacement for the remote audiveris_client.convert:
-    transcribe locally, unwrap the exported .mxl to plain MusicXML at
-    dest. Returns None on failure (the fusion pipeline treats a missing
-    Audiveris result as homr-only, same as before)."""
-    work = dest.parent / "audiveris-work"
+@dataclass
+class Conversion:
+    """What a run produced: the MusicXML, or why there is none."""
+
+    path: Path | None = None
+    failure: str | None = None
+    # True when the book would not export whole and was read page by page.
+    paged: bool = False
+    pages_skipped: list[int] = field(default_factory=list)
+
+
+def _join_pages(page_scores: list[Path], dest: Path) -> Path:
+    """Append each page's measures to the first page's parts. Unlike
+    movements, pages never overlap, so nothing is dropped at the seam: two
+    bars that repeat across a page turn are two printed bars."""
+    base_tree = ET.parse(page_scores[0])
+    base_parts = base_tree.getroot().findall("part")
+    for page in page_scores[1:]:
+        for base_part, part in zip(base_parts, ET.parse(page).getroot().findall("part")):
+            base_part.extend(part.findall("measure"))
+    for part in base_parts:
+        for number, measure in enumerate(part.findall("measure"), start=1):
+            measure.set("number", str(number))
+    base_tree.write(dest, encoding="UTF-8", xml_declaration=True)
+    return dest
+
+
+def _convert_paged(pdf: Path, dest: Path, work: Path, pages: list[Path] | None,
+                   binary: str | None, tessdata: str | None) -> Conversion:
+    """Transcribe page by page and join the pages that work. One sheet
+    with no readable system ("No system found") makes Audiveris refuse to
+    export the whole book, and the other pages are lost with it."""
+    paged_dir = work / "paged"
+    paged_dir.mkdir(exist_ok=True)
+    if pages is None:
+        from pdf2image import convert_from_path
+
+        pages = []
+        for i, image in enumerate(convert_from_path(str(pdf), dpi=RENDER_DPI), start=1):
+            page = paged_dir / f"page_{i:03d}.png"
+            image.save(page, "PNG")
+            pages.append(page)
+
+    outcome = Conversion(paged=True)
+    page_scores: list[Path] = []
+    for i, page in enumerate(pages, start=1):
+        # Audiveris names its output after the image it was given.
+        page_dir = paged_dir / f"{i:03d}"
+        page_dir.mkdir(exist_ok=True)
+        try:
+            _run(page, page_dir, PAGE_TIMEOUT_SECONDS, binary, tessdata)
+        except subprocess.TimeoutExpired:
+            logger.warning("audiveris: page %d timed out", i)
+        score = _merge_movements(sorted(page_dir.rglob("*.mxl")),
+                                 paged_dir / f"page_{i:03d}.musicxml")
+        # The structure repair reads the first project file it finds under
+        # the job, and it must be the book's, which covers every sheet. A
+        # page's own project describes one page of the score.
+        for project in page_dir.rglob("*.omr"):
+            project.unlink()
+        if score is None:
+            logger.warning("audiveris: page %d unreadable, skipped", i)
+            outcome.pages_skipped.append(i)
+            if i >= 3 and not page_scores:
+                outcome.failure = "the first pages have no readable music"
+                return outcome
+            continue
+        page_scores.append(score)
+    if not page_scores:
+        outcome.failure = "Audiveris could not read any page"
+        return outcome
+    outcome.path = _join_pages(page_scores, dest)
+    return outcome
+
+
+def convert(pdf: Path, dest: Path, timeout: int = BOOK_TIMEOUT_SECONDS, *,
+            work: Path | None = None, pages: list[Path] | None = None,
+            binary: str | None = None, tessdata: str | None = None) -> Conversion:
+    """Transcribe `pdf` and write its MusicXML to `dest`, every movement
+    joined. Audiveris' own files (the .omr project among them) land in
+    `work`, by default a folder beside `dest`. `pages` are the PDF's pages
+    already rendered at RENDER_DPI, for the page-by-page fallback; without
+    them it renders its own. Never raises: a run that produced nothing
+    says why in `failure`, so the caller can report it."""
+    work = work or dest.parent / "audiveris-work"
     work.mkdir(parents=True, exist_ok=True)
+    if not Path(binary or AUDIVERIS_BIN).exists():
+        return Conversion(failure=f"no Audiveris binary at {binary or AUDIVERIS_BIN}")
     try:
-        transcribe(pdf, work, timeout=timeout)
-    except (AudiverisUnavailable, PageUnreadable):
-        return None
+        log = _run(pdf, work, timeout, binary, tessdata)
     except subprocess.TimeoutExpired:
-        return None
-    merged = _merge_movements(sorted(work.rglob("*.mxl")), dest)
-    if merged is not None:
-        return merged
-    exported = next(
-        (x for x in work.rglob("*.xml") if "META-INF" not in str(x)), None)
-    if exported is not None:
-        dest.write_bytes(exported.read_bytes())
-        return dest
-    return None
+        return Conversion(failure=f"Audiveris timed out after {timeout} s")
+    if _ocr_was_skipped(log, work):
+        return Conversion(failure="Audiveris ran without OCR (tesseract legacy "
+                                  "traineddata missing or unusable)")
+    paged_dir = work / "paged"
+    exported = [m for m in sorted(work.rglob("*.mxl")) if paged_dir not in m.parents]
+    if not exported:
+        outcome = _convert_paged(pdf, dest, work, pages, binary, tessdata)
+        if outcome.path is None and "does not seem to contain multi-line staves" in log:
+            outcome.failure = "the page does not contain multi-line staves"
+        return outcome
+    if _merge_movements(exported, dest) is None:
+        return Conversion(failure="Audiveris exported no readable MusicXML")
+    return Conversion(path=dest)
+
+
+def convert_musicxml(pdf: Path, dest: Path,
+                     timeout: int = BOOK_TIMEOUT_SECONDS) -> Path | None:
+    """`convert`, for a caller that only wants the file. Returns None on
+    failure (the fusion pipeline treats a missing Audiveris result as
+    homr-only)."""
+    return convert(pdf, dest, timeout).path
