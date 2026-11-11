@@ -172,10 +172,11 @@ def _mended(flags, gap: float, whole: float) -> list[tuple[int, int]]:
 class Sheet:
     """Ink layers of one page, each answering one question."""
 
-    def __init__(self, ink: np.ndarray, root: ET.Element):
+    def __init__(self, ink: np.ndarray, root: ET.Element, bars: list[dict] | None = None):
         self.ink = ink
         self.u8 = ink.astype(np.uint8)
-        self.bars = page_layout(root)
+        # `bars`: another staff's bars (a score reads its drum staff this way)
+        self.bars = page_layout(root) if bars is None else bars
         for k, b in enumerate(self.bars):
             b["k"] = k
         self.il = float(np.median([b["il"] for b in self.bars])) if self.bars else 20.0
@@ -1491,11 +1492,14 @@ def spans_from_numbers(numbers: dict[int, int], crops: list[dict],
     return counts
 
 
-def ink_readings(crops: list[dict], omr: Path, rest_counts: dict | None = None):
+def ink_readings(crops: list[dict], omr: Path, rest_counts: dict | None = None,
+                 chart: list[dict] | None = None):
     """BarReading per crop, straight from the ink. Returns (readings,
-    stacks whose values did not add up)."""
+    stacks whose values did not add up). `chart`: bars already read, in
+    `read_chart`'s form, instead of reading the first staff of `omr`."""
     from drum_grid import BarReading, Strike
-    by_ordinal = {(b["ordinal"], b["part"]): b for b in read_chart(omr)}
+    by_ordinal = {(b["ordinal"], b.get("part", 0)): b
+                  for b in (read_chart(omr) if chart is None else chart)}
     rest_counts = rest_counts or {}
     readings, unsure = [], []
     for crop in crops:
