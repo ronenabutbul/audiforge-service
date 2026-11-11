@@ -253,6 +253,22 @@ class Sheet:
                 if b is not None:
                     self.timesigs.append((float(b.get("x")), float(b.get("y")),
                                           float(b.get("w")), float(b.get("h"))))
+        clefs = [tuple(float(el.find("bounds").get(q)) for q in "xywh")
+                 for el in root.iter("clef") if el.find("bounds") is not None]
+        # a clef is never a note (Audiveris can take a faint 4/4 for one)
+        self.timesigs += clefs
+        # a signature Audiveris missed (start of the piece, mid line):
+        # its digits are not notes either
+        for b in self.bars:
+            if not any(b["x0"] - 4 <= tx <= b["x0"] + 4 * b["il"] and
+                       b["top"] - 2 * b["il"] <= ty <= b["top"] + 6 * b["il"]
+                       for tx, ty, _tw, _th in self.timesigs):
+                # after the clef at the head of a system
+                start = max([cx + cw for cx, cy, cw, ch in clefs
+                             if b["x0"] - 4 <= cx <= b["x0"] + 5 * b["il"]
+                             and b["top"] - 3 * b["il"] <= cy + ch / 2 <= b["top"] + 7 * b["il"]]
+                            + [b["x0"]])
+                ink_time_signature(self.ink, b["top"], b["il"], start, self.timesigs)
         self._heads()
         self._crosses()
         # a dynamic's letters ("ff" printed against a stem) have the
@@ -260,7 +276,9 @@ class Sheet:
         # cross is a note head
         self.dynamics = [tuple(float(el.find("bounds").get(q)) for q in "xywh")
                          for el in root.iter("dynamics") if el.find("bounds") is not None]
-        self.crosses = [(x, y) for x, y in self.crosses if not self.in_dynamic(x, y)]
+        self.crosses = [(x, y) for x, y in self.crosses
+                        if not self.in_dynamic(x, y) and not self.in_time(x, y)]
+        self.filled = [(x, y) for x, y in self.filled if not self.in_time(x, y)]
         self._rings()
         self._stems()
         self._rests(root)
@@ -446,12 +464,41 @@ class Sheet:
             if w > 0.4 * il or hh < 1.2 * il:
                 continue
             cx = x + (w - 1) / 2
-            col = v[:, max(int(round(cx)) - 1, 0):int(round(cx)) + 2].any(axis=1)
             y0, y1 = int(y), int(y + hh)
-            while y0 > 0 and y - y0 < reach and col[y0 - 1]:
-                y0 -= 1
-            while y1 < len(col) and y1 - (y + hh) < reach and col[y1]:
-                y1 += 1
+
+            # follow the stroke row by row; a scanned stem can step a
+            # couple of pixels sideways (a skewed scan's staircase)
+            # follow the stroke row by row; a scanned stem can step a
+            # couple of pixels sideways (a skewed scan's staircase), and
+            # the stepped piece can be too short for the opening: past
+            # the opened stroke it goes on through thin upright ink only
+            thin_max = max(int(0.35 * il), 3)
+
+            def follow(yy, step, limit):
+                at = int(round(cx))
+                while 0 <= yy + step < v.shape[0] and abs(yy + step - (y if step < 0 else y + hh)) <= limit:
+                    lo = max(at - 3, 0)
+                    near = np.flatnonzero(v[yy + step, lo:at + 4])
+                    if not near.size:
+                        row = self.nolines[yy + step]
+                        near = np.flatnonzero(row[lo:at + 4])
+                        if not near.size:
+                            break
+                        c = lo + int(near[np.argmin(np.abs(near - (at - lo)))])
+                        a, b = c, c
+                        while a > 0 and row[a - 1]:
+                            a -= 1
+                        while b < len(row) - 1 and row[b + 1]:
+                            b += 1
+                        if b - a + 1 > thin_max:
+                            break
+                        at = (a + b) // 2
+                    else:
+                        at = lo + int(near[np.argmin(np.abs(near - (at - lo)))])
+                    yy += step
+                return yy
+            y0 = follow(y0, -1, reach)
+            y1 = follow(y1 - 1, 1, reach) + 1
             if y1 - y0 < h:
                 continue
             # a worn scan breaks a stem short of its beam: a gap of a few
@@ -1385,8 +1432,8 @@ def _read_digit(mask: np.ndarray) -> list[str]:
     return reads
 
 
-def ink_time_signature(ink: np.ndarray, top: float, il: float, x0: float
-                       ) -> tuple[int, int] | None:
+def ink_time_signature(ink: np.ndarray, top: float, il: float, x0: float,
+                       where: list | None = None) -> tuple[int, int] | None:
     """A time signature printed right after the barline at x0 that
     Audiveris did not report (a meter change in mid line): two digits
     stacked into one column that spans the staff from top line to bottom
@@ -1453,6 +1500,8 @@ def ink_time_signature(ink: np.ndarray, top: float, il: float, x0: float
         upper = next((int(t) for t in parts[0] if t.isdigit() and 1 <= int(t) <= 16), None)
         lower = next((int(t) for t in parts[1] if t in ("2", "4", "8", "16")), None)
         if upper and lower:
+            if where is not None:
+                where.append((float(xa + x), float(ya + y), float(w), float(h)))
             return upper, lower
     return None
 
@@ -2011,6 +2060,53 @@ def _strikes_of(e: dict, bar: dict) -> list[dict]:
     return out
 
 
+def _touched_barlines(ink: np.ndarray, top: float, il: float, x0: int, x1: int,
+                      head: bool = False) -> list[int]:
+    """Barlines inside a stack that a word or a mark touches (the e of
+    "snare" printed against it), which `fix_hbars` turns down because the
+    stroke widens there. A barline still runs from exactly the top line to
+    exactly the bottom one, blank beyond both, a few pixels thick; it may
+    widen only for a sliver of rows (a letter's stroke), where a head
+    joined to a stem widens it for half an interline."""
+    t, b = int(round(top)), int(round(top + 4 * il))
+    if t < 6 or b + 6 >= ink.shape[0]:
+        return []
+    left = x0 + (6 if head else 1.5) * il
+    out, last = [], None
+    band = max(int(0.25 * il), 2)
+    for x in range(int(left), int(x1 - 1.5 * il)):
+        col = ink[t - 6:b + 7, max(x - 1, 0):x + 2].any(axis=1)
+        inner = col[8:-8]
+        if not inner.all() or col[:3].any() or col[-3:].any():
+            continue
+        # the stroke's own width on every row; staff-line rows are skipped
+        wide = []
+        for r in range(t + 2, b - 1):
+            row = ink[r]
+            if not row[x]:
+                continue
+            a = x
+            while a > 0 and row[a - 1]:
+                a -= 1
+            z = x
+            while z < len(row) - 1 and row[z + 1]:
+                z += 1
+            wide.append(0 if z - a + 1 > 3 * il else z - a + 1)
+        thick = sorted(wide)[len(wide) // 2] if wide else 99
+        if thick > 0.3 * il:
+            continue
+        run = longest = 0
+        for w in wide:
+            run = run + 1 if w > 0.75 * il else 0
+            longest = max(longest, run)
+        if longest > band:
+            continue
+        if last is None or x - last > il:
+            out.append(x)
+        last = x
+    return out
+
+
 def merged_bars(omr: Path) -> dict[int, list[int]]:
     """{stack ordinal: x of every barline printed inside it}. Audiveris
     sometimes takes two printed bars for one (a barline under an ending
@@ -2024,6 +2120,16 @@ def merged_bars(omr: Path) -> dict[int, list[int]]:
     for (_img, pixels, top, bottom, il, x0, x1, ordinal, system_x0) in fix_hbars._iter_stacks(omr):
         xs = fix_hbars._merged_bar_xs(pixels, top, bottom, x0, x1, il,
                                       medians.get(ordinal, 0), head=x0 == system_x0)
+        for x in _touched_barlines(pixels, top, il, x0, x1, head=x0 == system_x0):
+            if not any(abs(x - q) < 2 * il for q in xs):
+                xs = sorted(xs + [x])
+        # a two-bar repeat sign stands on the barline between the two
+        # bars it fills; one in the middle of a stack marks a barline the
+        # engine merged over (the sign's slashes hide it)
+        for cx, n in repeat_signs(pixels, top, il, x0, x1):
+            if n == 2 and x0 + 2 * il < cx < x1 - 2 * il \
+                    and not any(abs(cx - x) < 2 * il for x in xs):
+                xs = sorted(xs + [int(round(cx))])
         if xs:
             out[ordinal] = xs
     return out
