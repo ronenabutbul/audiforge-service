@@ -416,6 +416,11 @@ def bar_crops(omr_path: Path) -> list[dict]:
                                 <= bottom + 2 * interline):
                             continue
                         if x0 - 4 <= sig["x"] <= x1:
+                            # printed after a barline, never on one: a
+                            # "signature" centred on the barline is a
+                            # two-bar repeat sign misread (Libertango)
+                            if si and abs(sig["x"] - x0) < 1.2 * interline:
+                                continue
                             if (si == len(stacks) - 1
                                     and sig["x"] > x0 + 0.85 * (x1 - x0)):
                                 pending_sig = sig["meter"]
