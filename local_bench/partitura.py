@@ -2205,9 +2205,12 @@ def convert(work: Path, out: Path) -> dict:
                 if i == 0:
                     if len(part.slots) > 1:
                         ET.SubElement(attrs, "staves").text = str(len(part.slots))
-                    track = clefs[id(systems[0])]
                     for k, slot in enumerate(part.slots):
-                        kind = track[slot][0][1] or "G"
+                        # A score may hide a staff on its first system (the
+                        # instrument enters later), so the opening clef is
+                        # the one on the first system that prints the staff.
+                        kind = next((clefs[id(s)][slot][0][1] for s in systems
+                                     if slot in clefs[id(s)]), None) or "G"
                         clef = ET.SubElement(attrs, "clef")
                         if len(part.slots) > 1:
                             clef.set("number", str(k + 1))
