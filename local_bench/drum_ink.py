@@ -1226,7 +1226,9 @@ class Sheet:
         x0, x1 = int(hx + 0.75 * il), int(hx + 2.0 * il)
         if edge is not None:
             x0, x1 = int(edge + 0.05 * il), int(edge + 1.3 * il)
-        y0, y1 = int(hy - 0.6 * il), int(hy + 0.6 * il)
+        # a dot is printed in a space: a head on a line has its dot in the
+        # space above, as high as half an interline over the head's centre
+        y0, y1 = int(hy - 0.85 * il), int(hy + 0.6 * il)
         box = self.nolines[max(y0, 0):y1, max(x0, 0):x1].astype(np.uint8)
         if not box.size:
             return False
