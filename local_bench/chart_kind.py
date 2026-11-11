@@ -72,19 +72,23 @@ def _ink_staves(omr: Path) -> list[tuple[int, int]]:
                         y += 1
                     ys.append((a + y) // 2)
                 y += 1
-            if len(ys) < 2:
-                out += [(1, y) for y in ys]
-                continue
-            gaps = np.diff(ys)
-            il = float(np.median(gaps))
-            group = [ys[0]]
-            for a, g in zip(ys[1:], gaps):
-                if abs(g - il) <= 0.25 * il and len(group) < 5:
-                    group.append(a)
+            # Lines of one staff are a head's height apart, a small part of
+            # the page (about 1% of its height, 2% for the largest print);
+            # staves stand much further apart. Grouping by the page's median
+            # gap instead would make five one-line percussion staves, spaced
+            # evenly down the page, into one giant "five-line staff".
+            near = 0.02 * len(rows)
+            group = ys[:1]
+            for a, b in zip(ys, ys[1:]):
+                g = b - a
+                if g <= near and len(group) < 5 and \
+                        (len(group) < 2 or abs(g - (group[1] - group[0])) <= 0.25 * g):
+                    group.append(b)
                 else:
                     out.append((len(group), group[0]))
-                    group = [a]
-            out.append((len(group), group[0]))
+                    group = [b]
+            if group:
+                out.append((len(group), group[0]))
     return out
 
 
@@ -130,6 +134,10 @@ def _kind_from_ink(omr: Path) -> tuple[str, float, str]:
     ev = f"no systems read; ink: {len(five)} five-line staves, {len(thin)} one/two-line lines over {pages} pages"
     if not five and not thin:
         return "melodic", 0.0, ev + "; no staff found"
+    if thin and len(five) <= len(thin) / 4:
+        # staves of one or two lines are percussion notation, whatever the
+        # instrument's name: nothing pitched is written on them
+        return "drum", 0.8, ev + "; one/two-line staves only"
     if len(thin) > len(five):
         return "drum", 0.4, ev
     if len(five) / pages > 14:

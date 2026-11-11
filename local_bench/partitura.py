@@ -364,6 +364,13 @@ def no_systems_reason(omr: Path) -> str:
                 if il:
                     gaps.append(il)
     if not gaps:
+        import chart_kind
+        staves = chart_kind._ink_staves(omr)
+        if staves and all(n <= 2 for n, _y in staves):
+            return (f"Audiveris found no systems; the pages hold only one- or two-line staves "
+                    f"({len(staves)}), which Audiveris reads only with its "
+                    f"org.audiveris.omr.sheet.ProcessingSwitches.oneLineStaves switch on "
+                    f"(without it, it takes the staff spacing for one huge interline)")
         return "Audiveris found no systems and the pages show no staff lines"
     il = float(np.median(gaps))
     msg = (f"Audiveris found no systems on any sheet; the ink shows staff lines "

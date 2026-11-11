@@ -63,6 +63,11 @@ def warnings_of(text: str) -> list[str]:
     return seen[:30]
 
 
+def _has_systems(omr: Path) -> bool:
+    import chart_kind
+    return bool(chart_kind.features(omr).get("systems"))
+
+
 def convert_any(work: Path, out: Path, kind: str | None = None) -> dict:
     t0 = time.time()
     work, out = Path(work), Path(out)
@@ -78,6 +83,13 @@ def convert_any(work: Path, out: Path, kind: str | None = None) -> dict:
         kind = s["kind"]
         s["low_confidence"] = s["confidence"] < LOW_CONFIDENCE
         out.parent.mkdir(parents=True, exist_ok=True)
+        if kind != "melodic" and not _has_systems(omr):
+            # every ink reader works on the staves Audiveris found; with
+            # none there is nothing to read, and the readers would crash
+            import partitura
+            s["error"] = f"no systems: {partitura.no_systems_reason(omr)}"
+            s["exit"] = 3
+            return s
         if kind == "melodic":
             s["reader"] = "cached fusion result"
             cached = omr.parent / f"{omr.parent.name}.musicxml"
