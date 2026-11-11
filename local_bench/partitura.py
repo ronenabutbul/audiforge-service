@@ -1187,6 +1187,7 @@ def read_drums(systems: list[System], pages: dict, slot: int, meters: list[tuple
     from drum_grid import bar_slots
     out = []
     sheets: dict[str, object] = {}
+    geo_of: dict[tuple[int, int], dict] = {}
     ordinal = 0
     for system in systems:
         staff = next((s for s in system.staves if s.slot == slot), None)
@@ -1200,12 +1201,16 @@ def read_drums(systems: list[System], pages: dict, slot: int, meters: list[tuple
                 if system.name not in sheets:
                     ink, root = pages[system.name]
                     # the sheet's scale is this staff's, on all its systems
-                    geos = [_bar_on_staff(s2, b2, st2, False) for s2 in systems if s2.name == system.name
-                            for st2 in s2.staves if st2.slot == slot for b2 in s2.bars]
-                    sheets[system.name] = drum_ink.Sheet(ink, root, bars=geos)
+                    geos = {(id(s2), k2): _bar_on_staff(s2, b2, st2, k2 == 0)
+                            for s2 in systems if s2.name == system.name
+                            for st2 in s2.staves if st2.slot == slot
+                            for k2, b2 in enumerate(s2.bars)}
+                    sheets[system.name] = drum_ink.Sheet(ink, root, bars=list(geos.values()))
                     _drop_head_columns(sheets[system.name])
+                    geo_of.update(geos)
                 sheet = sheets[system.name]
-                geo = _bar_on_staff(system, bar, staff, k == 0)
+                # the very bar the sheet knows (its "k" homes the signs)
+                geo = geo_of[(id(system), k)]
                 read = drum_ink.read_bar(sheet, geo, slots)
                 if staff.count == 1:
                     # nothing but the line's own notes: no rests from the staves above
@@ -1223,11 +1228,7 @@ def read_drums(systems: list[System], pages: dict, slot: int, meters: list[tuple
                     for e in events:
                         if e.get("rest") or e.get("slot") is None:
                             continue
-                        for hx, hy, kind in e["heads"]:
-                            step = int(round((hy - geo["top"]) / (geo["il"] / 2)))
-                            entry["strikes"].append((int(e["slot"]), step, kind,
-                                                     float(e["value"]) if e["value"] else None,
-                                                     e["voice"], e.get("tremolo", 0)))
+                        entry["strikes"] += drum_ink._strikes_of(e, geo)
                         if not problem and e["voice"] in (1, 2):
                             y = geo["top"] + 2 * geo["il"]
                             entry["anchors"].append((e["x"] - system.shift(y), Fraction(e["slot"]) / 4))
