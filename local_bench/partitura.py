@@ -1698,7 +1698,11 @@ def read_signatures(systems: list[System], pages: dict | None = None
                 meter, pending_meter = pending_meter, None
             key.update(pending_key)
             pending_key = {}
-            mine = [(x, m) for x, m in sigs if home(x)[0] == k]
+            # a time signature stands just after a barline, or just before
+            # one as a warning; a "meter" in the middle of a bar is some
+            # other sign misread (a bar-repeat "%" read as 3/4)
+            mine = [(x, m) for x, m in sigs if home(x)[0] == k
+                    and (k == 0 or x < bar["x0"] + 4 * il or x > bar["x1"] - 4 * il)]
             for x, m in mine:
                 if home(x)[1]:
                     pending_meter = m
