@@ -1002,25 +1002,27 @@ def _omr_hairpins(omr_path: Path, grade_min: float = HAIRPIN_GRADE_MIN):
     return wedges
 
 
-def place_hairpins(omr_path: Path, result_path: Path, hbars: list[dict]) -> int:
+def place_hairpins(omr_path: Path, result_path: Path, hbars: list[dict],
+                   band: str = "below") -> int:
     """Crescendo and diminuendo hairpins from the project file. A wedge
     opens the bar under its left end and closes the bar under its right
     end; a bar that already carries a wedge of that kind, or a
     neighbour that does, has the exported copy and is left alone. Both
     ends are always written together, so no hairpin is left open.
-    Returns hairpins placed."""
+    `band` is where the wedge is engraved: below the staff on a melodic
+    part, above it on a one-line drum chart. Returns hairpins placed."""
     wedges = _omr_hairpins(omr_path)
     if not wedges:
         return 0
     start_of = {}
     for n, i in _locate_marks(
             omr_path, hbars, [(s, x0, y, i) for i, (s, x0, _x1, y, _k) in enumerate(wedges)],
-            band="below", containing=True, slack_il=0.5):
+            band=band, containing=True, slack_il=0.5):
         start_of.setdefault(i, n)
     stop_of = {}
     for n, i in _locate_marks(
             omr_path, hbars, [(s, x1, y, i) for i, (s, _x0, x1, y, _k) in enumerate(wedges)],
-            band="below", containing=True, slack_il=-0.5):
+            band=band, containing=True, slack_il=-0.5):
         stop_of.setdefault(i, n)
 
     tree = ET.parse(result_path)
@@ -1032,7 +1034,7 @@ def place_hairpins(omr_path: Path, result_path: Path, hbars: list[dict]) -> int:
         return any(w.get("type") == kind for w in measure.iter("wedge"))
 
     def direction(kind):
-        d = ET.Element("direction", placement="below")
+        d = ET.Element("direction", placement=band)
         ET.SubElement(ET.SubElement(d, "direction-type"), "wedge", type=kind)
         return d
 

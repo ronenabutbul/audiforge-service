@@ -135,6 +135,11 @@ class Strike(BaseModel):
     step: int
     head: str = "normal"
     accent: bool = False
+    # Set from the ink, never by the model: a void head holds its value
+    # (in 16th slots) instead of the short strike the writer assumes,
+    # and slashes on its stem make it a roll.
+    length: int | None = None
+    tremolo: int = 0
 
 
 class BarReading(BaseModel):
@@ -151,6 +156,8 @@ class Hit(BaseModel):
     slot: int
     instruments: list[str]
     accent: bool = False
+    length: int | None = None   # 16th slots a long note holds (dotted half = 12)
+    tremolo: int = 0            # roll slashes on the stem
     # observed ink, parallel to instruments — lets the writer put each
     # note where the ORIGINAL page shows it instead of at the textbook
     # kit position, so the output engraves like the source
@@ -221,6 +228,7 @@ def reading_to_grid(reading: "BarReading",
                     step_map: dict | None = None) -> "BarGrid":
     """Map seen positions to kit pieces via POSITION_MAP."""
     by_slot: dict[int, list[tuple[str, bool, int, str]]] = {}
+    long: dict[int, tuple[int | None, int]] = {}
     for strike in reading.strikes:
         table = step_map or STEP_MAP
         row = table.get(max(-4, min(10, strike.step)))
@@ -231,12 +239,16 @@ def reading_to_grid(reading: "BarReading",
             continue
         by_slot.setdefault(strike.slot, []).append(
             (inst, strike.accent, strike.step, strike.head))
+        if strike.length or strike.tremolo:
+            long[strike.slot] = (strike.length, strike.tremolo)
     return BarGrid(
         is_repeat_of_previous=reading.is_repeat_of_previous,
         hits=[Hit(slot=s, instruments=[i for i, _, _, _ in v],
                   accent=any(a for _, a, _, _ in v),
                   steps=[st for _, _, st, _ in v],
-                  heads=[h for _, _, _, h in v])
+                  heads=[h for _, _, _, h in v],
+                  length=long.get(s, (None, 0))[0],
+                  tremolo=long.get(s, (None, 0))[1])
               for s, v in sorted(by_slot.items())],
         dynamic=reading.dynamic)
 
@@ -357,7 +369,8 @@ def bar_crops(omr_path: Path) -> list[dict]:
                                   "rows": rows,
                                   "height": crop.height,
                                   "stack": stack_ordinal,
-                                  "meter": meter})
+                                  "meter": meter,
+                                  "pickup": stack.get("special") == "PICKUP"})
     return crops
 
 
@@ -474,7 +487,10 @@ def _gemini_read_bar(crop: dict, prompt: str, model: str,
             text = payload["candidates"][0]["content"]["parts"][0]["text"]
             return BarReading.model_validate_json(text)
         except Exception as exc:
-            if attempt == 5:
+            # A bad key or a malformed request never succeeds on retry;
+            # six waits on it cost minutes per rebuild.
+            code = getattr(exc, "code", None)
+            if code in (400, 401, 403) or attempt == 5:
                 print(f"  {label}: giving up ({exc})", flush=True)
                 return None
             import time
@@ -570,6 +586,165 @@ def snap_steps(crops: list[dict], readings: list["BarReading"], omr: Path,
     if moved:
         print(f"  snapped {moved} strikes to the ink", flush=True)
     return readings
+
+
+def refine_from_ink(crops: list[dict], readings: list["BarReading"], omr: Path,
+                    slots_per_beat: int = 4) -> list["BarReading"]:
+    """Correct the model's rhythm with what the page actually prints.
+
+    Audiveris recognises no cross head, so it exports no stem for the
+    hi-hat line; the ink still has every one, exact to the pixel, and the
+    heads hanging on it can be read from their shape. Three cases:
+
+    * A stem on every 16th. The upper voice IS the ink: every stem's
+      heads (cross = cymbal, filled = drum, by staff step) replace what
+      the model reported for that voice. This is where the model merged
+      two 16ths into an 8th (Avihu 6-13, 16-17).
+    * Otherwise the bar is left as read (snap_slots has already put its
+      onsets on the beats Audiveris engraved). Spacing the stems evenly
+      was tried for partial bars and moved notes the wrong way: engraved
+      spacing is not linear in time.
+
+    Long notes come from the ink too: a void head holds a half, with a
+    dot a dotted half, and slashes on its stem make it a roll.
+    """
+    from drum_overlay import (bar_geometry, bar_objects, ink_stems,
+                              head_roll, long_heads, sheet_pixels,
+                              solve_slots, stem_heads)
+
+    pixels = sheet_pixels(omr)
+    stems = ink_stems(omr, pixels)
+    longs = long_heads(omr, pixels)
+    objects = bar_objects(omr)
+    bars = bar_geometry(omr)
+    out, rebuilt, lengthened, timed, rolls = [], 0, 0, 0, 0
+    for crop, reading in zip(crops, readings):
+        bar = bars[crop["stack"]] if crop["stack"] < len(bars) else None
+        xs = stems.get(crop["stack"], [])
+        new = reading.model_copy(deep=True)
+        slots = bar_slots(crop.get("meter", (4, 4)))
+        # the upper voice is every head on an up-stem: cymbals, snare,
+        # toms; kick and pedal hi-hat (step 6 and below) hang on down-stems
+        upper = [s for s in new.strikes if s.step <= 5]
+        if bar is not None and xs and not reading.multirest_count:
+            page = pixels[bar["sheet"]]
+            if len(xs) == slots:
+                read = []
+                for slot, x in enumerate(xs):
+                    heads = [(st, kind) for st, kind in
+                             stem_heads(page, x, bar["top"], bar["interline"])
+                             if st <= 5 and not (kind == "normal" and st <= -2)]
+                    if not heads:  # ink unreadable here: keep the model's
+                        heads = [(s.step, s.head) for s in upper
+                                 if s.slot == slot]
+                    for st, kind in heads:
+                        acc = any(s.accent for s in upper
+                                  if abs(s.slot - slot) <= 1 and s.step == st)
+                        read.append(Strike(slot=slot, step=st, head=kind,
+                                           accent=acc))
+                if read:
+                    new.strikes = [s for s in new.strikes if s.step > 5] + read
+                    rebuilt += 1
+        if bar is not None and not xs and not reading.multirest_count:
+            # no up-stem: a sparse bar of kick and rests. Audiveris'
+            # offsets slip in these; its x positions do not.
+            obj = objects.get(crop["stack"])
+            lower = [s for s in new.strikes if s.step > 5]
+            if obj and obj["heads"] and lower \
+                    and len(obj["heads"]) == len(lower):
+                solved = solve_slots(obj["heads"], obj["rests"], obj["x1"], slots)
+                if solved:
+                    for s, (x, st) in zip(sorted(lower, key=lambda s: s.slot),
+                                          obj["heads"]):
+                        s.slot = solved[x]
+                    timed += 1
+        if bar is not None and not reading.multirest_count:
+            # rolls: slashes across the stem of a filled head
+            page = pixels[bar["sheet"]]
+            obj = objects.get(crop["stack"]) or {"heads": []}
+            for hx, hstep in obj["heads"]:
+                if hstep > 5:
+                    continue
+                n = head_roll(page, hx, bar["top"] + hstep * bar["interline"] / 2,
+                              bar["interline"], staff_top=bar["top"])
+                if not n:
+                    continue
+                near = min(bar["onsets"], key=lambda o: abs(o["x"] - hx),
+                           default=None)
+                if near is None:
+                    continue
+                slot = int(round(float(near["beats"]) * slots_per_beat))
+                cands = [s for s in new.strikes if s.step <= 5
+                         and abs(s.slot - slot) <= 1 and s.head == "normal"]
+                if cands:
+                    min(cands, key=lambda s: abs(s.slot - slot)).tremolo = n
+                    rolls += 1
+        for item in longs.get(crop["stack"], []):
+            if bar is None:
+                break
+            width = bar["x1"] - bar["x0"]
+            est = int(round((item["x"] - bar["x0"]) / width * slots))
+            # the model's strike for this head, if it saw one nearby;
+            # otherwise the ink alone puts the note there
+            # Audiveris' slot for this head is exact; the model's strikes
+            # near it on the upper voice are its misreadings of the same
+            # ink (a stray tom beside a snare roll) and are replaced.
+            on = [o for o in bar["onsets"] if abs(o["x"] - item["x"]) < 1.2 * bar["interline"]]
+            slot = int(round(float(on[0]["beats"]) * slots_per_beat)) if on else est
+            slot = max(0, min(slots - 1, slot))
+            new.strikes = [s for s in new.strikes if not (
+                s.step <= 5 and abs(s.slot - slot) <= 3)]
+            s = Strike(slot=slot, step=item["step"], head="normal")
+            new.strikes.append(s)
+            s.length = 12 if item["dot"] else 8
+            s.tremolo = item["tremolo"]
+            lengthened += 1
+        out.append(new)
+    print(f"  ink: {rebuilt} bars read off their stems, {timed} sparse bars "
+          f"timed by spacing, {lengthened} long notes, {rolls} rolls",
+          flush=True)
+    return out
+
+
+def snap_slots(crops: list[dict], readings: list["BarReading"], omr: Path,
+               slots_per_beat: int = 4) -> list["BarReading"]:
+    """Put each strike on the beat Audiveris engraved it at.
+
+    The model is good at WHICH lines are struck and poor at WHEN: on
+    Avihu's Allegretto bars it reads kick on 1, 3, 3+ where the page has
+    1, 2+, 3. Audiveris' slots are the rhythm of the printed bar, exact
+    to the 16th, and a slot with a notehead on it is a strike onset. When
+    the model saw as many onsets as the page has, the two line up one to
+    one and the page wins on timing.
+    """
+    from drum_overlay import bar_geometry
+    bars = bar_geometry(omr)
+    out, snapped = [], 0
+    for crop, reading in zip(crops, readings):
+        bar = bars[crop["stack"]] if crop["stack"] < len(bars) else None
+        seen = sorted({s.slot for s in reading.strikes})
+        if bar is None or not seen or reading.is_repeat_of_previous:
+            out.append(reading)
+            continue
+        tol = bar["interline"]
+        head_onsets = [o for o in bar["onsets"]
+                       if any(abs(hx - o["x"]) <= tol for hx in bar["heads"])]
+        if len(head_onsets) != len(seen):
+            out.append(reading)
+            continue
+        target = [int(round(float(o["beats"]) * slots_per_beat))
+                  for o in head_onsets]
+        remap = dict(zip(seen, target))
+        if remap == {k: k for k in seen}:
+            out.append(reading)
+            continue
+        new = reading.model_copy(deep=True)
+        for strike in new.strikes:
+            strike.slot = remap[strike.slot]
+        out.append(new)
+        snapped += 1
+    print(f"  snapped {snapped} bars onto the engraved beats", flush=True)
+    return out
 
 
 def merge_wobbled_lines(crops: list[dict], readings: list["BarReading"],
@@ -1008,19 +1183,74 @@ def _display_from_step(step: int) -> tuple[str, int]:
     return "CDEFGAB"[diatonic % 7], diatonic // 7
 
 
+_REST_SLOTS = {"WHOLE_REST": 16, "HALF_REST": 8, "QUARTER_REST": 4,
+               "EIGHTH_REST": 2, "ONE_16TH_REST": 1}
+
+
+def printed_rests(omr_path: Path) -> dict[int, list[int]]:
+    """The rests Audiveris read, per stack ordinal, left to right, in
+    16th slots. A bar with no strikes is not silent by default: the page
+    prints its rests (Avihu bar 1 is an eighth rest and a quarter rest,
+    a pickup), and Newzik writes exactly those. Writing a whole rest
+    instead was the first thing Ronen flagged."""
+    import zipfile as _zipfile
+    rests: dict[int, list[int]] = {}
+    ordinal = -1
+    with _zipfile.ZipFile(omr_path) as z:
+        sheets = sorted(
+            {n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+            key=lambda s: int(s.split("#")[1]))
+        for sheet in sheets:
+            root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml")
+                                 .decode("utf-8", "replace"))
+            found = []
+            for rest in root.iter("rest"):
+                b = rest.find("bounds")
+                slots = _REST_SLOTS.get(rest.get("shape", ""))
+                if b is None or not slots:
+                    continue
+                found.append((float(b.get("x")) + float(b.get("w")) / 2,
+                              float(b.get("y")) + float(b.get("h")) / 2,
+                              slots))
+            for system in root.iter("system"):
+                staff = system.find(".//staff")
+                lines = (staff.findall("lines/line")
+                         if staff is not None else [])
+                if len(lines) < 5:
+                    continue
+                top = float(lines[0].find("point").get("y"))
+                bottom = float(lines[-1].find("point").get("y"))
+                margin = (bottom - top) * 0.75
+                for stack in system.findall("stack"):
+                    ordinal += 1
+                    x0, x1 = float(stack.get("left")), float(stack.get("right"))
+                    here = sorted(
+                        (x, n) for x, y, n in found
+                        if x0 <= x < x1 and top - margin <= y <= bottom + margin)
+                    if here:
+                        rests[ordinal] = [n for _, n in here]
+    return rests
+
+
 def write_musicxml(grids: list[BarGrid], out: Path,
                    beats: int = 4, beat_type: int = 4,
                    slots_per_beat: int = 4, title: str = "Drum Set",
                    rest_bars: dict[int, int] | None = None,
                    meters: list[tuple[int, int]] | None = None,
-                   tempos: dict[int, int] | None = None):
+                   tempos: dict[int, int] | None = None,
+                   printed: dict[int, list[int]] | None = None,
+                   pickups: set[int] | None = None):
     """rest_bars maps a grid index to how many MEASURES that printed bar
     stands for — a multirest bar is one bar on the page but N measures of
     music, which is why counting printed bars undercounts a piece.
 
     meters is a per-bar (num, den) list from the printed time signatures;
-    tempos maps a grid index to a metronome marking printed above it."""
-    divisions = slots_per_beat  # slot = one division of a quarter
+    tempos maps a grid index to a metronome marking printed above it.
+    printed maps a grid index to the rests the page prints in that bar
+    (16th slots, left to right), used when the bar has no strikes."""
+    divisions = slots_per_beat
+    printed = printed or {}  # slot = one division of a quarter
+    pickups = pickups or set()
     meters = meters or []
     tempos = dict(tempos or {})
 
@@ -1048,17 +1278,24 @@ def write_musicxml(grids: list[BarGrid], out: Path,
 
     def open_measure(gi: int):
         nonlocal num, emitted_meter
-        num += 1
-        measure = ET.SubElement(part, "measure", number=str(num))
+        # A pickup is not a bar: published charts number the first full
+        # bar 1, so the pickup is measure 0 and implicit, as Newzik and
+        # every engraver write it.
+        if gi == 0 and gi in pickups:
+            measure = ET.SubElement(part, "measure", number="0",
+                                    implicit="yes")
+        else:
+            num += 1
+            measure = ET.SubElement(part, "measure", number=str(num))
         bar_meter = meter_of(gi)
-        if num == 1 or bar_meter != emitted_meter:
+        if gi == 0 or bar_meter != emitted_meter:
             attrs = ET.SubElement(measure, "attributes")
-            if num == 1:
+            if gi == 0:
                 ET.SubElement(attrs, "divisions").text = str(divisions)
             time = ET.SubElement(attrs, "time")
             ET.SubElement(time, "beats").text = str(bar_meter[0])
             ET.SubElement(time, "beat-type").text = str(bar_meter[1])
-            if num == 1:
+            if gi == 0:
                 clef = ET.SubElement(attrs, "clef")
                 ET.SubElement(clef, "sign").text = "percussion"
                 ET.SubElement(clef, "line").text = "2"
@@ -1078,15 +1315,43 @@ def write_musicxml(grids: list[BarGrid], out: Path,
         slots = bar_slots(meter_of(gi))
         span = rest_bars.get(gi, 1)
         if span > 1:
-            # A multirest: N whole-measure rests, not one bar.
-            for _ in range(span):
+            # A multirest: N whole-measure rests, not one bar. The marker
+            # lets the app collapse them back into the printed "13".
+            for k in range(span):
                 m = open_measure(gi)
+                if k == 0:
+                    attrs = m.find("attributes")
+                    if attrs is None:
+                        attrs = ET.SubElement(m, "attributes")
+                    style = ET.SubElement(attrs, "measure-style")
+                    ET.SubElement(style, "multiple-rest").text = str(span)
                 note = ET.SubElement(m, "note")
                 ET.SubElement(note, "rest", measure="yes")
                 ET.SubElement(note, "duration").text = str(slots)
                 ET.SubElement(note, "voice").text = "1"
             continue
         measure = open_measure(gi)
+        if not any(0 <= h.slot < slots and any(i in KIT for i in h.instruments)
+                   for h in grid.hits):
+            # No strikes: write the rests the page prints, as printed
+            # (Newzik does the same, so a pickup stays a pickup), or one
+            # measure rest when the page shows nothing else.
+            shown = printed.get(gi) or []
+            if shown and sum(shown) <= slots:
+                for n in shown:
+                    _add_rest(measure, n, 1)
+            else:
+                note = ET.SubElement(measure, "note")
+                ET.SubElement(note, "rest", measure="yes")
+                ET.SubElement(note, "duration").text = str(slots)
+                ET.SubElement(note, "voice").text = "1"
+            if grid.dynamic:
+                direction = ET.SubElement(measure, "direction",
+                                          placement="below")
+                dtype = ET.SubElement(direction, "direction-type")
+                dyn = ET.SubElement(dtype, "dynamics")
+                ET.SubElement(dyn, grid.dynamic)
+            continue
         if grid.dynamic:
             direction = ET.SubElement(measure, "direction",
                                       placement="below")
@@ -1095,9 +1360,16 @@ def write_musicxml(grids: list[BarGrid], out: Path,
             ET.SubElement(dyn, grid.dynamic)
 
         by_voice: dict[int, dict[int, list]] = {1: {}, 2: {}}
+        long_at: dict[tuple[int, int], tuple[int | None, int]] = {}
         for hit in grid.hits:
             if not 0 <= hit.slot < slots:
                 continue
+            if hit.length or hit.tremolo:
+                # the void head is one note of the chord: the upper
+                # voice's (snare roll over a kick), never the kick
+                for inst in hit.instruments:
+                    if inst in KIT and KIT[inst][4] == 1:
+                        long_at[(1, hit.slot)] = (hit.length, hit.tremolo)
             for j, inst in enumerate(hit.instruments):
                 if inst not in KIT:
                     continue
@@ -1107,7 +1379,11 @@ def write_musicxml(grids: list[BarGrid], out: Path,
                 by_voice[voice].setdefault(hit.slot, []).append(
                     (inst, hit.accent, seen_step, seen_head))
 
-        for vi, voice in enumerate((1, 2)):
+        # An empty voice is not written: a bar of kick alone was getting
+        # a whole rest hung in the hi-hat voice that the page never
+        # printed (Ronen, Avihu 45-55).
+        voices = [v for v in (1, 2) if by_voice[v]]
+        for vi, voice in enumerate(voices):
             events = by_voice[voice]
             if vi == 1:
                 backup = ET.SubElement(measure, "backup")
@@ -1121,6 +1397,10 @@ def write_musicxml(grids: list[BarGrid], out: Path,
                     cursor = slot
                 nxt = onsets[k + 1] if k + 1 < len(onsets) else slots
                 duration = _strike_slots(max(nxt - slot, 1))
+                held = long_at.get((voice, slot))
+                if held and held[0] and slot + held[0] <= nxt:
+                    duration = held[0]
+                tremolo = held[1] if held else 0
                 name, dots = _DUR_TYPES[duration]
                 for j, (inst, accent, seen_step, seen_head) in \
                         enumerate(events[slot]):
@@ -1149,10 +1429,15 @@ def write_musicxml(grids: list[BarGrid], out: Path,
                         "up" if voice == 1 else "down"
                     if head:
                         ET.SubElement(note, "notehead").text = head
-                    if accent and j == 0:
+                    if (accent or tremolo) and j == 0:
                         notations = ET.SubElement(note, "notations")
-                        artic = ET.SubElement(notations, "articulations")
-                        ET.SubElement(artic, "accent")
+                        if accent:
+                            artic = ET.SubElement(notations, "articulations")
+                            ET.SubElement(artic, "accent")
+                        if tremolo:
+                            orn = ET.SubElement(notations, "ornaments")
+                            ET.SubElement(orn, "tremolo", type="single").text = \
+                                str(tremolo)
                     if j == 0 and duration < 4:
                         beamable.append((note, slot, duration))
                 cursor = slot + duration
@@ -1311,6 +1596,13 @@ def _known_term(text: str) -> str | None:
     for term in _TERMS:
         if cleaned.lower() == term.lower().strip("."):
             return term
+    # One wrong letter in a short word is OCR, not another word: the
+    # page prints "Cym." where Tesseract read "Gym." (Avihu bar 52).
+    for term in _TERMS:
+        t = term.lower().strip(".")
+        if len(t) >= 3 and len(t) == len(cleaned) and sum(
+                a != b for a, b in zip(cleaned.lower(), t)) == 1:
+            return term
     best, score = None, 0.0
     for term in _TERMS:
         ratio = SequenceMatcher(None, cleaned.lower(),
@@ -1338,7 +1630,7 @@ def place_words(omr_path: Path, out: Path, crops: list[dict],
 
     # measure number of each crop, once multirests are expanded
     measure_of: dict[int, int] = {}
-    measure = 1
+    measure = 0 if crops and crops[0].get("pickup") else 1
     for i, crop in enumerate(crops):
         measure_of[crop["stack"]] = measure
         measure += rest_bars.get(i, 1)
@@ -1365,9 +1657,11 @@ def place_words(omr_path: Path, out: Path, crops: list[dict],
             sentences = []
             for sentence in root.iter("sentence"):
                 b = sentence.find("bounds")
-                # Titles and composer credits belong to the header, and a
-                # bare number is the printed bar number, not an instruction.
-                if b is None or sentence.get("role") == "CreatorLyricist":
+                # Audiveris files a tempo word printed above the first
+                # system under CreatorLyricist ("Allegro" on Avihu), so the
+                # role cannot decide what is an instruction; the vocabulary
+                # does. A bare number is the printed bar number.
+                if b is None:
                     continue
                 sx, sy = float(b.get("x")), float(b.get("y"))
                 sw, sh = float(b.get("w")), float(b.get("h"))
@@ -1392,13 +1686,19 @@ def place_words(omr_path: Path, out: Path, crops: list[dict],
                 top = float(line.get("y")) if line is not None else None
                 stacks = system.findall("stack")
                 starts = [float(s.get("left")) for s in stacks]
+                ends = [float(s.get("right")) for s in stacks]
                 for cx, sy, text in sentences:
                     if top is None or not (top - 220 < sy < top):
                         continue  # belongs to another system
                     if not starts:
                         continue
-                    si = min(range(len(starts)),
-                             key=lambda i: abs(starts[i] - cx))
+                    # The word belongs to the bar it sits over. The nearest
+                    # bar START put "Cym." (right half of bar 1) on bar 2 and
+                    # "Larghetto" (over a narrow multirest) a bar late.
+                    over = [i for i in range(len(stacks))
+                            if starts[i] <= cx <= ends[i]]
+                    si = over[0] if over else min(
+                        range(len(starts)), key=lambda i: abs(starts[i] - cx))
                     found.append((stack_ordinal + si, text))
                 stack_ordinal += len(stacks)
 
@@ -1427,13 +1727,63 @@ def place_words(omr_path: Path, out: Path, crops: list[dict],
     return placed
 
 
+def place_fermatas(omr_path: Path, out: Path, crops: list[dict],
+                   rest_bars: dict[int, int]) -> int:
+    """A fermata over a rest or note, where the page prints one."""
+    from drum_overlay import bar_objects
+
+    objects = bar_objects(omr_path)
+    measure_of: dict[int, int] = {}
+    measure = 0 if crops and crops[0].get("pickup") else 1
+    for i, crop in enumerate(crops):
+        measure_of[crop["stack"]] = measure
+        measure += rest_bars.get(i, 1)
+    tree = ET.parse(out)
+    part = tree.getroot().find("part")
+    by_number = {m.get("number"): m for m in part.findall("measure")}
+    placed = 0
+    for stack, obj in objects.items():
+        if not obj["fermatas"] or stack not in measure_of:
+            continue
+        m = by_number.get(str(measure_of[stack]))
+        if m is None:
+            continue
+        # voice-1 notes with their slot span
+        spans, t = [], 0
+        for n in m.findall("note"):
+            if n.find("voice") is not None and n.find("voice").text != "1":
+                break
+            d = n.find("duration")
+            d = int(d.text) if d is not None else 0
+            if n.find("chord") is None:
+                spans.append((t, t + d, n))
+                t += d
+        if not spans:
+            continue
+        total = t or 1
+        for x in obj["fermatas"]:
+            frac = (x - obj["x0"]) / max(obj["x1"] - obj["x0"], 1)
+            slot = frac * total
+            target = next((n for a, b, n in spans if a <= slot < b), spans[-1][2])
+            if target.find(".//fermata") is not None:
+                continue
+            notations = target.find("notations")
+            if notations is None:
+                notations = ET.SubElement(target, "notations")
+            ET.SubElement(notations, "fermata", type="upright")
+            placed += 1
+    if placed:
+        tree.write(out, encoding="UTF-8", xml_declaration=True)
+    return placed
+
+
 def apply_structure(work_dir: Path, out: Path, omr: Path,
                     hbars: list[dict]) -> None:
     """Give the drum score the same structure the melodic pipeline builds:
     printed tempo, repeat barlines and voltas, and rehearsal letters placed
     by their pixel position."""
     sys.path.insert(0, str(BENCH_DIR.parent / "app"))
-    from fix_hbars import place_rehearsals
+    from fix_hbars import place_hairpins, place_rehearsals
     from fix_tempo import fix as fix_tempo
     from postprocess import graft_barlines, measure_signature  # noqa: F401
 
@@ -1460,6 +1810,12 @@ def apply_structure(work_dir: Path, out: Path, omr: Path,
             print(f"  {grafted} repeat/ending barlines grafted", flush=True)
 
     placed = place_rehearsals(omr, out, hbars)
+    # Drum charts engrave hairpins above the staff, under the dynamics
+    # line; a part below. Both bands are tried, duplicates are skipped.
+    wedges = place_hairpins(omr, out, hbars, band="above") \
+        + place_hairpins(omr, out, hbars)
+    if wedges:
+        print(f"  {wedges} hairpins placed", flush=True)
     if placed:
         print(f"  {placed} rehearsal letters placed", flush=True)
 
@@ -1515,6 +1871,10 @@ def main():
     if "--recalibrate" in sys.argv and raw_cache.exists():
         readings = [BarReading.model_validate(r)
                     for r in json.loads(raw_cache.read_text())]
+        if "--snap" in sys.argv:
+            readings = snap_slots(crops, readings, omr)
+        if "--no-ink" not in sys.argv:
+            readings = refine_from_ink(crops, readings, omr)
         transcribe_gemini.last_readings = readings
         step_map = calibrate(readings)
         read_grids = [reading_to_grid(r, step_map) for r in readings]
@@ -1590,10 +1950,18 @@ def main():
         if tempos:
             print(f"  {len(tempos)} printed tempo marks: "
                   f"{sorted(set(tempos.values()))}", flush=True)
+    by_stack = printed_rests(omr)
+    printed = {gi: by_stack[c["stack"]] for gi, c in enumerate(crops)
+               if c["stack"] in by_stack}
+    pickups = {gi for gi, c in enumerate(crops) if c.get("pickup")}
     write_musicxml(grids, out, title=out.stem, rest_bars=rest_bars,
-                   meters=meters, tempos=tempos)
+                   meters=meters, tempos=tempos, printed=printed,
+                   pickups=pickups)
     apply_structure(work_dir, out, omr, hbars)
     words = place_words(omr, out, crops, rest_bars)
+    fermatas = place_fermatas(omr, out, crops, rest_bars)
+    if fermatas:
+        print(f"  {fermatas} fermatas placed", flush=True)
     if words:
         print(f"  {words} printed instructions placed (Allegro, Cym., …)",
               flush=True)
