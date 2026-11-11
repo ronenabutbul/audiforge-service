@@ -207,11 +207,15 @@ class Sheet:
         # from a copy with every recognised word blanked
         self.marksink = self.nolines & ~self.thinlines
         self.equals = []
+        # words of two letters or more (a "3" alone is not one)
+        self.wordboxes = []
         for w in root.iter("word"):
             b = w.find("bounds")
             value = (w.get("value") or "").strip()
             if b is None:
                 continue
+            if len(value) >= 2 and sum(ch.isalpha() for ch in value) >= 1:
+                self.wordboxes.append(tuple(float(b.get(k)) for k in ("x", "y", "w", "h")))
             if value.startswith("=") or value[:1].isdigit() and "=" in value:
                 self.equals.append((float(b.get("x")), float(b.get("y")) + float(b.get("h")) / 2))
             # words, and the open/closed marks over a hi-hat line
@@ -324,7 +328,17 @@ class Sheet:
             & cv2.dilate(self.linemask.astype(np.uint8), np.ones((3, 1), np.uint8))
         found = []
         # ...and only an open, clean cross there: a roll slash on a line
-        # through a stem is heavier ink
+        # through a stem is heavier ink, and a grace note's flag beside
+        # its slash is solid ink a small square fits in
+        solid = cv2.morphologyEx(self.nolines.astype(np.uint8), cv2.MORPH_OPEN,
+                                 np.ones((sq, sq), np.uint8))
+        r = int(0.6 * il)
+        on_line = on_line.copy()
+        n, _lab, _st, cents = cv2.connectedComponentsWithStats(on_line)
+        for i in range(1, n):
+            cx, cy = int(cents[i][0]), int(cents[i][1])
+            if solid[max(cy - r, 0):cy + r, max(cx - r, 0):cx + r].any():
+                on_line[_lab == i] = 0
         for mask, most in ((both, 0.42), (on_line, 0.28)):
             n, _lab, stats, cents = cv2.connectedComponentsWithStats(mask)
             for i in range(1, n):
@@ -747,6 +761,36 @@ class Sheet:
                 return True
         return False
 
+    def digit(self, glyph: tuple) -> str | None:
+        """The digit one glyph (an entry of `self.glyphs`) prints, read by
+        Tesseract twice (as one character and as a word); None unless
+        both readings agree. Cached: a page has few candidates."""
+        cache = self.__dict__.setdefault("_digits", {})
+        if glyph in cache:
+            return cache[glyph]
+        import os
+        import subprocess
+        import tempfile
+        x, y, w, h, k = glyph
+        mask = (self._labels[y:y + h, x:x + w] == k).astype(np.uint8)
+        pad = max(h // 2, 4)
+        img = (np.pad(1 - mask, pad, constant_values=1) * 255).astype(np.uint8)
+        f = 64 / img.shape[0]
+        img = cv2.resize(img, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+        env = {"TESSDATA_PREFIX": str(BENCH_DIR / "tools" / "tessdata"),
+               "PATH": "/opt/homebrew/bin:/usr/bin:/bin" + os.pathsep + os.environ.get("PATH", "")}
+        reads = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = f"{tmp}/g.png"
+            cv2.imwrite(path, img)
+            for psm in ("10", "8"):
+                r = subprocess.run(["tesseract", path, "-", "--psm", psm, "-c",
+                                    "tessedit_char_whitelist=0123456789"],
+                                   capture_output=True, text=True, env=env)
+                reads.append(r.stdout.strip())
+        cache[glyph] = reads[0] if reads[0] and reads[0] == reads[1] else None
+        return cache[glyph]
+
     def diamond(self, cx: float, cy: float) -> bool:
         """A filled head drawn as a diamond (a ride bell): pointed at top
         and bottom, its sides straight lines meeting at the widest row in
@@ -830,8 +874,11 @@ class Sheet:
         n, _lab, stats, _c = cv2.connectedComponentsWithStats(box)
         for i in range(1, n):
             _x, _y, w, h, a = stats[i]
+            # a dot stands free: a piece cut off by the box's edge (a
+            # flag's tail running in from above) is not one
             if 0.14 * il <= w <= 0.5 * il and 0.14 * il <= h <= 0.5 * il \
-                    and a >= 0.6 * w * h and _x > 0 and _x + w < box.shape[1]:
+                    and a >= 0.6 * w * h and _x > 0 and _x + w < box.shape[1] \
+                    and _y > 0 and _y + h < box.shape[0]:
                 return True
         return False
 
@@ -985,6 +1032,7 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
         if not e.get("rest"):
             e["diamonds"] = [(hx, hy) for hx, hy, k in e["heads"]
                              if k == "normal" and sheet.diamond(hx, hy)]
+    _read_triplets(sheet, bar, events)
     _attach_signs(sheet, bar, events)
     # a grace note leans on the next note to its right
     for gx, gy, _gs in sheet.graces:
@@ -1032,6 +1080,86 @@ def _attach_signs(sheet: Sheet, bar: dict, events: list[dict]) -> None:
             name = kind if kind in ("open", "closed") else kind + ("@above" if above else "@below")
             if name not in best[1].setdefault("signs", []):
                 best[1]["signs"].append(name)
+
+
+def _read_triplets(sheet: Sheet, bar: dict, events: list[dict]) -> None:
+    """A "3" over the stem tips of three notes (or under them, for the
+    lower voice), with or without a bracket: the three notes take the
+    time of two. Their values become two thirds of what they print
+    ("nominal" keeps the printed value) and they share a "tuplet" id."""
+    il, top = bar["il"], bar["top"]
+    notes = [e for e in events if not e.get("rest") and e["voice"] in (1, 2)]
+    if len(notes) < 3:
+        return
+    for glyph in sheet.glyphs:
+        gx, gy, gw, gh, _k = glyph
+        cx, cy = gx + gw / 2, gy + gh / 2
+        if not (bar["x0"] < cx < bar["x1"]) \
+                or not (0.55 * il <= gh <= 1.6 * il and 0.35 * il <= gw <= 1.2 * il
+                        and gh >= 1.1 * gw):
+            continue
+        above = cy < top + 2 * il
+        voice = 1 if above else 2
+        line = sorted((e for e in events if e["voice"] == voice and not e.get("tuplet")),
+                      key=lambda e: e["x"])
+        # stem tips of this voice near the digit, on its far side
+        tips = [e for e in line if not e.get("rest") and e.get("tip") is not None
+                and abs(e["x"] - cx) < 4 * il
+                and (0 < e["tip"] - cy < 3.2 * il if above else 0 < cy - e["tip"] < 3.2 * il)]
+        # a letter of a printed word ("Someone Like You") is not a 3:
+        # a tuplet's digit has no letter-sized neighbour on its line
+        # (a bracket's arms are long and flat, not letters)
+        if any(wx - 2 <= cx <= wx + ww + 2 and wy - 2 <= cy <= wy + wh + 2
+               for wx, wy, ww, wh in sheet.wordboxes):
+            continue
+        if any(o is not glyph and abs(o[1] + o[3] / 2 - cy) < 0.5 * gh
+               and 0.4 * gh <= o[3] <= 1.6 * gh and o[2] <= 1.5 * gh
+               and min(abs(o[0] - (gx + gw)), abs(gx - (o[0] + o[2]))) < 0.6 * il
+               for o in sheet.glyphs):
+            continue
+        if not tips or sheet.digit(glyph) != "3":
+            continue
+        cols: list[list[dict]] = []
+        for e in line:
+            if cols and e["x"] - cols[-1][0]["x"] < 0.7 * il:
+                cols[-1].append(e)
+            else:
+                cols.append([e])
+        if len(cols) < 3:
+            continue
+        best = min(range(len(cols) - 2), key=lambda k: abs(
+            np.mean([cols[k + j][0]["x"] for j in range(3)]) - cx))
+        group = cols[best:best + 3]
+        values = {min(c["value"] for c in col) for col in group}
+        if len(values) != 1 or abs(np.mean([c[0]["x"] for c in group]) - cx) > 2.5 * il:
+            continue
+        tid = f"{int(gx)}:{int(gy)}"
+        # a bracket: thin flat ink level with the digit, on both sides
+        band = sheet.thinlines[max(int(cy - 0.6 * il), 0):int(cy + 0.6 * il)]
+        left = band[:, max(int(gx - 3 * il), 0):max(int(gx - 0.1 * il), 0)].any(axis=0)
+        right = band[:, int(gx + gw + 0.1 * il):int(gx + gw + 3 * il)].any(axis=0)
+        bracket = bool(left.size and right.size and left.mean() > 0.4 and right.mean() > 0.4)
+        sheet.__dict__.setdefault("_brackets", {})[tid] = bracket
+        for col in group:
+            for e in col:
+                e["nominal"] = e["value"]
+                e["value"] = e["value"] * Fraction(2, 3)
+                e["tuplet"] = tid
+
+
+def bar_tuplets(events: list[dict], brackets: dict | None = None) -> list[dict]:
+    """The writer's tuplet list for a timed bar: one entry per "3" read."""
+    out = []
+    for tid in sorted({e["tuplet"] for e in events if e.get("tuplet")}):
+        members = [e for e in events if e.get("tuplet") == tid and e.get("slot") is not None]
+        if not members:
+            continue
+        start = min(e["slot"] for e in members)
+        last = max(members, key=lambda e: e["slot"])
+        out.append({"voice": members[0]["voice"], "start": str(start),
+                    "end": str(last["slot"] + last["value"]), "actual": 3, "normal": 2,
+                    "bracket": bool((brackets or {}).get(tid))})
+    return out
 
 
 def repeat_signs(ink: np.ndarray, top: float, il: float, x0: float, x1: float
@@ -1231,7 +1359,7 @@ def _time_assign(read: dict, il: float) -> tuple[list[dict], str | None]:
         if e.get("rest"):
             e["voice"] = voice[id(e)]
         e["slot"], e["value"] = times[id(e)]
-    if any(e["slot"].denominator != 1 for e in notes):
+    if any(e["slot"].denominator != 1 and not e.get("tuplet") for e in notes):
         return events, "off-grid"
     return events, None
 
@@ -1346,7 +1474,7 @@ def _time_once(read: dict, il: float, mode: str) -> tuple[list[dict], str | None
     if any(e != slots for e in ends):
         problem = "voices end at " + "/".join(str(float(cursor[v])) for v in (1, 2)) \
             + f" of {slots}"
-    if any(e.get("slot") is not None and e["slot"].denominator != 1
+    if any(e.get("slot") is not None and e["slot"].denominator != 1 and not e.get("tuplet")
            for e in events if not e.get("rest")):
         problem = (problem or "") + " off-grid"
     return events, problem
@@ -1557,6 +1685,8 @@ def read_chart(omr: Path) -> list[dict]:
                         strikes += _strikes_of(e, bar)
                     out.append({"ordinal": ordinal, "part": part, "sheet": name,
                                 "strikes": strikes, "problem": problem, "events": events,
+                                "tuplets": bar_tuplets(events, sheet.__dict__.get("_brackets"))
+                                if not problem else [],
                                 "slots": slots, "bar": bar,
                                 "repeat": bar_repeat(ink, bar)})
                 ordinal += 1
