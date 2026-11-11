@@ -862,6 +862,11 @@ class Sheet:
                 continue
             fill = float(blob[:, cols[0]:cols[-1] + 1].mean())
             kind = "normal" if fill >= 0.62 else ("circled_x" if h >= 1.25 * il else "x")
+            # a beam runs on past the window's outer edge; a head ends
+            # inside it
+            outer = blob[:, -1] if side > 0 else blob[:, 0]
+            if outer.mean() > 0.3:
+                continue
             if narrow and kind != "x":
                 continue
             if kind == "x":
