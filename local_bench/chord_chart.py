@@ -406,11 +406,25 @@ def _read_token(names: Names, tok: list[dict], cap: float, base: float) -> str:
         else:
             runs.append((raised, list(g)))
     text = "".join(_read_run(names, parts, cap) for _raised, parts in runs)
+    if text[:1] in ("E", "F") and glyphs:
+        text = _e_or_f(names, glyphs[0]) + text[1:]
     if parse_chord(tidy(text)) is None:
         again = "".join(_read_run(names, parts, cap, alone=True) for _raised, parts in runs)
         if parse_chord(tidy(again)) is not None:
             return again
     return text
+
+
+def _e_or_f(names: Names, g: list[dict]) -> str:
+    """E and F differ by the bar along the foot: under an E the ink runs
+    the whole width, under an F only the stem and its serif."""
+    x0 = min(p["x"] for p in g)
+    x1 = max(p["x"] + p["w"] for p in g)
+    y0 = min(p["y"] for p in g)
+    y1 = max(p["y"] + p["h"] for p in g)
+    m = np.isin(names.lab[y0:y1, x0:x1], [p["i"] for p in g])
+    foot = m[-max(int(0.2 * (y1 - y0)), 1):].any(axis=0).mean()
+    return "E" if foot > 0.8 else "F"
 
 
 def _glyphs(tok: list[dict]) -> list[list[dict]]:
