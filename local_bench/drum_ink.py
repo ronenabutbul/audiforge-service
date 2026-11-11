@@ -121,7 +121,8 @@ class Sheet:
             if value.startswith("=") or value[:1].isdigit() and "=" in value:
                 self.equals.append((float(b.get("x")), float(b.get("y")) + float(b.get("h")) / 2))
             # words, and the open/closed marks over a hi-hat line
-            if sum(ch.isalpha() for ch in value) < 3 and not (
+            # ... and a metronome mark, whose little note has a stem
+            if sum(ch.isalpha() for ch in value) < 3 and "=" not in value and not (
                     value and all(ch in "+o0O°" for ch in value)):
                 continue
             x, y = int(float(b.get("x"))), int(float(b.get("y")))
@@ -340,12 +341,19 @@ class Sheet:
         best = (0, 0)
         for side, other, sign in ((left, right, -1), (right, left, 1)):
             beams = slashes = 0
-            for y in side:
-                if ink_near(sign * 1.25 * il, y) and ink_near(sign * 1.65 * il, y):
+            crossed = False
+            # from the tip towards the head: beams sit at the tip, roll
+            # slashes between them and the head, so nothing past a slash
+            # is a beam (a tie leaving the head looks like one)
+            for y in sorted(side, key=lambda v: toward * (v - tip)):
+                both = any(abs(y - oy) < 1.1 * il for oy in other)
+                if crossed:
+                    slashes += 1 if both else 0
+                elif ink_near(sign * 1.25 * il, y) and ink_near(sign * 1.65 * il, y):
                     beams += 1          # goes on: a beam (or a long flag)
-                elif any(abs(y - oy) < 1.1 * il for oy in other) \
-                        and not ink_near(-sign * 1.65 * il, y):
+                elif both and not ink_near(-sign * 1.65 * il, y):
                     slashes += 1
+                    crossed = True
                 else:
                     beams += 1          # a stub or a flag
             if (beams, slashes) > best:
@@ -1085,8 +1093,12 @@ def ink_readings(crops: list[dict], omr: Path, rest_counts: dict | None = None):
                 seen.add((slot, step))
                 head = "normal" if kind == "void" else kind
                 length = int(value) if value and (value > 4 or kind == "void") else None
+                sure = not bar["problem"] and voice in (1, 2) and value \
+                    and float(value).is_integer()
                 strikes.append(Strike(slot=slot, step=step, head=head, length=length,
-                                      tremolo=min(trem, 3)))
+                                      tremolo=min(trem, 3),
+                                      voice=voice if sure else None,
+                                      value=int(value) if sure else None))
         readings.append(BarReading(strikes=strikes))
     return readings, unsure
 

@@ -140,6 +140,12 @@ class Strike(BaseModel):
     # and slashes on its stem make it a roll.
     length: int | None = None
     tremolo: int = 0
+    # The page's own voice (1 = stem up, 2 = stem down) and printed value
+    # in 16th slots, when the ink reader is sure of them. With these the
+    # writer engraves what the page prints instead of the textbook voice
+    # of each kit piece and the longest value that fits.
+    voice: int | None = None
+    value: int | None = None
 
 
 class BarReading(BaseModel):
@@ -163,6 +169,9 @@ class Hit(BaseModel):
     # kit position, so the output engraves like the source
     steps: list[int] = []
     heads: list[str] = []
+    voices: list[int] = []      # 0 = not known
+    values: list[int] = []      # 0 = not known
+    tremolos: list[int] = []
 
 
 def calibrate(readings: list["BarReading"]) -> dict:
@@ -227,7 +236,7 @@ def calibrate(readings: list["BarReading"]) -> dict:
 def reading_to_grid(reading: "BarReading",
                     step_map: dict | None = None) -> "BarGrid":
     """Map seen positions to kit pieces via POSITION_MAP."""
-    by_slot: dict[int, list[tuple[str, bool, int, str]]] = {}
+    by_slot: dict[int, list[tuple]] = {}
     long: dict[int, tuple[int | None, int]] = {}
     for strike in reading.strikes:
         table = step_map or STEP_MAP
@@ -238,15 +247,19 @@ def reading_to_grid(reading: "BarReading",
         if inst is None:
             continue
         by_slot.setdefault(strike.slot, []).append(
-            (inst, strike.accent, strike.step, strike.head))
+            (inst, strike.accent, strike.step, strike.head,
+             strike.voice or 0, strike.value or 0, strike.tremolo))
         if strike.length or strike.tremolo:
             long[strike.slot] = (strike.length, strike.tremolo)
     return BarGrid(
         is_repeat_of_previous=reading.is_repeat_of_previous,
-        hits=[Hit(slot=s, instruments=[i for i, _, _, _ in v],
-                  accent=any(a for _, a, _, _ in v),
-                  steps=[st for _, _, st, _ in v],
-                  heads=[h for _, _, _, h in v],
+        hits=[Hit(slot=s, instruments=[t[0] for t in v],
+                  accent=any(t[1] for t in v),
+                  steps=[t[2] for t in v],
+                  heads=[t[3] for t in v],
+                  voices=[t[4] for t in v] if any(t[4] for t in v) else [],
+                  values=[t[5] for t in v] if any(t[5] for t in v) else [],
+                  tremolos=[t[6] for t in v] if any(t[4] for t in v) else [],
                   length=long.get(s, (None, 0))[0],
                   tremolo=long.get(s, (None, 0))[1])
               for s, v in sorted(by_slot.items())],
@@ -1374,10 +1387,14 @@ def write_musicxml(grids: list[BarGrid], out: Path,
                 if inst not in KIT:
                     continue
                 voice = KIT[inst][4]
+                if j < len(hit.voices) and hit.voices[j] in (1, 2):
+                    voice = hit.voices[j]      # the page's own voice
                 seen_step = hit.steps[j] if j < len(hit.steps) else None
                 seen_head = hit.heads[j] if j < len(hit.heads) else None
+                value = hit.values[j] if j < len(hit.values) else 0
+                trem = hit.tremolos[j] if j < len(hit.tremolos) else 0
                 by_voice[voice].setdefault(hit.slot, []).append(
-                    (inst, hit.accent, seen_step, seen_head))
+                    (inst, hit.accent, seen_step, seen_head, value, trem))
 
         # An empty voice is not written: a bar of kick alone was getting
         # a whole rest hung in the hi-hat voice that the page never
@@ -1401,8 +1418,15 @@ def write_musicxml(grids: list[BarGrid], out: Path,
                 if held and held[0] and slot + held[0] <= nxt:
                     duration = held[0]
                 tremolo = held[1] if held else 0
+                page_values = [e[4] for e in events[slot] if e[4]]
+                if page_values:
+                    # the value the page prints; what is left is its rests
+                    value = min(page_values)
+                    if value in _DUR_TYPES and slot + value <= nxt:
+                        duration = value
+                    tremolo = max(e[5] for e in events[slot])
                 name, dots = _DUR_TYPES[duration]
-                for j, (inst, accent, seen_step, seen_head) in \
+                for j, (inst, accent, seen_step, seen_head, _v, _t) in \
                         enumerate(events[slot]):
                     step, octave, head, midi, _ = KIT[inst]
                     # engrave where the ORIGINAL put the note, so the
