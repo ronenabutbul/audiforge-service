@@ -10,13 +10,13 @@ Mirrors the audiforge/syncsheet conversion contract:
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import re
 import shutil
 import subprocess
 import uuid
 import xml.etree.ElementTree as ET
-import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, Thread
@@ -25,13 +25,12 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pdf2image import convert_from_path
 
-from app import audiveris_local, postprocess, resource_usage
-from app.transpose import apply_transpose
+from app import audiveris_local, pipeline, resource_usage
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("omr-service")
 
-DATA_DIR = Path("/tmp/omr-jobs")
+DATA_DIR = Path(os.environ.get("OMR_JOBS_DIR", "/tmp/omr-jobs"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 RENDER_DPI = 300
@@ -159,104 +158,6 @@ def title_from_filename(filename: str | None) -> str:
     return without_id or stem or "Untitled"
 
 
-def _apply_metadata(result_path: Path, piece_title: str):
-    """Set work/movement title and part name from the uploaded filename.
-
-    homr only transcribes notation; titles default to its own guess and the
-    part name to "Voice". Filenames like "Abba Gold - Clarinet 1.pdf" carry
-    both the piece title and the part name.
-    """
-    title, part_name = piece_title, None
-    if " - " in piece_title:
-        title, part_name = (s.strip() for s in piece_title.rsplit(" - ", 1))
-
-    tree = ET.parse(result_path)
-    root = tree.getroot()
-    if root.tag != "score-partwise":
-        return
-
-    work = root.find("work")
-    if work is None:
-        work = ET.Element("work")
-        root.insert(0, work)
-    work_title = work.find("work-title")
-    if work_title is None:
-        work_title = ET.SubElement(work, "work-title")
-    work_title.text = title
-
-    # The title goes in one place only. Writing it to movement-title as well
-    # makes a renderer that draws both - OSMD draws a title and a subtitle -
-    # print the same words twice down the top of the first page. homr's own
-    # guess lives there too ("Brown", "Voice"), so an existing one is
-    # cleared rather than left to show under the real title.
-    movement_title = root.find("movement-title")
-    if movement_title is not None:
-        root.remove(movement_title)
-
-    if part_name:
-        for name_el in root.findall("part-list/score-part/part-name"):
-            name_el.text = part_name
-
-    tree.write(result_path, encoding="UTF-8", xml_declaration=True)
-
-
-def _fix_rhythm(result_path: Path) -> dict:
-    """Validate each measure's duration against the time signature.
-
-    OMR engines miss rests; an underfull measure makes playback drift from
-    that bar onward. Pad underfull measures with a trailing rest so the bar
-    keeps its notated length, and report suspect bars for review.
-    """
-    tree = ET.parse(result_path)
-    root = tree.getroot()
-    if root.tag != "score-partwise":
-        return {}
-
-    underfull_fixed: list[int] = []
-    overfull: list[int] = []
-
-    for part in root.findall("part"):
-        divisions, beats, beat_type = 1, 4, 4
-        for measure in part.findall("measure"):
-            attrs = measure.find("attributes")
-            if attrs is not None:
-                if (d := attrs.findtext("divisions")) is not None:
-                    divisions = int(d)
-                time_el = attrs.find("time")
-                if time_el is not None:
-                    beats = int(time_el.findtext("beats") or beats)
-                    beat_type = int(time_el.findtext("beat-type") or beat_type)
-
-            expected = divisions * beats * 4 // beat_type
-            cursor = maxpos = 0
-            for el in measure:
-                if el.tag == "note":
-                    if el.find("chord") is not None or el.find("grace") is not None:
-                        continue
-                    cursor += int(el.findtext("duration") or 0)
-                elif el.tag == "backup":
-                    cursor -= int(el.findtext("duration") or 0)
-                elif el.tag == "forward":
-                    cursor += int(el.findtext("duration") or 0)
-                maxpos = max(maxpos, cursor)
-
-            number = int(measure.get("number") or 0)
-            if maxpos == 0:
-                continue  # multirest / intentionally empty
-            if maxpos < expected:
-                pad = ET.SubElement(measure, "note")
-                ET.SubElement(pad, "rest")
-                ET.SubElement(pad, "duration").text = str(expected - maxpos)
-                ET.SubElement(pad, "voice").text = "1"
-                underfull_fixed.append(number)
-            elif maxpos > expected:
-                overfull.append(number)
-
-    if underfull_fixed:
-        tree.write(result_path, encoding="UTF-8", xml_declaration=True)
-    return {"underfull_fixed": underfull_fixed, "overfull": overfull}
-
-
 def _run_homr_pipeline(job_id: str, job_dir: Path, source: Path) -> Path:
     """Render pages, run homr per page, merge to one MusicXML. Raises on failure."""
     pages = _render_pages(job_dir, source)
@@ -271,169 +172,29 @@ def _run_homr_pipeline(job_id: str, job_dir: Path, source: Path) -> Path:
         shutil.copy(outputs[0], result)
     else:
         _merge_musicxml(outputs, result)
-    ties, chords, rests = postprocess.normalize_homr(result)
-    logger.info("job %s: normalized homr output (%d ties, %d chord orders, "
-                "%d multirest measures)", job_id, ties, chords, rests)
+    logger.info("job %s: normalized homr output %s", job_id,
+                pipeline.prepare_homr(result))
     return result
 
 
-def _rhythm_score(path: Path) -> float:
-    """Fraction of measures whose durations match the time signature (0..1).
+def _run_audiveris(job_id: str, job_dir: Path, source: Path) -> tuple[Path | None, str | None]:
+    """Audiveris' MusicXML for the upload, or why there is none.
 
-    Used as a no-ground-truth quality proxy to pick the better engine —
-    higher rhythm validity correlates with a cleaner transcription.
-    """
-    try:
-        root = ET.parse(path).getroot()
-    except Exception:
-        return 0.0
-    if root.tag != "score-partwise":
-        return 0.0
-    valid = total = 0
-    for part in root.findall("part"):
-        divisions, beats, beat_type = 1, 4, 4
-        for measure in part.findall("measure"):
-            attrs = measure.find("attributes")
-            if attrs is not None:
-                if (d := attrs.findtext("divisions")) is not None:
-                    divisions = int(d)
-                time_el = attrs.find("time")
-                if time_el is not None:
-                    beats = int(time_el.findtext("beats") or beats)
-                    beat_type = int(time_el.findtext("beat-type") or beat_type)
-            expected = divisions * beats * 4 // beat_type
-            cursor = maxpos = 0
-            for el in measure:
-                if el.tag == "note":
-                    if el.find("chord") is not None or el.find("grace") is not None:
-                        continue
-                    cursor += int(el.findtext("duration") or 0)
-                elif el.tag == "backup":
-                    cursor -= int(el.findtext("duration") or 0)
-                elif el.tag == "forward":
-                    cursor += int(el.findtext("duration") or 0)
-                maxpos = max(maxpos, cursor)
-            total += 1
-            if maxpos == 0 or maxpos == expected:
-                valid += 1
-    return valid / total if total else 0.0
-
-
-def _select_engine(candidates: dict[str, Path | None]) -> tuple[str, Path | None, dict]:
-    """Pick the engine whose output has the highest rhythm validity.
-
-    candidates: {engine_name: path_or_None}. A None means that engine
-    crashed/failed. Returns (winner_name, winner_path, scores).
-    """
-    scores = {name: (_rhythm_score(p) if p else None) for name, p in candidates.items()}
-    ranked = sorted(
-        ((name, p) for name, p in candidates.items() if p is not None),
-        key=lambda np: scores[np[0]] or 0.0,
-        reverse=True,
-    )
-    if not ranked:
-        return "none", None, scores
-    return ranked[0][0], ranked[0][1], scores
-
-
-def _repair_structure(job_id: str, job_dir: Path, result: Path,
-                      aud_path: Path) -> None:
-    """Put back what the engines dropped: multirest counts, missed
-    multirests, drifted bar numbering, and rehearsal letters.
-
-    Each step is independent and advisory — a failure leaves the score as
-    it was rather than losing the conversion.
-    """
-    from app.fix_hbars import (detect_circled_letters, detect_hbars,
-                                place_dynamics, place_endings, place_hairpins,
-                                place_rehearsals, place_repeats, place_signs,
-                                place_tempo_marks, place_text, stack_numbers)
-    from app.fix_hbars import fix as fix_hbars
-    from app.fix_multirests import fix as fix_multirest_counts
-    from app.fix_structure import fix as fix_structure
-
-    try:
-        fixed = fix_multirest_counts(job_dir, result)
-        if fixed:
-            logger.info("job %s: %d multirest counts repaired", job_id, fixed)
-    except Exception:
-        logger.exception("job %s: multirest repair failed", job_id)
-
-    try:
-        fix_structure(job_dir, result)
-    except Exception:
-        logger.exception("job %s: structure repair failed", job_id)
-
-    try:
-        updated, inserted = fix_hbars(job_dir, result)
-        if updated or inserted:
-            logger.info("job %s: H-bars — %d counts corrected, %d multirests "
-                        "inserted", job_id, updated, inserted)
-    except Exception:
-        logger.exception("job %s: H-bar reconciliation failed", job_id)
-
-    if result.read_bytes() == aud_path.read_bytes():
-        return  # Audiveris is the score itself; nothing to graft onto it
-
-    omr = next(job_dir.rglob("*.omr"), None)
-    hbars = detect_hbars(omr) if omr is not None else []
-    numbers = None
-    try:
-        numbers = stack_numbers(omr, hbars) if omr is not None else None
-        missing = postprocess.graft_missing_measures(result, aud_path)
-        if missing:
-            logger.info("job %s: %d bar(s) the base engine skipped put back "
-                        "from Audiveris", job_id, missing)
-    except Exception:
-        logger.exception("job %s: missing-bar graft failed", job_id)
-    try:
-        placed = postprocess.graft_numbered(result, aud_path, numbers)
-        if placed:
-            logger.info("job %s: %d elements placed by printed number",
-                        job_id, placed)
-    except Exception:
-        logger.exception("job %s: numbered graft failed", job_id)
-
-    if omr is not None:
-        # Circled letters are invisible to Audiveris's text OCR; read them
-        # off the page and place them with whatever it did recognise.
-        circled = []
-        try:
-            circled = detect_circled_letters(omr)
-            if circled:
-                logger.info("job %s: %d circled rehearsal letters read: %s",
-                            job_id, len(circled),
-                            "".join(c[3] for c in circled))
-        except Exception:
-            logger.exception("job %s: circled-letter detection failed", job_id)
-        try:
-            moved = place_rehearsals(omr, result, hbars, extra_marks=circled)
-            if moved:
-                logger.info("job %s: %d rehearsal letters placed", job_id, moved)
-        except Exception:
-            logger.exception("job %s: rehearsal placement failed", job_id)
-        try:
-            signs = place_signs(omr, result, hbars)
-            if signs:
-                logger.info("job %s: %d coda/segno signs placed", job_id, signs)
-        except Exception:
-            logger.exception("job %s: sign placement failed", job_id)
-        try:
-            dyn = place_dynamics(omr, result, hbars)
-            if dyn:
-                logger.info("job %s: %d dynamics placed from the project file",
-                            job_id, dyn)
-        except Exception:
-            logger.exception("job %s: dynamics placement failed", job_id)
-        for label, place in (("hairpins", place_hairpins), ("repeats", place_repeats),
-                             ("endings", place_endings), ("tempo marks", place_tempo_marks),
-                             ("text", place_text)):
-            try:
-                n = place(omr, result, hbars)
-                if n:
-                    logger.info("job %s: %d %s placed from the page", job_id, n, label)
-            except Exception:
-                logger.exception("job %s: %s placement failed", job_id, label)
+    Local only. The remote service returned MusicXML without the .omr, so
+    the structure repair had nothing to read and the fusion graft lost its
+    source of text and voltas."""
+    if source.suffix.lower() != ".pdf":
+        return None, "not run: Audiveris reads PDF uploads only"
+    if not audiveris_local.available():
+        return None, f"no Audiveris binary at {audiveris_local.AUDIVERIS_BIN}"
+    outcome = audiveris_local.convert(
+        source, job_dir / "audiveris.musicxml",
+        pages=sorted(job_dir.glob("page_???.png")) or None)
+    if outcome.pages_skipped:
+        logger.warning("job %s: audiveris read page by page, skipped %s",
+                       job_id, outcome.pages_skipped)
+        _update_job(job_id, audiveris_pages_skipped=outcome.pages_skipped)
+    return outcome.path, outcome.failure
 
 
 def _process_job(job_id: str, source: Path):
@@ -447,126 +208,53 @@ def _process_job(job_id: str, source: Path):
     try:
         _update_job(job_id, status="processing", progress=0.05)
 
-        # Run both engines; neither failure is fatal on its own.
+        # Run both engines; neither failure is fatal on its own, but each
+        # is said out loud: `engine_failures` in the status names the
+        # engine and the reason, so a result made by one engine alone is
+        # never mistaken for the full conversion.
+        failures: dict[str, str] = {}
         homr_path: Path | None = None
         try:
             homr_path = _run_homr_pipeline(job_id, job_dir, source)
         except Exception as exc:
             logger.warning("job %s: homr failed (%s)", job_id, exc)
+            failures["homr"] = str(exc)[:500]
 
-        aud_path: Path | None = None
-        if source.suffix.lower() == ".pdf":
-            _update_job(job_id, progress=0.75)
-            # Local only. The remote service returned MusicXML without the
-            # .omr, so _repair_structure below had nothing to read and the
-            # fusion graft lost its source of text and voltas. A half-run is
-            # worse than a missing half: better to let homr stand alone.
-            if audiveris_local.available():
-                aud_path = audiveris_local.convert_musicxml(
-                    source, job_dir / "audiveris.musicxml")
-            else:
-                logger.warning("job %s: no local Audiveris; homr runs alone "
-                               "and structure repair is skipped", job_id)
+        _update_job(job_id, progress=0.75)
+        aud_path, aud_failure = _run_audiveris(job_id, job_dir, source)
+        if aud_path is None:
+            logger.warning("job %s: audiveris gave no score (%s); structure "
+                           "repair is skipped", job_id, aud_failure)
+            failures["audiveris"] = aud_failure or "no MusicXML produced"
+        else:
+            restored = pipeline.prepare_audiveris(aud_path, job_dir)
+            if any(restored.values()):
+                logger.info("job %s: audiveris rests put back: %s", job_id, restored)
+        _update_job(job_id, engine_failures=failures)
 
-        engine, winner, scores = _select_engine({"homr": homr_path, "audiveris": aud_path})
-        _update_job(job_id, engine=engine, engine_scores=scores)
-        if winner is None:
-            raise RuntimeError("both engines failed to produce MusicXML")
-
-        result_path = job_dir / "result.musicxml"
-        shutil.copy(winner, result_path)
-
-        # homr wins on notes; Audiveris reads text, dynamics and volta
-        # brackets homr can't. Graft those in rather than discarding them.
-        if engine == "homr" and aud_path is not None:
-            try:
-                aligned, grafted = postprocess.graft_features(result_path, aud_path)
-                if grafted:
-                    engine = "fusion"
-                    _update_job(job_id, engine=engine)
-                logger.info("job %s: fusion grafted %d features over %d "
-                            "aligned measures", job_id, grafted, aligned)
-            except Exception:
-                logger.exception("job %s: fusion graft failed; keeping homr",
-                                 job_id)
-            try:
-                # Independent of the alignment above: the time symbol is
-                # keyed by the signature itself, so it survives a score
-                # the two engines could not align.
-                stamped = postprocess.graft_time_symbol(result_path, aud_path)
-                if stamped:
-                    logger.info("job %s: %d time signatures stamped C/cut",
-                                job_id, stamped)
-            except Exception:
-                logger.exception("job %s: time-symbol graft failed", job_id)
-
-        # Either base: Audiveris' own export carries the same OCR debris
-        # the graft would have brought in.
-        try:
-            repaired, dropped = postprocess.clean_words(result_path)
-            if repaired or dropped:
-                logger.info("job %s: words - %d repaired, %d debris dropped",
-                            job_id, repaired, dropped)
-        except Exception:
-            logger.exception("job %s: word cleanup failed", job_id)
-
-        # Structure repair, which only became possible server-side once
-        # Audiveris started running in this container: every step below
-        # reads the .omr for printed geometry the MusicXML has lost.
-        if aud_path is not None:
-            _repair_structure(job_id, job_dir, result_path, aud_path)
+        if homr_path is None and aud_path is None:
+            _update_job(job_id, engine="none",
+                        engine_scores={"homr": None, "audiveris": None})
 
         with jobs_lock:
             piece_title = jobs[job_id].get("piece_title")
-        if piece_title:
-            try:
-                _apply_metadata(result_path, piece_title)
-            except Exception:
-                logger.exception("job %s: metadata patch failed", job_id)
-        try:
-            _update_job(job_id, rhythm=_fix_rhythm(result_path))
-        except Exception:
-            logger.exception("job %s: rhythm validation failed", job_id)
-        if piece_title:
-            try:
-                part_name = piece_title.rsplit(" - ", 1)[-1]
-                if apply_transpose(result_path, part_name):
-                    _update_job(job_id, transposed=True)
-            except Exception:
-                logger.exception("job %s: transpose failed", job_id)
-
-        page1 = job_dir / "page_001.png"
-        if page1.exists():
-            try:
-                from app.fix_tempo import fix as fix_tempo
-
-                bpm = fix_tempo(page1, result_path)
-                if bpm:
-                    logger.info("job %s: tempo recovered %s BPM", job_id, bpm)
-            except Exception:
-                logger.exception("job %s: tempo OCR failed", job_id)
-            try:
-                from app.fix_titles import fix as fix_titles
-
-                for line in fix_titles(page1, result_path):
-                    logger.info("job %s: title text %s", job_id, line)
-            except Exception:
-                logger.exception("job %s: title OCR failed", job_id)
-
-        try:
-            # Last, once every bar is in place: homr writes no beams, and
-            # a page of flagged eighths reads nothing like the beamed one
-            # it came from.
-            phantom = postprocess.drop_phantom_clef_changes(result_path)
-            beamed = postprocess.beam_by_beat(result_path)
-            logger.info("job %s: %d notes beamed, %d phantom clef/key/fermata "
-                        "removed", job_id, beamed, phantom)
-        except Exception:
-            logger.exception("job %s: beaming failed", job_id)
-        try:
-            postprocess.app_compat(result_path)
-        except Exception:
-            logger.exception("job %s: app_compat failed", job_id)
+        result_path = job_dir / "result.musicxml"
+        # Everything from the engine choice to the finished file is the
+        # shared pipeline the Mac bench runs too (app/pipeline.py).
+        report = pipeline.finish(
+            job_dir, homr_path, aud_path, result_path, piece_title,
+            say=lambda line: logger.info("job %s: %s", job_id, line))
+        _update_job(
+            job_id,
+            engine=report["engine"],
+            engine_scores=report["scores"],
+            engine_reason=report["reason"],
+            rhythm=report["rhythm"],
+            warnings=report["warnings"],
+            structure_repair="done" if aud_path is not None else "skipped",
+        )
+        if report["transposed"]:
+            _update_job(job_id, transposed=True)
 
         _update_job(
             job_id,
