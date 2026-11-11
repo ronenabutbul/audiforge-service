@@ -312,7 +312,17 @@ class Sheet:
         il = self.il
         k = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (max(int(0.85 * il), 3), max(int(0.62 * il), 3)))
-        self.solid = cv2.morphologyEx(self.u8, cv2.MORPH_OPEN, k)
+        # a scan leaves pinholes of paper inside a filled head (one or two
+        # pixels); the opening cannot fit its ellipse past them and loses
+        # the head. Paper islands that small are no notation's white, a
+        # void head's is ten times larger: they are filled first.
+        holes = 1 - self.u8
+        hn, hlab, hstats, _hc = cv2.connectedComponentsWithStats(holes, connectivity=4)
+        tiny = np.flatnonzero(hstats[:, 4] <= max(3, int(0.015 * il * il)))
+        full = self.u8.copy()
+        if tiny.size:
+            full[np.isin(hlab, tiny[tiny > 0])] = 1
+        self.solid = cv2.morphologyEx(full, cv2.MORPH_OPEN, k)
         n, _lab, stats, cents = cv2.connectedComponentsWithStats(self.solid)
         self.filled = []
         single = []
