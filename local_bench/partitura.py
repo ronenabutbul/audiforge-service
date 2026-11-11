@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import io
+import re
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
@@ -2017,6 +2018,15 @@ def convert(work: Path, out: Path) -> dict:
     except Exception as exc:
         print(f"  dynamics skipped: {exc}", flush=True)
         dynamics, hairpins, texts = [], [], []
+    # "sim." after the last printed bar of a part is often taken for a
+    # lyric syllable: a lone syllable that is a word of the trade is a
+    # direction
+    for name, (_ink, root) in pages.items():
+        for el in root.iter("lyric-item"):
+            value, b = (el.get("value") or "").strip(), el.find("bounds")
+            if b is not None and re.fullmatch(r"(sim(ile)?|ad lib|a tempo|div|unis)\.?", value, re.I):
+                texts.append((_sheet_index(name), float(b.get("x")),
+                              float(b.get("y")) + float(b.get("h")) / 2, value))
     for sheet, x, y, kind in dynamics:
         hit = locator.measure_at(sheet, x, y)
         if hit is None:
@@ -2039,11 +2049,13 @@ def convert(work: Path, out: Path) -> dict:
         dtype = _direction(ms[b[0]], "below", staff_no, onset_at(b[0], x1 - system.shift(y)))
         ET.SubElement(dtype, "wedge", type="stop", number=str(number % 6 + 1))
         placed["wedges"] += 1
-    import re
     for sheet, x, y, text in texts:
         text = re.sub(r"^\W*=\s*\d+\s*", "", text).strip()
-        # a direction worth printing has a real word in it
-        if not re.search(r"[A-Za-z]*[aeiouAEIOU][A-Za-z]*", text) or len(text) < 4 \
+        # a direction worth printing has a real word in it, or is one of
+        # the short words of the trade
+        known = re.fullmatch(r"(sim(ile)?|cresc|dim|rit|rall|div|unis|ad lib|a tempo|solo|tutti)\.?",
+                             text, re.I)
+        if not known and not re.search(r"[A-Za-z]*[aeiouAEIOU][A-Za-z]*", text) or len(text) < 4 \
                 or not any(len(w) >= 3 and re.search(r"[aeiou]", w) for w in re.findall(r"[A-Za-z]+", text)):
             continue
         hit = locator.measure_at(sheet, x, y)
