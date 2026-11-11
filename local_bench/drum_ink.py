@@ -173,10 +173,23 @@ class Sheet:
     """Ink layers of one page, each answering one question."""
 
     def __init__(self, ink: np.ndarray, root: ET.Element, bars: list[dict] | None = None):
-        self.ink = ink
-        self.u8 = ink.astype(np.uint8)
         # `bars`: another staff's bars (a score reads its drum staff this way)
         self.bars = page_layout(root) if bars is None else bars
+        # a boxed bar number or letter over the staff is read on its own
+        # (`boxed_marks`); its upright sides would pass for stems and its
+        # corners for cross heads, so the boxes leave this copy of the ink
+        self.frames = []
+        for top, il, x0, x1 in {(b["top"], b["il"], b["x0"], b["x1"]) for b in self.bars}:
+            ya, yb = max(int(top - 7 * il), 0), int(top - 0.15 * il)
+            xa, xb = max(int(x0 - 2 * il), 0), int(x1)
+            for x, y, w, h in _frames(ink[ya:yb, xa:xb], il):
+                self.frames.append((xa + x, ya + y, w, h))
+        if self.frames:
+            ink = ink.copy()
+            for x, y, w, h in self.frames:
+                ink[y:y + h, x:x + w] = False
+        self.ink = ink
+        self.u8 = ink.astype(np.uint8)
         for k, b in enumerate(self.bars):
             b["k"] = k
         self.il = float(np.median([b["il"] for b in self.bars])) if self.bars else 20.0
@@ -242,6 +255,12 @@ class Sheet:
                                           float(b.get("w")), float(b.get("h"))))
         self._heads()
         self._crosses()
+        # a dynamic's letters ("ff" printed against a stem) have the
+        # crossing strokes of an x; inside a dynamic Audiveris read, no
+        # cross is a note head
+        self.dynamics = [tuple(float(el.find("bounds").get(q)) for q in "xywh")
+                         for el in root.iter("dynamics") if el.find("bounds") is not None]
+        self.crosses = [(x, y) for x, y in self.crosses if not self.in_dynamic(x, y)]
         self._rings()
         self._stems()
         self._rests(root)
@@ -434,6 +453,28 @@ class Sheet:
                 y1 += 1
             if y1 - y0 < h:
                 continue
+            # a worn scan breaks a stem short of its beam: a gap of a few
+            # pixels, then a beam (wide ink) right over it - the stem
+            # reaches the beam. Only towards a beam: a head stands beside
+            # the stem, not across it.
+            cxi = int(round(cx))
+            gap = max(int(0.3 * il), 3)
+            for end, step in ((y0, -1), (y1 - 1, 1)):
+                for d in range(2, gap + 1):
+                    yy = end + step * d
+                    if not 0 <= yy < self.u8.shape[0]:
+                        break
+                    # (a staff line is wide ink too, and is not a beam)
+                    row = self.nolines[yy, max(cxi - int(0.6 * il), 0):cxi + int(0.6 * il) + 1]
+                    if row.mean() > 0.9:
+                        # on through the beam to its far edge, as a stem goes
+                        while 0 < yy < self.u8.shape[0] - 1 and self.nolines[yy + step, cxi]:
+                            yy += step
+                        if step < 0:
+                            y0 = yy
+                        else:
+                            y1 = yy + 1
+                        break
             self.stems.append((cx, float(y0), float(y1)))
 
     def _rests(self, root: ET.Element):
@@ -547,6 +588,13 @@ class Sheet:
         k = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (max(int(0.5 * il), 3), max(int(0.38 * il), 3)))
         small = cv2.morphologyEx(self.nolines.astype(np.uint8), cv2.MORPH_OPEN, k)
+        # a small head ON a staff line loses its middle with the line and
+        # falls apart into two slivers; the opening on the full ink keeps
+        # it whole (the line itself is too thin to survive)
+        full = cv2.morphologyEx(self.u8, cv2.MORPH_OPEN, k)
+        m, flab, fstats, _fc = cv2.connectedComponentsWithStats(full)
+        online = np.unique(flab[(full > 0) & self.linemask])
+        small |= np.isin(flab, online[online > 0]).astype(np.uint8)
         # what a real head, a beam or a block leaves is not a small head
         small &= 1 - cv2.dilate(self.solid, np.ones((5, 5), np.uint8))
         barred = [tuple(float(el.find("bounds").get(q)) for q in "xywh")
@@ -554,10 +602,16 @@ class Sheet:
                               "time-number") for el in root.iter(tag)
                   if el.find("bounds") is not None]
         n, _lab, stats, cents = cv2.connectedComponentsWithStats(small)
+        upright = cv2.morphologyEx(self.nolines.astype(np.uint8), cv2.MORPH_OPEN,
+                                   np.ones((max(int(1.1 * il), 5), 1), np.uint8))
+        thin = upright & (1 - cv2.morphologyEx(upright, cv2.MORPH_OPEN,
+                                               np.ones((1, max(int(0.3 * il), 3)), np.uint8)))
+        clear = self.nolines & ~thin.astype(bool)
         self.graces = []
         for i in range(1, n):
             x, y, w, h, area = stats[i]
-            if not (0.45 * il <= w <= 0.9 * il and 0.4 * il <= h <= 0.75 * il
+            # (one on a staff line keeps a stub of the line each side)
+            if not (0.45 * il <= w <= 1.0 * il and 0.4 * il <= h <= 0.75 * il
                     and 0.18 * self.head_area <= area <= 0.45 * self.head_area):
                 continue
             cx, cy = float(cents[i][0]), float(cents[i][1])
@@ -573,7 +627,8 @@ class Sheet:
             # the head stands free: paper to its left and below-left (the
             # slash of a repeat-bar sign or of a roll runs on that way)
             def paper(xa, xb, ya, yb):
-                box = self.nolines[max(int(ya), 0):int(yb) + 1, max(int(xa), 0):int(xb) + 1]
+                # a stem there is the stem of the grace before (a drag)
+                box = clear[max(int(ya), 0):int(yb) + 1, max(int(xa), 0):int(xb) + 1]
                 return not box.size or box.mean() < 0.08
             if not (paper(cx - 1.1 * il, cx - 0.6 * il, cy - 0.25 * il, cy + 0.25 * il)
                     and paper(cx - 0.9 * il, cx - 0.4 * il, cy + 0.3 * il, cy + 0.8 * il)):
@@ -666,6 +721,10 @@ class Sheet:
                 best = (beams, slashes)
         return best
 
+    def in_dynamic(self, x: float, y: float) -> bool:
+        return any(bx <= x <= bx + bw and by <= y <= by + bh
+                   for bx, by, bw, bh in getattr(self, "dynamics", []))
+
     def stem_blobs(self, sx: float, y0: float, y1: float, side: int,
                    narrow: bool = False) -> list[tuple[float, float, str]]:
         """Heads the shape detectors missed, found the way a reader finds
@@ -714,8 +773,10 @@ class Sheet:
                     kind = "void"
                 elif narrow:
                     continue
-            found.append((max(int(xa), 0) + (cols[0] + cols[-1]) / 2,
-                          max(int(y0), 0) + (a + b) / 2, kind))
+            fx, fy = max(int(xa), 0) + (cols[0] + cols[-1]) / 2, max(int(y0), 0) + (a + b) / 2
+            if self.in_dynamic(fx, fy):
+                continue            # "ff" printed against the stem
+            found.append((fx, fy, kind))
         return found
 
     def frame_sides(self) -> set[int]:
@@ -1007,8 +1068,13 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
         events.append({"x": sx - (0.55 * il if up else -0.55 * il), "voice": 1 if up else 2,
                        "value": value, "heads": members, "marks": marks,
                        "tremolo": tremolo, "tip": tip, "sx": sx})
+    # a faint head is a small blob too; once a stem carries it, it is not
+    # a rest block, however a slanting staff line runs through it
+    hung = [(hx, hy) for e in events for hx, hy, _k in e["heads"]]
     loose += [(bx, by, "block") for bx, by in sheet.small
-              if inside(bx, by) and not on_rest(bx, by) and sheet.block(bx, by)]
+              if inside(bx, by) and not on_rest(bx, by) and sheet.block(bx, by)
+              and not any(abs(bx - hx) < 0.6 * il and abs(by - hy) < 0.5 * il
+                          for hx, hy in hung)]
     for hx, hy, kind in loose:
         if kind == "block" or kind == "normal" and sheet.block(hx, hy):
             # a half or whole rest printed off the staff for one voice
@@ -1041,7 +1107,11 @@ def read_bar(sheet: Sheet, bar: dict, slots: int) -> dict:
         after = [e for e in events if not e.get("rest") and e["voice"]
                  and 0 < min(h[0] for h in e["heads"]) - gx < 3.2 * il]
         if after:
-            target = min(after, key=lambda e: (e["x"], abs(e["heads"][0][1] - gy)))
+            # the grace's note is the next one at its own height; a note of
+            # the other voice printed under the grace is not it
+            def dy(e):
+                return min(abs(h[1] - gy) for h in e["heads"])
+            target = min(after, key=lambda e: (dy(e) > 1.2 * il, e["x"], dy(e)))
             target.setdefault("graces", []).append((gx, gy))
     return {"events": events, "slots": slots, "x1": x1}
 
@@ -1160,6 +1230,105 @@ def bar_tuplets(events: list[dict], brackets: dict | None = None) -> list[dict]:
                     "end": str(last["slot"] + last["value"]), "actual": 3, "normal": 2,
                     "bracket": bool((brackets or {}).get(tid))})
     return out
+
+
+def _read_digit(mask: np.ndarray) -> list[str]:
+    """Tesseract's readings of one printed digit (a binary mask), as one
+    character and as a word, the glyph scaled to 60 pixels tall."""
+    import os
+    import subprocess
+    import tempfile
+    ys, xs = np.nonzero(mask)
+    if not len(ys):
+        return []
+    m = mask[ys.min():ys.max() + 1, xs.min():xs.max() + 1].astype(np.uint8) * 255
+    f = 60 / m.shape[0]
+    m = cv2.resize(m, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+    img = 255 - np.pad(m, 30, constant_values=0)
+    env = {"TESSDATA_PREFIX": str(BENCH_DIR / "tools" / "tessdata"),
+           "PATH": "/opt/homebrew/bin:/usr/bin:/bin" + os.pathsep + os.environ.get("PATH", "")}
+    reads = []
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/t.png"
+        cv2.imwrite(path, img)
+        for psm in ("10", "8"):
+            r = subprocess.run(["tesseract", path, "-", "--psm", psm, "-c",
+                                "tessedit_char_whitelist=0123456789"],
+                               capture_output=True, text=True, env=env)
+            reads.append(r.stdout.strip())
+    return reads
+
+
+def ink_time_signature(ink: np.ndarray, top: float, il: float, x0: float
+                       ) -> tuple[int, int] | None:
+    """A time signature printed right after the barline at x0 that
+    Audiveris did not report (a meter change in mid line): two digits
+    stacked into one column that spans the staff from top line to bottom
+    line, the upper one on the top half, the lower one on the bottom half.
+    Nothing else in a bar is that shape: a stem runs past the staff, a
+    note column has its head on one side, a repeat sign sits in the middle
+    spaces only. Read only when the shape is there, so the cost is nil on
+    a bar without one. Upper digit 1-16, lower one 2/4/8/16; Tesseract
+    may misread one of its two passes, so any reading that names a
+    possible value is taken, the first pass first."""
+    xa, xb = int(x0 + 0.3 * il), int(x0 + 4 * il)
+    ya, yb = int(top - 0.5 * il), int(top + 4.5 * il)
+    if ya < 0 or xa < 0 or yb > ink.shape[0] or xb > ink.shape[1]:
+        return None
+    # the staff's own lines here (a skewed scan moves them a few pixels
+    # from the system's left end)
+    rows = ink[max(ya - int(il), 0):yb + int(il), xa:xb].sum(axis=1)
+    base = max(ya - int(il), 0)
+    best = max(range(-int(0.6 * il), int(0.6 * il) + 1),
+               key=lambda dy: sum(rows[int(round(top + dy + k * il)) - base]
+                                  for k in range(5)
+                                  if 0 <= int(round(top + dy + k * il)) - base < len(rows)))
+    top += best
+    ya, yb = int(top - 0.5 * il), int(top + 4.5 * il)
+    if ya < 0 or yb > ink.shape[0]:
+        return None
+    box = ink[ya:yb, xa:xb].astype(np.uint8)
+    thick = max(int(round(0.14 * il)), 2)
+    tall = cv2.morphologyEx(box, cv2.MORPH_OPEN, np.ones((2 * thick + 3, 1), np.uint8))
+    lines = np.zeros_like(box)
+    for k in range(5):
+        y = int(round(top + k * il)) - ya
+        lines[max(y - thick, 0):y + thick + 1] = 1
+    clean = (box.astype(bool) & ~(lines.astype(bool) & ~tall.astype(bool))).astype(np.uint8)
+    blob = cv2.dilate(clean, np.ones((5, 5), np.uint8))
+    n, lab, stats, _c = cv2.connectedComponentsWithStats(blob)
+    for i in range(1, n):
+        x, y, w, h, _a = stats[i]
+        if not (3.5 * il <= h and 1.0 * il <= w <= 2.4 * il and x <= 2 * il):
+            continue
+        # wholly inside the staff: from about the top line to the bottom one
+        if y < 0.1 * il or y + h > box.shape[0] - 0.1 * il:
+            continue
+        # digits have small counters at most; a drawn box (the percussion
+        # clef) encloses a hole the height of the staff
+        comp = (lab[y:y + h, x:x + w] == i).astype(np.uint8)
+        holes = cv2.connectedComponentsWithStats(1 - np.pad(comp, 1))[2][2:]
+        if any(hs[3] > 1.5 * il for hs in holes):
+            continue
+        keep = cv2.dilate((lab == i).astype(np.uint8), np.ones((7, 7), np.uint8))
+        # the two digits meet on the middle line (the base of a 2, the top
+        # of a 4): each half is read without the other's edge
+        mid = int(round(2.5 * il))
+        edge = thick + 1
+        parts = [[], []]
+        # with the staff lines taken out, then left in: a digit stroke that
+        # runs along a line (the bar of a 4) only survives the second way
+        for src in (clean, box):
+            for j, (r0, r1) in enumerate(((0, mid + edge), (mid + edge, box.shape[0]))):
+                mask = (src[r0:r1] & keep[r0:r1]).astype(bool)
+                mask[:, :max(x - 3, 0)] = False
+                mask[:, x + w + 3:] = False
+                parts[j] += _read_digit(mask)
+        upper = next((int(t) for t in parts[0] if t.isdigit() and 1 <= int(t) <= 16), None)
+        lower = next((int(t) for t in parts[1] if t in ("2", "4", "8", "16")), None)
+        if upper and lower:
+            return upper, lower
+    return None
 
 
 def repeat_signs(ink: np.ndarray, top: float, il: float, x0: float, x1: float
@@ -1376,6 +1545,10 @@ def _time_ruler(read: dict, il: float, x1: float | None) -> tuple[list[dict], st
             if e["voice"] != ruler:
                 continue
             marks.append((e["x"], t))
+            # a grace note takes room in front of its note; what the other
+            # voice prints under the grace sounds with the note
+            for gx, _gy in e.get("graces", []):
+                marks.append((gx, t))
             e["slot"] = t
             t += e["value"] or 0
         notes = [e for e in events if e["voice"] == ruler and not e.get("rest")]
@@ -1383,6 +1556,7 @@ def _time_ruler(read: dict, il: float, x1: float | None) -> tuple[list[dict], st
             continue
         if x1 is not None:
             marks.append((x1, Fraction(slots)))
+        marks.sort(key=lambda m: m[0])
         ok = True
         for e in events:
             if e["voice"] == ruler:
@@ -1480,6 +1654,68 @@ def _time_once(read: dict, il: float, mode: str) -> tuple[list[dict], str | None
     return events, problem
 
 
+def _frames(band: np.ndarray, il: float) -> list[tuple[int, int, int, int]]:
+    """(x, y, w, h) of every closed rectangular frame in a binary band
+    (a boxed bar number or letter), found by its four straight sides
+    (long flat and upright runs), not by connectivity, so print touching
+    the frame or a sign touching it from outside does not hide it. A
+    volta hook has no bottom and is not one."""
+    if band.size == 0:
+        return []
+    band = band.astype(np.uint8)
+    long = max(int(1.2 * il), 4)
+    flat = cv2.morphologyEx(band, cv2.MORPH_OPEN, np.ones((1, long), np.uint8))
+    upright = cv2.morphologyEx(band, cv2.MORPH_OPEN, np.ones((long, 1), np.uint8))
+    sides = flat | upright
+    n, _lab, stats, _c = cv2.connectedComponentsWithStats(
+        cv2.dilate(sides, np.ones((3, 3), np.uint8)))
+    out = []
+    edge = max(int(0.2 * il), 2)
+    for i in range(1, n):
+        x, y, w, h, _a = stats[i]
+        if not (1.4 * il <= w <= 6 * il and 1.4 * il <= h <= 4 * il):
+            continue
+        g = sides[y:y + h, x:x + w]
+        cover = sorted((g[:edge].any(axis=0).mean(), g[-edge:].any(axis=0).mean(),
+                        g[:, :edge].any(axis=1).mean(), g[:, -edge:].any(axis=1).mean()))
+        # one side may be broken by a faint scan, never missing
+        if cover[0] < 0.6 or cover[1] < 0.85:
+            continue
+        out.append((int(x), int(y), int(w), int(h)))
+    return out
+
+
+def _framed_text(ink: np.ndarray, xa: int, xb: int, ya: int, yb: int, il: float,
+                 ocr) -> list[tuple[int, int, str]]:
+    """[(centre x, centre y, text)] of every frame (`_frames`) in the
+    band, with the print inside read after the sides are rubbed out."""
+    from PIL import Image
+    band = ink[ya:yb, xa:xb].astype(np.uint8)
+    out = []
+    for x, y, w, h in _frames(band, il):
+        edge = max(int(0.2 * il), 2)
+        # the sides' own thickness, then everything strictly inside
+        t = edge + 1
+        inner = band[y + t:y + h - t, x + t:x + w - t].copy()
+        if inner.sum() < 0.05 * inner.size:
+            continue
+        m, lab2, st2, _c2 = cv2.connectedComponentsWithStats(inner)
+        keep = np.zeros_like(inner)
+        for j in range(1, m):
+            if st2[j][3] > 0.5 * inner.shape[0]:
+                keep[lab2 == j] = 1
+        if not keep.any():
+            continue
+        pad = int(il)
+        img = Image.fromarray(((1 - np.pad(keep, pad)) * 255).astype(np.uint8))
+        scale = max(1.0, 64 / max(inner.shape[0], 1))
+        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+        text = ocr(img, False, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        if text:
+            out.append((xa + x + w // 2, ya + y + h // 2, text))
+    return out
+
+
 def boxed_marks(omr: Path) -> list[tuple[int, int, int, str]]:
     """(sheet ordinal, x, y, text) of every boxed letter or number above a
     staff, read from the ink. Audiveris finds the boxes but reads the
@@ -1507,6 +1743,7 @@ def boxed_marks(omr: Path) -> list[tuple[int, int, int, str]]:
                 il = (_line_y(lines[-1], left) - _line_y(lines[0], left)) / 4
                 x0, y0 = max(int(left - 2 * il), 0), max(int(top - 7 * il), 0)
                 names = Names(ink, x0, int(right), y0, int(top - 0.2 * il), il)
+                here = []
                 for box in names.boxes():
                     f = box["frame"]
                     if not box["inside"] or f["w"] > 6 * il or f["h"] > 4 * il:
@@ -1514,8 +1751,21 @@ def boxed_marks(omr: Path) -> list[tuple[int, int, int, str]]:
                     text = ocr(names.image(box["inside"]), len(box["inside"]) == 1,
                                "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
                     if text:
-                        found.append((index, x0 + f["x"] + f["w"] // 2,
-                                      y0 + f["y"] + f["h"] // 2, text))
+                        here.append((index, x0 + f["x"] + f["w"] // 2,
+                                     y0 + f["y"] + f["h"] // 2, text))
+                # a frame whose print touches it (the 2 of a boxed 20) or that
+                # touches a sign beside it (a segno): the frame is not a
+                # component of its own, so read it again from its straight sides
+                for cx, cy, text in _framed_text(ink, x0, int(right), y0,
+                                                 int(top - 0.2 * il), il, ocr):
+                    near = [k for k, m in enumerate(here)
+                            if abs(m[1] - cx) < il and abs(m[2] - cy) < il]
+                    if not near:
+                        here.append((index, cx, cy, text))
+                    elif len(text) > len(here[near[0]][3]) and \
+                            text.endswith(here[near[0]][3]):
+                        here[near[0]] = (*here[near[0]][:3], text)
+                found += here
             out.extend(found)
             il = Sheet(ink, root).il
             for m in theirs:
@@ -1696,6 +1946,7 @@ def read_chart(omr: Path) -> list[dict]:
             z.read(f"{name}/{name}.xml").decode("utf-8", "replace")))
             for name in _sheets(z)}
     apply_kit_words(out, words)
+    apply_rim_words(out, words)
     return out
 
 
@@ -1704,12 +1955,21 @@ def read_chart(omr: Path) -> list[dict]:
 _BELL_WORDS = ("bell", "cup", "dome", "cymdome", "ridebell")
 _CYMBAL_WORDS = ("ride", "ridecym", "suscym", "cym", "hh", "hihat", "hithat", "crash",
                  "choke")
+# Words that say how the snare is struck: "rim." (rim click) / cross stick
+# turn the snare notes after them into the rim sound until "snare" (or
+# "Sn.") says the head again. Exact only: "rim" is one letter from "rit".
+_RIM_WORDS = ("rim", "rimclick", "crossstick", "xstick", "sidestick", "cs")
+_SNARE_WORDS = ("snare", "sn", "sd")
 
 
 def _kit_word(text: str) -> str | None:
     """'bell', 'cymbal' (a word that ends a bell passage) or None. One
     wrong letter in a word of three or more is OCR ("Gym." for "Cym.")."""
     letters = "".join(c for c in text.lower() if c.isalpha())
+    if letters in _RIM_WORDS:
+        return "rim"
+    if letters in _SNARE_WORDS:
+        return "snare"
     for kind, terms in (("bell", _BELL_WORDS), ("cymbal", _CYMBAL_WORDS)):
         for t in terms:
             if letters == t or (len(t) >= 3 and len(letters) == len(t)
@@ -1791,6 +2051,43 @@ def apply_kit_words(chart: list[dict], words: dict[str, list]) -> None:
         while mi < len(marks) and marks[mi][0] == i:
             pending = marks[mi][2] == "bell"
             target = None if pending or marks[mi][2] == "cymbal" else target
+            mi += 1
+
+
+def apply_rim_words(chart: list[dict], words: dict[str, list]) -> None:
+    """A rim word ("rim.", "cross stick") makes every plain head on the
+    snare's place from that word on a rim click, until a snare word
+    ("snare", "Sn.") gives the head back. Printed in the staff or over it,
+    inside the bar it starts in. Other heads and places are untouched."""
+    from drum_grid import STEP_MAP
+    snare = {s for s, row in STEP_MAP.items() if row.get("normal") == "snare"}
+    marks = []          # (chart index, x, kind)
+    for i, b in enumerate(chart):
+        bar = b["bar"]
+        il, top = bar["il"], bar["top"]
+        for x, y, _w, kind in words.get(b["sheet"], []):
+            if kind not in ("rim", "snare"):
+                continue
+            if bar["x0"] - 0.5 * il <= x < bar["x1"] and top - 7 * il <= y <= top + 5 * il:
+                others = [c for c in chart if c["sheet"] == b["sheet"] and c is not b
+                          and c["bar"]["x0"] - 0.5 * il <= x < c["bar"]["x1"]
+                          and abs(c["bar"]["top"] + 2 * il - y) < abs(top + 2 * il - y)]
+                if not others:
+                    marks.append((i, x - 0.8 * il, kind))
+    if not any(k == "rim" for _i, _x, k in marks):
+        return
+    marks.sort(key=lambda m: (m[0], m[1]))
+    on, mi = False, 0
+    for i, b in enumerate(chart):
+        for st in sorted(b["strikes"], key=lambda s: s.get("x", 0)):
+            while mi < len(marks) and (marks[mi][0] < i or
+                                       marks[mi][0] == i and marks[mi][1] <= st.get("x", 0)):
+                on = marks[mi][2] == "rim"
+                mi += 1
+            if on and st["kind"] == "normal" and st["step"] in snare and not st.get("grace"):
+                st["inst"] = "rim"
+        while mi < len(marks) and marks[mi][0] == i:
+            on = marks[mi][2] == "rim"
             mi += 1
 
 

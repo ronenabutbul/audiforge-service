@@ -379,6 +379,7 @@ def bar_crops(omr_path: Path) -> list[dict]:
                                  .decode("utf-8", "replace"))
             image = Image.open(io.BytesIO(z.read(f"{sheet}/BINARY.png"))) \
                 .convert("L")
+            ink = None
             # Audiveris records every printed time signature with bounds;
             # collected per sheet, matched to bars by position below.
             sigs = []
@@ -411,6 +412,19 @@ def bar_crops(omr_path: Path) -> list[dict]:
                         meter = pending_sig
                         pending_sig = None
                     fragment = False
+                    printed = [s for s in sigs
+                               if top - 2 * interline <= s["y"] <= bottom + 2 * interline
+                               and x0 - 4 <= s["x"] <= x1]
+                    if not printed:
+                        # a mid-line meter change Audiveris left out
+                        from drum_ink import ink_time_signature
+                        if ink is None:
+                            import numpy as np
+                            ink = np.asarray(image) < 128
+                        seen = ink_time_signature(ink, top, interline, x0)
+                        if seen:
+                            print(f"  time signature read from the ink: stack {stack_ordinal} {seen[0]}/{seen[1]}", file=sys.stderr)
+                            meter = seen
                     for sig in sigs:
                         if not (top - 2 * interline <= sig["y"]
                                 <= bottom + 2 * interline):
@@ -1886,6 +1900,9 @@ _TERMS = [
     "Cym.", "Hi-hat", "Hit hat", "Ride", "Cup", "Bell", "Sticks", "Brushes",
     "Snare", "Toms", "Bass drum", "Fill", "Cue", "Vamp", "Open", "Choke",
     "Cym. Dome", "Dome", "Ride Bell", "Sus. Cym.", "Crash",
+    # kit words one letter away from a tempo word: "rim." (rim click) must
+    # match itself before the one-letter rule makes it "rit."
+    "rim.", "Rim shot", "Cross stick", "t.t.", "Molto rit.",
 ]
 
 
