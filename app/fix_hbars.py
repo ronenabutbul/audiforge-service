@@ -951,7 +951,7 @@ def _silence_after(stack: int, hbars_by_stack: dict, stack_sounds: list[bool]) -
     `stack`: each following stack with no note head is one bar, or its own
     count when it is a multirest too, up to the first bar with music."""
     bars, k = 0, stack + 1
-    while k < len(stack_sounds) and not stack_sounds[k]:
+    while k < len(stack_sounds) and (k in hbars_by_stack or not stack_sounds[k]):
         bars += hbars_by_stack.get(k, 1)
         k += 1
     return bars
@@ -1125,9 +1125,11 @@ def fix(work_dir: Path, result_path: Path) -> tuple[int, int]:
 
 
 def stacks_with_notes(omr_path: Path) -> list[bool]:
-    """Per stack ordinal (as _iter_stacks counts them): does the printed
-    bar hold a note head? A bar Audiveris found heads in is music, so a run
-    of silence in the XML cannot reach into it."""
+    """Per stack ordinal (as _iter_stacks counts them): may the printed
+    bar hold music? Only a bar where Audiveris found a rest and no note
+    head counts as silent (False). A bar with heads is music, and so is a
+    bar where it found neither: it misses whole notes now and then, and a
+    missed note must never let a run of silence grow over it."""
     out = []
     with zipfile.ZipFile(omr_path) as z:
         sheets = sorted(
@@ -1147,8 +1149,12 @@ def stacks_with_notes(omr_path: Path) -> list[bool]:
                     # Several parts to a system, or a stack the part has no
                     # measure for: unknown, which counts as music (nothing
                     # is then trimmed on its word).
-                    sounds = (bool((measures[k].findtext("head-chords") or "").split())
-                              if k < len(measures) else True)
+                    if k < len(measures):
+                        heads = (measures[k].findtext("head-chords") or "").split()
+                        rests = (measures[k].findtext("rest-chords") or "").split()
+                        sounds = bool(heads) or not rests
+                    else:
+                        sounds = True
                     out.append(sounds)
     return out
 

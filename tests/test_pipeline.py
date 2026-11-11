@@ -895,6 +895,20 @@ def test_rest_expanded_from_a_misread_count_is_cut_to_the_page():
           stack_sounds=[True, False, False, True])
     assert len(_bars(after_silence)) == 7, "a silent bar printed after the rest stays"
 
+    # Silent means Audiveris saw a rest there and no head. A bar where it
+    # saw neither (a whole note it missed) is music, so the trim stops.
+    import zipfile
+    sheet = ('<sheet><system><staff><lines>' + '<line/>' * 5 + '</lines></staff>'
+             '<stack left="0" right="10"/><stack left="10" right="20"/>'
+             '<stack left="20" right="30"/><part>'
+             '<measure><head-chords>1</head-chords></measure>'
+             '<measure><rest-chords>2</rest-chords></measure>'
+             '<measure></measure></part></system></sheet>')
+    omr = scratch("omr") / "silence.omr"
+    with zipfile.ZipFile(omr, "w") as z:
+        z.writestr("sheet#1/sheet#1.xml", sheet)
+    assert fix_hbars.stacks_with_notes(omr) == [True, False, True]
+
 
 # --------------------------------------------------------------------------- #
 
