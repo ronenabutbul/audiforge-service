@@ -1120,7 +1120,17 @@ def harmony_xml(c: dict, offset: int) -> str:
         if c["bass_alter"]:
             out.append(f"          <bass-alter>{c['bass_alter']}</bass-alter>")
         out.append("        </bass>")
-    for value, alter, kind in c["degrees"]:
+    # notes the kind's name implies but the kind value does not carry:
+    # readers (MuseScore) spell the symbol from kind + degrees, not the text
+    implied = []
+    m = re.match(r"(7|9|11|13)sus", c["kind_text"])
+    if m and c["kind"].startswith("suspended"):
+        implied.append((7, 0, "add"))
+        implied += [(d, 0, "add") for d in (9, 11, 13) if d <= int(m.group(1))]
+    if c["kind_text"] == "6/9":
+        implied.append((9, 0, "add"))
+    have = {v for v, _a, _k in c["degrees"]}
+    for value, alter, kind in [d for d in implied if d[0] not in have] + c["degrees"]:
         out += ["        <degree>", f"          <degree-value>{value}</degree-value>",
                 f"          <degree-alter>{alter}</degree-alter>",
                 f"          <degree-type>{kind}</degree-type>", "        </degree>"]
@@ -1140,12 +1150,21 @@ def write_musicxml(bars: list[dict], meta: dict, out: Path) -> None:
     x = ['<?xml version="1.0" encoding="UTF-8"?>',
          '<score-partwise version="4.0">',
          f"  <work><work-title>{escape(meta['title'])}</work-title></work>"]
-    if meta.get("subtitle"):
-        x.append(f"  <movement-title>{escape(meta['subtitle'])}</movement-title>")
+    # no movement-title for the subtitle: MuseScore shows a movement title
+    # as THE title. Title and subtitle go in as page credits.
+    x.append(f"  <movement-title>{escape(meta['title'])}</movement-title>")
     if meta.get("composer"):
         x += ["  <identification>",
               f'    <creator type="composer">{escape(meta["composer"])}</creator>',
               "  </identification>"]
+    # (positions in tenths on MuseScore's default A4 page, 1697 tall)
+    for typ, text, place in (
+            ("title", meta["title"], 'default-x="616" default-y="1600" justify="center" valign="top" font-size="22"'),
+            ("subtitle", meta.get("subtitle"), 'default-x="616" default-y="1540" justify="center" valign="top" font-size="14"'),
+            ("composer", meta.get("composer"), 'default-x="1148" default-y="1500" justify="right" valign="bottom" font-size="10"')):
+        if text:
+            x += ['  <credit page="1">', f"    <credit-type>{typ}</credit-type>",
+                  f"    <credit-words {place}>{escape(text)}</credit-words>", "  </credit>"]
     x += ["  <part-list>", '    <score-part id="P1">',
           f"      <part-name>{escape(meta['part'])}</part-name>",
           "    </score-part>", "  </part-list>", '  <part id="P1">']
