@@ -526,6 +526,9 @@ def debug_image(system_list: list[System], pages: dict, parts: list[Part], name:
 def layout_debug(work: Path, out_dir: Path) -> None:
     omr = next(work.glob("*.omr"))
     systems, pages = read_layout(omr)
+    if not systems:
+        print("no systems in the Audiveris project (it never got as far as the staves)")
+        return
     parts = number_staves(systems, pages)
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"{len(pages)} sheets with music, {len(systems)} systems, "
@@ -1159,7 +1162,7 @@ def _simile(sheet, bar: dict) -> bool:
     staff with a dot either side, and nothing else in the bar."""
     il, top = bar["il"], bar["top"]
     cx = (bar["x0"] + bar["x1"]) / 2
-    x0, x1 = int(cx - 2.2 * il), int(cx + 2.2 * il)
+    x0, x1 = int(cx - 2.8 * il), int(cx + 2.8 * il)
     y0, y1 = int(top + 0.4 * il), int(top + 3.6 * il)
     box = sheet.nolines[max(y0, 0):y1, max(x0, 0):x1].astype(np.uint8)
     if not box.size:
@@ -1168,7 +1171,7 @@ def _simile(sheet, bar: dict) -> bool:
     slash = dots = 0
     for i in range(1, n):
         _x, _y, w, h, area = stats[i]
-        if 0.9 * il <= w <= 2.6 * il and 1.2 * il <= h <= 2.6 * il and area <= 0.6 * w * h:
+        if 1.4 * il <= w <= 3.3 * il and 1.4 * il <= h <= 2.8 * il and area <= 0.5 * w * h:
             slash += 1
         elif 0.15 * il <= w <= 0.6 * il and 0.15 * il <= h <= 0.6 * il and area >= 0.55 * w * h:
             dots += 1
