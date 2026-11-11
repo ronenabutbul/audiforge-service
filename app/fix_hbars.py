@@ -136,6 +136,17 @@ def _hook_above(pixels, x: int, top_row: int, interline: float) -> bool:
     return bool(band.size) and float(band.any(axis=0).mean()) > 0.9
 
 
+def _run_width(pixels, r: int, x: int) -> int:
+    """Width of the run of ink through (r, x)."""
+    l = x
+    while l > 0 and pixels[r, l - 1]:
+        l -= 1
+    g = x
+    while g < pixels.shape[1] - 1 and pixels[r, g + 1]:
+        g += 1
+    return g - l + 1
+
+
 def _interior_barline_xs(pixels, top: float, bottom: float, x0: int, x1: int,
                          interline: float) -> list[int]:
     """x of every barline strictly inside a stack, i.e. the boundaries of
@@ -167,6 +178,12 @@ def _interior_barline_xs(pixels, top: float, bottom: float, x0: int, x1: int,
             while rgt < pixels.shape[1] - 1 and pixels[r, rgt + 1]:
                 rgt += 1
             width = rgt - l + 1
+            if (VOLTA_HOOK_BARLINES and width <= 2 * interline
+                    and pixels[r + 1, x]
+                    and _run_width(pixels, r + 1, x) > staff_line):
+                # The row just over a staff line: the line's ragged top
+                # edge joined to the stroke, not a notehead.
+                continue
             if width > staff_line:
                 # The row under a staff line carries the line's ragged
                 # edge, a short blob joined to the stroke; not a notehead.
