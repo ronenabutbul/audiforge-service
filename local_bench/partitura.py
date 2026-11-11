@@ -236,21 +236,38 @@ def _barlines(ink: np.ndarray, staves: list[Staff]) -> list[dict]:
     y0 = top.top(top.left)
     runs = [_staff_uprights(ink, s, lean, left, right) for s in five]
     tol = 0.22 * il
+    # In a tall system (a conductor score of twenty staves) a scan bends
+    # the barlines a little: the lean of the staff lines predicts the
+    # barline well over a few staves but drifts by half an interline over
+    # twenty. So the barline is followed from staff to staff, each staff
+    # predicted from where it stood on the staff above. A scan can also
+    # break a barline inside a staff (a faded stroke, or the bottom staff
+    # cut by the page edge). In a system of eight staves or more a
+    # quarter of them may miss it: no other stroke fills a whole staff
+    # in line with that many others. A small system must hold it on
+    # every staff, as before.
+    may_miss = len(five) // 4 if len(five) >= 8 else 0
     out = []
     for a, b in runs[0]:
         x = (a + b - 1) / 2
         xs = min(max(x, top.left), top.right)
         ya = top.top(xs)
-        lo, hi = a, b
+        at, at_y = x, ya
+        missed = 0
         ok = True
         for s, mine in zip(five[1:], runs[1:]):
-            want = x + lean * (s.top(min(max(x, s.left), s.right)) - ya)
+            sy = s.top(min(max(at, s.left), s.right))
+            want = at + lean * (sy - at_y)
             near = [(c, d) for c, d in mine if c - tol <= want <= d - 1 + tol]
             if not near:
-                ok = False
-                break
-            lo = min(lo, min(c for c, _ in near) - (want - x))
-            hi = max(hi, max(d for _, d in near) - (want - x))
+                missed += 1
+                if missed > may_miss:
+                    ok = False
+                    break
+                at, at_y = want, sy
+                continue
+            c, d = min(near, key=lambda r: abs((r[0] + r[1] - 1) / 2 - want))
+            at, at_y = (c + d - 1) / 2, sy
         if not ok:
             continue
         if len(five) == 1:
