@@ -446,7 +446,17 @@ class Sheet:
             a, g = 0.36 * il, 0.26 * il
             axes = sum(patch(dx, dy) for dx, dy in ((0, a), (0, -a)))
             diag = sum(patch(dx, dy) for dx, dy in ((g, g), (-g, g), (g, -g), (-g, -g)))
-            if diag == 4 and axes == 0 and patch(0, 0):
+            # and the circle itself: ink on its sides, level with the
+            # centre (a heavy cross filling a space has its notches there,
+            # the staff lines above and below closing it into a "ring")
+            sides = 0
+            for sgn in (-1, 1):
+                q = self.nolines[int(cy - 0.12 * il):int(cy + 0.12 * il) + 1,
+                                 int(cx + sgn * 0.95 * il):int(cx + sgn * 0.5 * il) + 1] if sgn < 0 else \
+                    self.nolines[int(cy - 0.12 * il):int(cy + 0.12 * il) + 1,
+                                 int(cx + 0.5 * il):int(cx + 0.95 * il) + 1]
+                sides += bool(q.size) and q.any()
+            if diag == 4 and axes == 0 and patch(0, 0) and sides == 2:
                 self.rings.append((cx, cy))
         # a ring swallows the cross drawn inside it
         self.crosses = [(x, y) for x, y in self.crosses
@@ -555,6 +565,10 @@ class Sheet:
                                float(b.get("x")) + float(b.get("w")),
                                float(b.get("x")), float(b.get("y")),
                                float(b.get("w")), float(b.get("h"))))
+        # a digit inside a boxed bar number is not a rest (the 7 of "57")
+        self.rests = [r for r in self.rests
+                      if not any(fx <= r[0] <= fx + fw and fy <= r[1] <= fy + fh
+                                 for fx, fy, fw, fh in self.frames)]
 
     # -- signs over and under the notes -----------------------------------------
     def _signs(self):
@@ -862,6 +876,20 @@ class Sheet:
                 continue
             fill = float(blob[:, cols[0]:cols[-1] + 1].mean())
             kind = "normal" if fill >= 0.62 else ("circled_x" if h >= 1.25 * il else "x")
+            if kind == "normal":
+                # a heavy cross filling a space is as dark as a head, but
+                # has notches: paper at the middle of its top and bottom
+                # edges and of its sides, ink at all four corners
+                g = blob[:, cols[0]:cols[-1] + 1]
+                gh, gw = g.shape
+                e = max(int(0.15 * min(gh, gw)), 1)
+                mid_r, mid_c = slice(gh // 2 - e, gh // 2 + e + 1), slice(gw // 2 - e, gw // 2 + e + 1)
+                notches = [g[:2 * e, mid_c].mean(), g[-2 * e:, mid_c].mean(),
+                           g[mid_r, :2 * e].mean(), g[mid_r, -2 * e:].mean()]
+                corners = [g[:2 * e, :2 * e].mean(), g[:2 * e, -2 * e:].mean(),
+                           g[-2 * e:, :2 * e].mean(), g[-2 * e:, -2 * e:].mean()]
+                if sum(n < 0.25 for n in notches) >= 3 and min(corners) > 0.5:
+                    kind = "x"
             # a beam runs on past the window's outer edge; a head ends
             # inside it
             outer = blob[:, -1] if side > 0 else blob[:, 0]

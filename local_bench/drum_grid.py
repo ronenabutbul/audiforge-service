@@ -1906,6 +1906,28 @@ _TERMS = [
 ]
 
 
+def _mend_boxed_numbers(path: Path) -> None:
+    """A boxed bar number IS the number of the bar it stands over. Where
+    the OCR reading differs from that bar's number in one digit only
+    ("37" over bar 57: the 5's flag lost in the frame), the reading is the
+    misread; anything further off is left as printed, since the numbering
+    itself may be what is wrong."""
+    tree = ET.parse(path)
+    mended = []
+    for measure in tree.getroot().iter("measure"):
+        number = measure.get("number", "")
+        for reh in measure.iter("rehearsal"):
+            text = (reh.text or "").strip()
+            if not (text.isdigit() and number.isdigit()) or text == number:
+                continue
+            if len(text) == len(number) and sum(a != b for a, b in zip(text, number)) == 1:
+                mended.append((text, number))
+                reh.text = number
+    if mended:
+        tree.write(path, encoding="UTF-8", xml_declaration=True)
+        print(f"  boxed numbers mended to their bars: {mended}", flush=True)
+
+
 def _known_term(text: str) -> str | None:
     """Keep an instruction only when the page plausibly printed it."""
     from difflib import SequenceMatcher
@@ -2158,6 +2180,7 @@ def apply_structure(work_dir: Path, out: Path, omr: Path,
     if ink_marks is not None:
         placed = place_rehearsals(omr, out, hbars, extra_marks=ink_marks,
                                   use_omr=False)
+        _mend_boxed_numbers(out)
     else:
         placed = place_rehearsals(omr, out, hbars)
     # Drum charts engrave hairpins above the staff, under the dynamics
@@ -2209,8 +2232,18 @@ def main():
                 for k in range(1, h.get("span", 1))}
     crops = [c for c in crops if c["stack"] not in absorbed]
     inner: dict[int, list[int]] = {}
+    ink_chart = None
     if "--ink" in sys.argv:
-        from drum_ink import boxed_marks, boxed_numbers, sliver_bars
+        from drum_ink import boxed_marks, boxed_numbers, read_chart, sliver_bars
+        ink_chart = read_chart(omr)
+        # Audiveris calls a first bar a pickup when it holds less than its
+        # meter by its own reading; the ink says whether it does. A first
+        # bar whose voices fill the whole meter is bar 1.
+        if crops and crops[0].get("pickup"):
+            first = next((b for b in ink_chart if b["ordinal"] == crops[0]["stack"]), None)
+            if first is not None and not first["problem"] and first["strikes"]:
+                crops[0] = dict(crops[0], pickup=False)
+                print("  first bar fills its meter: not a pickup", flush=True)
         ink_marks = boxed_marks(omr)
         slivers = sliver_bars(omr) - set(rest_counts)
         crops = [c for c in crops if c["stack"] not in slivers]
@@ -2256,7 +2289,7 @@ def main():
     raw_cache = out.with_suffix(".readings.json")
     if "--ink" in sys.argv:
         from drum_ink import ink_readings
-        readings, unsure = ink_readings(crops, omr, rest_counts)
+        readings, unsure = ink_readings(crops, omr, rest_counts, chart=ink_chart)
         print(f"read {len(readings)} bars from the ink alone; "
               f"{len(unsure)} did not add up: {unsure[:20]}", flush=True)
         transcribe_gemini.last_readings = readings
