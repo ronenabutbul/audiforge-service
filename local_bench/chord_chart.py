@@ -614,6 +614,50 @@ def _stem_of(sheet: Sheet, system: System, s: dict) -> tuple[float, float, int] 
             return sx, sy1, -1
         if abs(sx - s["x1"]) < 0.45 * il and top - 0.4 * il < sy1 < top + 0.9 * il and sy0 < top - 1.0 * il:
             return sx, sy0, 1
+    return _stem_in_ink(sheet, system, s, foot, top)
+
+
+def _stem_in_ink(sheet: Sheet, system: System, s: dict, foot: float, top: float):
+    """A stem the stem finder missed because a scan broke it into dashes:
+    a column of ink beside the slash's foot (down) or top (up) that is
+    at least half ink for a stem's length (a scan leaves it dotted)."""
+    il = system.il
+    ink = sheet.nolines             # staff lines would read as ink beside the stem
+    H, W = ink.shape
+
+    def column(xc, ya, yb, near_top):
+        best = None
+        for x in range(int(xc - 0.45 * il), int(xc + 0.45 * il) + 1):
+            if not 0 <= x < W:
+                continue
+            a, b = max(int(ya), 0), min(int(yb), H)
+            if b - a < 2:
+                continue
+            col = ink[a:b, max(x - 1, 0):x + 2].any(axis=1)
+            # a stem is narrow: the ink two columns aside is mostly blank,
+            # judged on the half next to the slash (a flag curls up beside
+            # the far half)
+            sa, sb = (a, (a + b) // 2) if near_top else ((a + b) // 2, b)
+            side = ink[sa:sb, max(x - 4, 0):x - 2].any(axis=1).mean() if x >= 4 else 0
+            side = max(side, ink[sa:sb, x + 3:x + 5].any(axis=1).mean() if x + 5 <= W else 0)
+            if col.mean() > 0.45 and side < 0.3 and (best is None or col.mean() > best[1]):
+                best = (x, col.mean())
+        return best
+
+    down = column(s["x"], foot + 0.2 * il, foot + 2.2 * il, True)
+    if down:
+        x, _ = down
+        y = int(foot + 2.2 * il)
+        while y < min(H, foot + 4.5 * il) and ink[y:y + int(0.3 * il) + 1, max(x - 1, 0):x + 2].any():
+            y += 1
+        return float(x), float(y), -1
+    up = column(s["x1"], top - 2.2 * il, top - 0.2 * il, False)
+    if up:
+        x, _ = up
+        y = int(top - 2.2 * il)
+        while y > max(0, top - 4.5 * il) and ink[max(y - int(0.3 * il) - 1, 0):y, max(x - 1, 0):x + 2].any():
+            y -= 1
+        return float(x), float(y), 1
     return None
 
 
