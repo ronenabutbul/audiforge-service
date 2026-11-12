@@ -93,6 +93,35 @@ class System:
         return self.lean * (y - self.y0)
 
 
+def clef_kind(el: ET.Element) -> str:
+    """The clef an Audiveris clef inter names: "G", "F", "PERC", or "C"
+    plus the staff line it sits on counted from the bottom ("C3" the alto
+    clef, "C4" the tenor clef); "" for anything else."""
+    shape = el.get("shape") or ""
+    if shape == "C_CLEF":
+        try:
+            pitch = int(el.get("pitch") or 0)
+        except ValueError:
+            pitch = 0
+        return f"C{3 - pitch // 2}" if pitch in (-4, -2, 0, 2, 4) else "C3"
+    return {"G_CLEF": "G", "G_CLEF_SMALL": "G", "G_CLEF_8VB": "G", "F_CLEF": "F",
+            "F_CLEF_SMALL": "F", "PERCUSSION_CLEF": "PERC"}.get(shape, "")
+
+
+def clef_sign_line(kind: str) -> tuple[str, str]:
+    """MusicXML sign and line of a clef kind."""
+    if kind.startswith("C"):
+        return "C", kind[1:] or "3"
+    return {"G": ("G", "2"), "F": ("F", "4")}.get(kind, ("G", "2"))
+
+
+def clef_middle(kind: str) -> int:
+    """Diatonic index of the middle staff line under the clef (C4 = 28)."""
+    if kind.startswith("C"):
+        return 28 + 2 * (int(kind[1:] or 3) - 3)
+    return {"G": 34, "F": 22}.get(kind, 34)
+
+
 def _five_line_staves(system: ET.Element) -> list[Staff]:
     clefs: dict[str, tuple[float, str]] = {}
     for el in system.find("sig/inters") if system.find("sig/inters") is not None else []:
@@ -100,8 +129,7 @@ def _five_line_staves(system: ET.Element) -> list[Staff]:
             continue
         b = el.find("bounds")
         x = float(b.get("x")) if b is not None else 0.0
-        kind = {"G_CLEF": "G", "G_CLEF_SMALL": "G", "G_CLEF_8VB": "G", "F_CLEF": "F",
-                "F_CLEF_SMALL": "F", "C_CLEF": "C", "PERCUSSION_CLEF": "PERC"}.get(el.get("shape"), "")
+        kind = clef_kind(el)
         sid = el.get("staff")
         # the clef at the head of the staff names it
         if kind and (sid not in clefs or x < clefs[sid][0]):
@@ -137,27 +165,50 @@ def _one_line_staves(ink: np.ndarray, staves: list[Staff], lower: float) -> list
     'sim.' gets one bar of line. `lower` is where the next system begins."""
     if not staves:
         return []
-    last = staves[-1]
+    found: list[Staff] = []
+    # under every staff: a percussion line may sit between two staves of
+    # the system (tambourine and conga between timpani and mallets) as
+    # well as under its last staff
+    for k, above in enumerate(staves):
+        below = staves[k + 1].top(staves[k + 1].left) if k + 1 < len(staves) else lower
+        found += _lines_under(ink, staves, above, below)
+    return found
+
+
+def _lines_under(ink: np.ndarray, staves: list[Staff], last: Staff, lower: float) -> list[Staff]:
+    """The one-line staves between staff `last` and height `lower`."""
     il = last.il
     left, right = int(min(s.left for s in staves)), int(max(s.right for s in staves))
     ya = int(last.bottom(last.left) + 1.5 * il)
     yb = int(min(lower - 1.5 * il, ink.shape[0]))
-    if yb <= ya or right - left < 20 * il:
+    if yb - ya < 2 * il or right - left < 20 * il:
         return []
     band = ink[ya:yb, left:right].astype(np.uint8)
     long = cv2.morphologyEx(band, cv2.MORPH_OPEN, np.ones((1, int(8 * il)), np.uint8))
     # a slanted line crosses a few pixel rows: gather them
     reach = max(int(0.2 * il), 2)
     thick = cv2.dilate(long, np.ones((2 * reach + 1, 1), np.uint8))
-    rows = thick.sum(axis=1) >= 12 * il
+    sums = thick.sum(axis=1)
+    rows = sums >= 12 * il
+    runs = _runs(rows)
+
+    def thin(a, b):
+        # a beam ending on the line widens the run a little but covers
+        # far less of the width than the line: judge the run's own rows
+        core = int(np.count_nonzero(sums[a:b] >= 0.5 * sums[a:b].max()))
+        return core - 2 * reach <= 0.4 * il
+
     found = []
-    for a, b in _runs(rows):
-        if b - a - 2 * reach > 0.4 * il:
+    for a, b in runs:
+        if not thin(a, b):
             continue                    # a beam or a black band, not a line
         y = ya + (a + b - 1) / 2
-        # nothing else long within two interlines (that would be a staff
-        # Audiveris missed, or a frame)
-        near = rows[max(a - int(2 * il), 0):a].any() or rows[b:b + int(2 * il)].any()
+        # no other line within two interlines (that would be a staff
+        # Audiveris missed, or a frame). The part's own beams are long too,
+        # but a beam is either short or, where a run of sixteenths fills
+        # the bars, a thick band of stacked beams: neither is such a line.
+        near = any(thin(c, d) and sums[c:d].max() >= 0.5 * sums[a:b].max()
+                   and (0 < a - d < 2 * il or 0 < c - b < 2 * il) for c, d in runs)
         if near:
             continue
         cols = np.flatnonzero(thick[a:b].any(axis=0))
@@ -178,8 +229,10 @@ def _one_line_staves(ink: np.ndarray, staves: list[Staff], lower: float) -> list
         slope = (yr - yl) / max(x1 - x0 - 6 * il, 1)
         y_left = yl - slope * 3 * il
         # the system's left barline reaches it
-        joined = max(_column_run(ink, last.left + dx, last.bottom(last.left), y_left, 3)
-                     for dx in (-4, -2, 0, 2, 4))
+        # (a staff indented past its neighbours, as a clefless staff is, does
+        # not tell where the system line runs: try the system's left edge too)
+        joined = max(_column_run(ink, x + dx, last.bottom(x), y_left, 3)
+                     for x in {last.left, float(left)} for dx in (-4, -2, 0, 2, 4))
         if joined < 0.9:
             continue
         found.append(Staff(1, float(x0), float(x1), flat=float(y_left), slope=float(slope),
@@ -331,6 +384,62 @@ def _repeat_dots(ink: np.ndarray, staff: Staff, x: float, side: int) -> bool:
     return seen == 2
 
 
+def _system_joined_below(ink: np.ndarray, upper: list[Staff], lower: list[Staff]) -> bool:
+    """True when the line that opens a system runs unbroken from the last
+    staff of `upper` to the first staff of `lower`: the two are one system
+    of the score. Audiveris cuts a tall system where a gap between staff
+    groups is wide (a tempo mark printed again over the brass, a big gap
+    above the percussion), and then every system starts its own bars."""
+    a, b = upper[-1], lower[0]
+    il = float(np.median([s.il for s in upper + lower]))
+    lo = min(a.left, b.left)
+    if lo < 3 * il:
+        # a staff that starts at the image edge: the edge is no system line
+        return False
+    for x in np.arange(lo - 1.5 * il, lo + 0.5 * il):
+        ya, yb = a.bottom(x), b.top(x)
+        if yb - ya < il or _column_run(ink, x, ya, yb, 1) < 0.95:
+            continue
+        # a page border or frame runs on past the system; the system line stops at it
+        above = _column_run(ink, x, upper[0].top(x) - 4 * il, upper[0].top(x) - 1.5 * il, 1)
+        below = _column_run(ink, x, lower[-1].bottom(x) + 1.5 * il, lower[-1].bottom(x) + 4 * il, 1)
+        if above < 0.5 and below < 0.5:
+            return True
+    return False
+
+
+def _joined_systems(ink: np.ndarray, found: list[ET.Element]) -> list[ET.Element]:
+    """The sheet's Audiveris systems, with the ones the system line joins
+    merged into one element (inters, relations, parts, stacks pooled; ids
+    are unique on a sheet)."""
+    found = [e for e in found if _five_line_staves(e)]
+    found.sort(key=lambda e: _five_line_staves(e)[0].top(_five_line_staves(e)[0].left))
+    groups: list[list[ET.Element]] = []
+    for e in found:
+        if groups and _system_joined_below(ink, _five_line_staves(groups[-1][-1]), _five_line_staves(e)):
+            groups[-1].append(e)
+        else:
+            groups.append([e])
+    out = []
+    for group in groups:
+        if len(group) == 1:
+            out.append(group[0])
+            continue
+        merged = ET.Element("system", dict(group[0].attrib))
+        sig = ET.SubElement(merged, "sig")
+        inters, relations = ET.SubElement(sig, "inters"), ET.SubElement(sig, "relations")
+        for e in group:
+            for child in e:
+                if child.tag == "sig":
+                    for box, into in (("inters", inters), ("relations", relations)):
+                        if child.find(box) is not None:
+                            into.extend(list(child.find(box)))
+                else:
+                    merged.append(child)
+        out.append(merged)
+    return out
+
+
 def read_layout(omr: Path) -> tuple[list[System], dict]:
     """Every system of the book, in reading order, and per sheet name the
     (ink, root) it was read from."""
@@ -347,7 +456,7 @@ def read_layout(omr: Path) -> tuple[list[System], dict]:
             ink = np.asarray(Image.open(io.BytesIO(z.read(f"{name}/BINARY.png"))).convert("L")) < 128
             pages[name] = (ink, root)
             on_sheet = []
-            for element in found:
+            for element in _joined_systems(ink, found):
                 staves = _five_line_staves(element)
                 if staves:
                     on_sheet.append(System(ordinal, name, len(on_sheet), staves, element))
@@ -357,6 +466,7 @@ def read_layout(omr: Path) -> tuple[list[System], dict]:
                 lower = on_sheet[k + 1].staves[0].top(on_sheet[k + 1].staves[0].left) \
                     if k + 1 < len(on_sheet) else ink.shape[0]
                 system.staves += _one_line_staves(ink, system.staves, lower)
+                system.staves.sort(key=lambda s: s.top(s.left))
                 system.il = float(np.median([s.il for s in system.staves]))
                 system.barlines = _barlines(ink, system.staves)
                 _bars_of(ink, system)
@@ -496,7 +606,23 @@ def _margin_names(system: System, root: ET.Element) -> list[tuple[float, str]]:
             rows[-1][1].append((x, value))
         else:
             rows.append([y, [(x, value)]])
-    return [(y, " ".join(v for _, v in sorted(ws))) for y, ws in rows]
+    return [(y, _clean_name(" ".join(v for _, v in sorted(ws)))) for y, ws in rows]
+
+
+def _clean_name(name: str) -> str:
+    """An instrument name as OCR reads it, without the stray marks around
+    it: a lone letter or mark standing before the name (the end of a
+    bracket, a flat sign torn off, read as "I", "l", "n" or "|") and quote
+    marks or punctuation left at its ends. Words and numbers are kept."""
+    words = name.replace("‘", "'").replace("’", "'").split()
+    while len(words) > 1 and len(words[0]) == 1 and not words[0].isdigit() \
+            and (words[0].islower() or words[0] in "I|!"):
+        words.pop(0)
+    while len(words) > 1 and len(words[-1]) == 1 and not words[-1].isdigit() \
+            and (words[-1].islower() or words[-1] in "I|!'\""):
+        words.pop()
+    out = " ".join(words).strip("'\"`,;:|!_- ")
+    return out or name.strip()
 
 
 CLEF_SHAPES = {"G_CLEF": "G", "G_CLEF_SMALL": "G", "G_CLEF_8VB": "G", "F_CLEF": "F",
@@ -514,7 +640,7 @@ def _carry_clefs(system: System, last: dict[int, str]) -> None:
     seen: dict[int, tuple[float, str]] = {}
     for el in inters if inters is not None else []:
         b = el.find("bounds")
-        kind = CLEF_SHAPES.get(el.get("shape") or "")
+        kind = clef_kind(el)
         if el.tag != "clef" or b is None or not kind or el.get("staff") not in by_sid:
             continue
         slot, x = by_sid[el.get("staff")].slot, float(b.get("x"))
@@ -867,6 +993,30 @@ def _whole_heads(ink: np.ndarray, system: System, taken: list[tuple[float, float
     return out
 
 
+def _off_beam_end(heads: list[Head], y1: float, y2: float, il: float) -> list[Head]:
+    """The chord's heads without the ones Audiveris found at the far end
+    of the stem. Heads sit at one end of a stem (the stem joins the side
+    of the head, so the head reaches past that end) and the beams or flag
+    at the other; at a small engraving the end of a beam or the hook of a
+    flag where it meets the stem reads as a black head, which adds a note
+    a sixth or more away from the real one (a flute line doubled an
+    octave lower). So when heads lie at both ends of a stem, the end a
+    head reaches past is the foot and the heads at the other end go."""
+    if len(heads) < 2 or abs(y2 - y1) < 2.5 * il:
+        return heads
+    lo, hi = min(y1, y2), max(y1, y2)
+    # how far the outermost head reaches past each end of the stem
+    over_lo = lo - min(h.y for h in heads)
+    over_hi = max(h.y for h in heads) - hi
+    if abs(over_lo - over_hi) < 0.4 * il:
+        return heads
+    foot, tip = (lo, hi) if over_lo > over_hi else (hi, lo)
+    # the heads of a chord stack from the foot a second or third apart;
+    # one standing alone near the tip is the beam or the flag
+    stray = [h for h in heads if abs(h.y - tip) < 1.5 * il and abs(h.y - foot) > 2 * il]
+    return [h for h in heads if h not in stray] if len(stray) < len(heads) else heads
+
+
 def read_pitched(system: System, ink: np.ndarray, sheet=None) -> list[Event]:
     """Chords and rests of the pitched staves of one system, with the
     values their stems, beams, flags and dots print. Not yet timed.
@@ -931,6 +1081,7 @@ def read_pitched(system: System, ink: np.ndarray, sheet=None) -> list[Event]:
             m = stem.find("median")
             y1, y2 = float(m.find("p1").get("y")), float(m.find("p2").get("y"))
             sx = (float(m.find("p1").get("x")) + float(m.find("p2").get("x"))) / 2
+            heads = _off_beam_end(heads, y1, y2, il)
             my = float(np.mean([h.y for h in heads]))
             up = abs(my - max(y1, y2)) < abs(my - min(y1, y2))
             # beams at different heights are different beams
@@ -1046,7 +1197,7 @@ def spell(events: list[Event], system: System, bar: dict, state: dict) -> None:
         seen: dict[int, int] = {}
         for e in sorted(evs, key=lambda e: e.x):
             clef = state["clef_at"](slot, e.x)
-            middle = CLEF_MIDDLE.get(clef, 34)
+            middle = clef_middle(clef)
             for h in e.heads:
                 d = middle - h.pos
                 h.step, h.octave = "CDEFGAB"[d % 7], d // 7
@@ -1742,6 +1893,82 @@ def _held_meter(systems: list[System], system: System, k: int,
     return int(best * beat), beat
 
 
+def _header_key_reads(system: System) -> tuple[float, dict[int, int]]:
+    """(header end, {slot: fifths}) for the key signatures Audiveris read
+    at the head of the system's staves."""
+    slot_of = {s.sid: s.slot for s in system.staves if s.sid}
+    stops = [float(h.get("stop")) for h in system.element.iter("header") if h.get("stop")]
+    header = max(stops) if stops else 0.0
+    reads: dict[int, int] = {}
+    inters = system.element.find("sig/inters")
+    for el in inters if inters is not None else []:
+        b = el.find("bounds")
+        if el.tag != "key" or b is None or el.get("fifths") is None \
+                or el.get("staff") not in slot_of:
+            continue
+        x = float(b.get("x")) + float(b.get("w")) / 2 - system.shift(float(b.get("y")))
+        if x < header:
+            reads[slot_of[el.get("staff")]] = int(el.get("fifths"))
+    return header, reads
+
+
+def _consensus_keys(systems: list[System]) -> dict[int, dict[int, int]]:
+    """Per system id, the key signature at the head of each staff, read as
+    the score's notation fixes it: in a score each staff's key differs from
+    the others' by its instrument's transposition, which never changes.
+    So the offsets between staves are learnt from every system, each
+    system's key is what most of its staves agree on, and a staff whose
+    key Audiveris missed or misread (a flat lost to a small engraving)
+    takes the system's key plus its own offset. Systems with fewer than
+    three keyed staves are left as read."""
+    reads = {id(s): _header_key_reads(s)[1] for s in systems}
+    count: dict[int, int] = {}
+    for r in reads.values():
+        for slot in r:
+            count[slot] = count.get(slot, 0) + 1
+    if not count:
+        return {}
+    ref = max(count, key=lambda k: count[k])
+    offset: dict[int, int] = {ref: 0}
+    for slot in count:
+        if slot == ref:
+            continue
+        diffs = [r[slot] - r[ref] for r in reads.values() if slot in r and ref in r]
+        if len(diffs) >= 3:
+            best = max(set(diffs), key=diffs.count)
+            if diffs.count(best) >= 0.6 * len(diffs):
+                offset[slot] = best
+    out: dict[int, dict[int, int]] = {}
+    for system in systems:
+        r = reads[id(system)]
+        votes = [k - offset[slot] for slot, k in r.items() if slot in offset]
+        fixed = dict(r)
+        if len(votes) >= 3:
+            concert = max(set(votes), key=votes.count)
+            if votes.count(concert) >= 0.6 * len(votes):
+                for s in system.staves:
+                    if s.slot in offset and s.count == 5 and s.clef != "PERC":
+                        fixed[s.slot] = concert + offset[s.slot]
+        out[id(system)] = fixed
+    return out
+
+
+def _usual_clefs(systems: list[System]) -> dict[int, str]:
+    """Per staff slot, the treble or bass clef that at least three in four
+    of its system heads show (four systems or more)."""
+    seen: dict[int, list[str]] = {}
+    for system in systems:
+        for s in system.staves:
+            if s.clef in ("G", "F"):
+                seen.setdefault(s.slot, []).append(s.clef)
+    out = {}
+    for slot, kinds in seen.items():
+        best = max(set(kinds), key=kinds.count)
+        if len(kinds) >= 4 and kinds.count(best) >= 0.75 * len(kinds):
+            out[slot] = best
+    return out
+
+
 def read_signatures(systems: list[System], pages: dict | None = None
                     ) -> tuple[list[tuple[int, int]], list[dict], dict]:
     """Per measure the meter; per measure {slot: fifths}; and per system
@@ -1755,6 +1982,8 @@ def read_signatures(systems: list[System], pages: dict | None = None
     pending_meter = None
     pending_key: dict[int, int] = {}
     carried: dict[int, str] = {}
+    heads = _consensus_keys(systems)
+    usual_clef = _usual_clefs(systems)
     for system in systems:
         slot_of = {s.sid: s.slot for s in system.staves if s.sid}
         stops = [float(h.get("stop")) for h in system.element.iter("header") if h.get("stop")]
@@ -1770,17 +1999,28 @@ def read_signatures(systems: list[System], pages: dict | None = None
             if el.tag in ("time-whole", "time-pair") and "/" in (el.get("time-rational") or ""):
                 a, c = el.get("time-rational").split("/")
                 sigs.append((x, (int(a), int(c))))
-            elif el.tag == "key" and el.get("fifths") is not None and el.get("staff") in slot_of:
+            elif el.tag == "key" and el.get("fifths") is not None and el.get("staff") in slot_of \
+                    and x >= header:
+                # (the keys at the head of the staves come from `heads`)
                 kys.append((x, slot_of[el.get("staff")], int(el.get("fifths"))))
             elif el.tag == "clef" and el.get("staff") in slot_of:
-                kind = {"G_CLEF": "G", "G_CLEF_SMALL": "G", "G_CLEF_8VB": "G", "F_CLEF": "F",
-                        "F_CLEF_SMALL": "F", "C_CLEF": "C", "PERCUSSION_CLEF": "PERC"}.get(el.get("shape"))
+                kind = clef_kind(el)
                 if kind:
                     cls.append((x, slot_of[el.get("staff")], kind))
+        for slot, fifths in heads.get(id(system), {}).items():
+            kys.append((-1.0, slot, fifths))
         track: dict[int, list[tuple[float, str]]] = {}
         for s in system.staves:
             # the clef at the head of the staff; unread, the one carried over
-            head = s.clef or carried.get(s.slot, "")
+            head = s.clef or carried.get(s.slot, "") or usual_clef.get(s.slot, "")
+            # A staff keeps its instrument's clef from system to system. A
+            # treble or bass clef that only this system shows, with no
+            # change into it at the end of the system before, is Audiveris
+            # misreading a small clef (a flute staff read in the bass clef
+            # puts every note a sixth out).
+            usual = usual_clef.get(s.slot)
+            if head in ("G", "F") and usual and usual != head and carried.get(s.slot) != head:
+                head = usual
             track[s.slot] = [(-1.0, head)]
         for x, slot, kind in sorted(cls):
             if x > header + 1.5 * il and kind != "PERC" and track[slot][0][1] != "PERC":
@@ -1896,6 +2136,65 @@ def _direction(measure_el: ET.Element, placement: str, staff_no: int | None, off
     return dtype
 
 
+def _distinct_heads(heads: list[Head]) -> list[Head]:
+    """The chord's heads with one head per pitch. Two heads on one pitch
+    in a chord is a misreading (one head found twice, or a unison of two
+    players printed as one head) and no reader can hold it; the head kept
+    takes over the other's ties and slurs."""
+    kept: dict[tuple, Head] = {}
+    for h in heads:
+        key = (h.step, h.alter, h.octave)
+        if key not in kept:
+            kept[key] = h
+            continue
+        k = kept[key]
+        k.tie_start = k.tie_start or h.tie_start
+        k.tie_stop = k.tie_stop or h.tie_stop
+        k.slur = k.slur + [sl for sl in h.slur if sl not in k.slur]
+    return list(kept.values())
+
+
+def _stream_shapes(stream: list[Event]) -> dict[int, tuple[Fraction, str | None, int, bool]]:
+    """Per event of one voice (by id): the length, type, dots and tuplet
+    flag it is written with. A triplet is only written whole: a run of
+    triplet notes that does not fill a group (three notes of its shortest
+    value, or the same time in longer ones) is written as plain notes of
+    the largest value that fits, because a broken tuplet makes MusicXML
+    readers fail (MuseScore 4 crashes on it)."""
+    out: dict[int, tuple[Fraction, str | None, int, bool]] = {}
+    for e in stream:
+        if e.length is None or e.length <= 0:
+            continue
+        if e.whole:
+            out[id(e)] = (e.length, None, 0, False)
+        elif e.length == e.value:
+            out[id(e)] = (e.value, e.type, e.dots, e.tuplet)
+        else:
+            out[id(e)] = (*_shape(e.length, e.tuplet), e.tuplet)
+    # runs of back-to-back triplet notes
+    runs: list[list[Event]] = []
+    end = None
+    for e in stream:
+        if id(e) not in out:
+            continue
+        if out[id(e)][3] and runs and end is not None and e.onset == end and out[id(runs[-1][-1])][3]:
+            runs[-1].append(e)
+        elif out[id(e)][3]:
+            runs.append([e])
+        else:
+            runs.append([e])
+        end = e.onset + out[id(e)][0]
+    for run in runs:
+        if not out[id(run[0])][3]:
+            continue
+        nominal = [out[id(e)][0] * Fraction(3, 2) for e in run]
+        if (sum(nominal) / (3 * min(nominal))).denominator == 1:
+            continue
+        for e in run:
+            out[id(e)] = (*_shape(out[id(e)][0], False), False)
+    return out
+
+
 def write_pitched_measure(m: ET.Element, part: Part, events: list[Event], bar_len: Fraction,
                           clef_changes: list[tuple[float, int, str]]) -> None:
     """Notes of one measure of a pitched part: voice after voice, each
@@ -1929,6 +2228,7 @@ def write_pitched_measure(m: ET.Element, part: Part, events: list[Event], bar_le
             cursor = Fraction(0)
             stream = sorted((e for e in mine if e.voice == v), key=lambda e: (e.onset, e.x))
             voice_no = (staff_no[slot] - 1) * 4 + v
+            shapes = _stream_shapes(stream)
             for e in stream:
                 if e.length is None or e.length <= 0:
                     continue
@@ -1936,8 +2236,9 @@ def write_pitched_measure(m: ET.Element, part: Part, events: list[Event], bar_le
                     if cslot == slot and cx < e.x + 5:
                         attrs = ET.SubElement(m, "attributes")
                         clef = ET.SubElement(attrs, "clef", number=str(staff_no[slot]))
-                        ET.SubElement(clef, "sign").text = kind
-                        ET.SubElement(clef, "line").text = {"G": "2", "F": "4", "C": "3"}[kind]
+                        sign, line = clef_sign_line(kind)
+                        ET.SubElement(clef, "sign").text = sign
+                        ET.SubElement(clef, "line").text = line
                         pending_clefs.remove((cx, cslot, kind))
                 if e.onset > cursor:
                     f = ET.SubElement(m, "forward")
@@ -1946,15 +2247,10 @@ def write_pitched_measure(m: ET.Element, part: Part, events: list[Event], bar_le
                     cursor = e.onset
                 elif e.onset < cursor:
                     continue                      # two readings of one instant: keep the first
-                if e.whole:
-                    length, name, dots = e.length, None, 0
-                elif e.length == e.value:
-                    length, name, dots = e.value, e.type, e.dots
-                else:
-                    length, name, dots = _shape(e.length, e.tuplet)
+                length, name, dots, tuplet = shapes[id(e)]
                 duration = max(int(round(length * DIVISIONS)), 1)
                 at += duration
-                heads = e.heads if not e.rest else [None]
+                heads = _distinct_heads(e.heads) if not e.rest else [None]
                 for k, h in enumerate(heads):
                     note = ET.SubElement(m, "note")
                     if k:
@@ -1982,7 +2278,7 @@ def write_pitched_measure(m: ET.Element, part: Part, events: list[Event], bar_le
                         ET.SubElement(note, "dot")
                     if h is not None and h.accidental in ACCIDENTAL:
                         ET.SubElement(note, "accidental").text = ACCIDENTAL[h.accidental][0]
-                    if e.tuplet:
+                    if tuplet:
                         tm = ET.SubElement(note, "time-modification")
                         ET.SubElement(tm, "actual-notes").text = "3"
                         ET.SubElement(tm, "normal-notes").text = "2"
@@ -2079,6 +2375,62 @@ def _link_open_ties(per_measure: list[list[Event]], bar_lens: list[Fraction]) ->
                     source.tie_start = h.tie_stop = True
 
 
+def _score_layout(score: ET.Element, systems: list[System], pages: dict) -> None:
+    """`<defaults>` that lay a score out on the original's page: its page
+    size and margins, a staff a little smaller than the printed one (a
+    renderer spaces notes wider than an engraver packs them, as the drum
+    writer found), and the printed gaps between staves and systems. Without
+    them a renderer sets a 26-staff system at its default staff size and
+    gaps, and the system runs over two pages. In tenths: 40 tenths are one
+    staff height (`drum_grid._page_defaults` does the same for drum
+    charts)."""
+    sheets = [s for s in systems if s.staves]
+    if not sheets:
+        return
+    ink, root = pages[sheets[0].name]
+    pic = root.find("picture")
+    width = float(pic.get("width")) if pic is not None and pic.get("width") else ink.shape[1]
+    height = float(pic.get("height")) if pic is not None and pic.get("height") else ink.shape[0]
+    il = float(np.median([s.il for s in sheets]))
+    shrink = 0.65
+    mm_per_px = 210.0 / width if abs(height / width - 297 / 210) < 0.03 else 215.9 / width
+    tenths = 40 / (4 * il * shrink)          # tenths per pixel
+    five = [[st for st in s.staves if st.count == 5] for s in sheets]
+    gaps = [b.top(b.left) - a.bottom(a.left) for fs in five for a, b in zip(fs, fs[1:])]
+    lefts = [min(st.left for st in s.staves) for s in sheets]
+    rights = [max(st.right for st in s.staves) for s in sheets]
+    tops = [s.staves[0].top(s.staves[0].left) for s in sheets]
+    bottoms = [s.staves[-1].bottom(s.staves[-1].left) for s in sheets]
+    d = ET.Element("defaults")
+    sc = ET.SubElement(d, "scaling")
+    ET.SubElement(sc, "millimeters").text = f"{4 * il * mm_per_px * shrink:.4f}"
+    ET.SubElement(sc, "tenths").text = "40"
+    pl = ET.SubElement(d, "page-layout")
+    ET.SubElement(pl, "page-height").text = f"{height * tenths:.0f}"
+    ET.SubElement(pl, "page-width").text = f"{width * tenths:.0f}"
+    pm = ET.SubElement(pl, "page-margins", type="both")
+    top = max(float(np.median(tops)) - 6 * il, 2 * il)
+    bottom = max(height - float(np.median(bottoms)) - 4 * il, 2 * il)
+    ET.SubElement(pm, "left-margin").text = f"{float(np.median(lefts)) * tenths:.0f}"
+    ET.SubElement(pm, "right-margin").text = f"{max(width - float(np.median(rights)), 0) * tenths:.0f}"
+    ET.SubElement(pm, "top-margin").text = f"{top * tenths:.0f}"
+    ET.SubElement(pm, "bottom-margin").text = f"{bottom * tenths:.0f}"
+    if gaps:
+        # the printed gaps, a little tightened: the renderer adds room for
+        # what sticks out of a staff, the engraver tucked it in
+        gap = float(np.median(gaps)) * 0.85
+        sl = ET.SubElement(d, "system-layout")
+        ET.SubElement(sl, "system-distance").text = f"{gap * 1.5 * tenths:.0f}"
+        ET.SubElement(sl, "top-system-distance").text = "0"
+        st = ET.SubElement(d, "staff-layout")
+        ET.SubElement(st, "staff-distance").text = f"{gap * tenths:.0f}"
+    old = score.find("defaults")
+    if old is not None:
+        score.remove(old)
+    at = next((k for k, el in enumerate(score) if el.tag == "part-list"), 0)
+    score.insert(at, d)
+
+
 def convert(work: Path, out: Path) -> dict:
     omr = next(work.glob("*.omr"))
     systems, pages = read_layout(omr)
@@ -2147,7 +2499,7 @@ def convert(work: Path, out: Path) -> dict:
                 # the last system ended in: a change at its head
                 for slot, changes in track.items():
                     head = changes[0][1]
-                    if slot in pitched_slots and head in ("G", "F", "C") \
+                    if slot in pitched_slots and head and head != "PERC" \
                             and in_force.get(slot, head) != head:
                         changes_here.insert(0, (bar["x0"] - system.il, slot, head))
                 for slot, changes in track.items():
@@ -2214,8 +2566,9 @@ def convert(work: Path, out: Path) -> dict:
                         clef = ET.SubElement(attrs, "clef")
                         if len(part.slots) > 1:
                             clef.set("number", str(k + 1))
-                        ET.SubElement(clef, "sign").text = kind
-                        ET.SubElement(clef, "line").text = {"G": "2", "F": "4", "C": "3"}.get(kind, "2")
+                        sign, line = clef_sign_line(kind)
+                        ET.SubElement(clef, "sign").text = sign
+                        ET.SubElement(clef, "line").text = line
                 if len(attrs):
                     m.append(attrs)
                 write_pitched_measure(m, part, per_measure[i], bar_lens[i], clef_changes[i])
@@ -2386,6 +2739,7 @@ def convert(work: Path, out: Path) -> dict:
     print("  placed from the page: " + ", ".join(f"{v} {k}" for k, v in placed.items()), flush=True)
     stats["placed"] = placed
 
+    _score_layout(score, systems, pages)
     out.parent.mkdir(parents=True, exist_ok=True)
     ET.indent(score)
     ET.ElementTree(score).write(out, encoding="UTF-8", xml_declaration=True)
