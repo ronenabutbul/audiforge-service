@@ -165,8 +165,17 @@ def _run_homr_pipeline(job_id: str, job_dir: Path, source: Path) -> Path:
     outputs: list[Path] = []
     for i, page in enumerate(pages, start=1):
         logger.info("job %s: homr page %d/%d", job_id, i, len(pages))
-        outputs.append(_run_homr(page))
+        # A booklet has pages with no music on them (a cover, an
+        # introduction, blank sides). homr finds no staff there and writes
+        # nothing; that page is left out, and the pages with music are kept.
+        try:
+            outputs.append(_run_homr(page))
+        except RuntimeError as error:
+            unreadable = error
+            logger.warning("job %s: homr page %d unreadable, skipped", job_id, i)
         _update_job(job_id, progress=0.1 + 0.6 * (i / len(pages)))
+    if not outputs:
+        raise unreadable
     result = job_dir / "homr.musicxml"
     if len(outputs) == 1:
         shutil.copy(outputs[0], result)

@@ -84,16 +84,23 @@ def run_homr(pdf: Path, work_dir: Path, homr_bin: Path = None) -> Path:
         # failed" during teardown) — the result is fine, so only a missing
         # output file counts as failure.
         if not produced:
-            raise RuntimeError(
+            # A page with no music on it (a cover, text, a blank side) is
+            # left out, as app/main.py does; only a book with no readable
+            # page at all is a failure.
+            unreadable = RuntimeError(
                 f"homr produced no MusicXML for {page.name} "
                 f"(exit {result.returncode}): "
                 f"{result.stderr[-2000:] or result.stdout[-2000:]}"
             )
+            print(f"  homr: {page.name} unreadable, skipped", flush=True)
+            continue
         if result.returncode != 0:
             print(f"  note: homr exited {result.returncode} on {page.name} "
                   f"but wrote output; using it", flush=True)
         outputs.append(produced[0])
 
+    if not outputs:
+        raise unreadable
     return merge_musicxml(outputs, work_dir / "merged.musicxml")
 
 
