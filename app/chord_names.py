@@ -12,6 +12,7 @@ Flats and sharps are told by shape, the letters and digits by tesseract.
 from __future__ import annotations
 
 import hashlib
+import xml.etree.ElementTree as ET
 import os
 import re
 import statistics
@@ -40,6 +41,44 @@ def _runs(flags) -> list[tuple[int, int]]:
             out.append((start, k))
             start = None
     return out
+
+
+class System:
+    """One staff of the page: where it is, and its strip made level."""
+
+    def __init__(self, ink: np.ndarray, el: ET.Element, ceiling: float):
+        staff = el.find(".//staff")
+        self.lines = staff.findall("lines/line")
+        self.stacks = [(float(s.get("left")), float(s.get("right"))) for s in el.findall("stack")]
+        self.x0 = int(float(staff.get("left", self.stacks[0][0])))
+        self.x1 = int(min(max(float(staff.get("right", 0)), self.stacks[-1][1]), ink.shape[1] - 1))
+        pts = [sorted((float(p.get("x")), float(p.get("y"))) for p in ln.findall("point"))
+               for ln in (self.lines[0], self.lines[-1])]
+        self._top, self._bottom = pts
+        mid = (self.x0 + self.x1) / 2
+        self.il = float(self.bottom(mid) - self.top(mid)) / 4
+        self.thick = max(int(round(float(self.lines[0].get("thickness", "2")))), 1)
+        il = self.il
+        # room above: as far as the staff before, but never past twelve spaces
+        # high enough for a rehearsal box set over an ending bracket
+        self.up = int(max(min(12.0 * il, self.top(mid) - ceiling), 2.5 * il))
+        self.down = int(6.0 * il)
+        xs = np.arange(self.x0, self.x1)
+        tops = np.round(np.interp(xs, [p[0] for p in self._top], [p[1] for p in self._top])).astype(int)
+        rows = tops[None, :] + np.arange(-self.up, self.down)[:, None]
+        ok = (rows >= 0) & (rows < ink.shape[0])
+        self.strip = ink[rows.clip(0, ink.shape[0] - 1), xs[None, :]] & ok
+        self.el = el
+
+    def top(self, x: float) -> float:
+        return float(np.interp(x, [p[0] for p in self._top], [p[1] for p in self._top]))
+
+    def bottom(self, x: float) -> float:
+        return float(np.interp(x, [p[0] for p in self._bottom], [p[1] for p in self._bottom]))
+
+    def band(self, ya: float, yb: float) -> np.ndarray:
+        """Rows ya..yb of the strip, counted in pixels from the top line."""
+        return self.strip[max(int(self.up + ya), 0):int(self.up + yb)]
 
 
 # chord_symbol.dart `_qualities`: what may stand between root and bass
@@ -179,7 +218,7 @@ class Names:
             out.append({"frame": f, "inside": inside})
         return out
 
-    def image(self, parts: list[dict], close: bool = False) -> Image.Image:
+    def image(self, parts: list[dict], close: bool = False, bridge: int = 0) -> Image.Image:
         """close: bridge one-pixel gaps, for small print whose hairlines
         Audiveris's binary image lost (the join of an m, the neck of a 7)."""
         xa = min(p["x"] for p in parts)
@@ -192,6 +231,9 @@ class Names:
         canvas[pad:pad + yb - ya, pad:pad + xb - xa][keep] = 0
         if close:
             canvas = 255 - cv2.morphologyEx(255 - canvas, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
+        if bridge:
+            # a letter that came apart side by side: join across the gap
+            canvas = 255 - cv2.morphologyEx(255 - canvas, cv2.MORPH_CLOSE, np.ones((1, bridge), np.uint8))
         img = Image.fromarray(canvas)
         scale = max(1.0, 64 / max(yb - ya, 1))
         return img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
@@ -260,7 +302,7 @@ WHITE = "ABCDEFGMNadgijmnosu0123456789()/+-."
 DIGITS = "0123456789"
 
 
-def letter_height(systems: list, all_names: list[Names]) -> float | None:
+def letter_height(systems: list[System], all_names: list[Names]) -> float | None:
     """The height of a capital in the chord names of a page: the height
     most pieces of ink above the staves share."""
     hs = []
@@ -305,18 +347,23 @@ def read_marks(names: Names) -> tuple[list[dict], set[int]]:
     return marks, used
 
 
-def _read_run(names: Names, parts: list[dict], cap: float, alone: bool = False) -> str:
+def _read_run(names: Names, parts: list[dict], cap: float, alone: bool = False,
+              mend: bool = False) -> str:
     """Text of one stretch of a name: signs by shape, the rest by tesseract.
     alone: every letter read by itself (a second try when the line reading
-    made no chord: tesseract reads the 6 of a lone "m6" as an o)."""
+    made no chord: tesseract reads the 6 of a lone "m6" as an o).
+    mend: letters read alone, with a lower-case letter that came apart
+    (an m whose last stem came loose) put back together first."""
     text, chunk = "", []
 
     def flush():
         nonlocal text, chunk
         if chunk:
             if alone:
-                for g in _glyphs(chunk, touch=0):    # overlapping, not merely near (the 1s of 11)
-                    text += ocr(names.image(g, close=True), True, WHITE)
+                # overlapping, not merely near (the 1s of 11)
+                for g in _glyphs(chunk, touch=0, low=cap if mend else None):
+                    gap = int(round(0.15 * cap)) if mend and len(g) > 1 else 0
+                    text += ocr(names.image(g, close=True, bridge=gap), True, WHITE)
             else:
                 broken = any(len(g) > 1 for g in _glyphs(chunk))
                 text += ocr(names.image(chunk, close=broken), len(chunk) == 1, WHITE)
@@ -355,12 +402,28 @@ def _read_token(names: Names, tok: list[dict], cap: float, base: float) -> str:
             runs[-1][1].extend(g)
         else:
             runs.append((raised, list(g)))
-    text = "".join(_read_run(names, parts, cap) for _up, parts in runs)
+    texts = [_read_run(names, parts, cap) for _up, parts in runs]
+    text = "".join(texts)
     if text[:1] in ("E", "F") and glyphs:
         text = _e_or_f(names, glyphs[0]) + text[1:]
+    # Figures are as tall as capitals; a digit read on the line where the
+    # only ink beside the capitals is lower-case high is a letter that came
+    # apart (the m of Bm read as "11"). Read it again with the pieces of
+    # lower-case height mended, and keep that if it is a chord with fewer
+    # characters.
+    if parse_chord(tidy(text)) is not None and any(
+            not up and re.search(r"\d", t) and not any(_height(g) >= 0.8 * cap for g in _glyphs(parts)[1:])
+            for (up, parts), t in zip(runs, texts)):
+        mended = "".join(_read_run(names, parts, cap, alone=True, mend=True) for _up, parts in runs)
+        if mended[:1] in ("E", "F") and glyphs:
+            mended = _e_or_f(names, glyphs[0]) + mended[1:]
+        if parse_chord(tidy(mended)) is not None and len(tidy(mended)) < len(tidy(text)):
+            return mended
     # read again letter by letter when the reading is no chord, or when it
     # has fewer characters than the name has letters (ink went unread)
-    short = len(re.sub(r"[^A-Za-z0-9#+/()]", "", text)) < len(glyphs)
+    # (an m on the line that came apart in two is one letter, not two)
+    letters = sum(len(_glyphs(parts, low=None if up else cap)) for up, parts in runs)
+    short = len(re.sub(r"[^A-Za-z0-9#+/()]", "", text)) < letters
     if parse_chord(tidy(text)) is None or short:
         again = "".join(_read_run(names, parts, cap, alone=True) for _up, parts in runs)
         if again[:1] in ("E", "F") and glyphs:
@@ -382,11 +445,17 @@ def _e_or_f(names: Names, g: list[dict]) -> str:
     return "E" if foot > 0.8 else "F"
 
 
-def _glyphs(tok: list[dict], touch: float = -1) -> list[list[dict]]:
+def _height(g: list[dict]) -> int:
+    return max(q["y"] + q["h"] for q in g) - min(q["y"] for q in g)
+
+
+def _glyphs(tok: list[dict], touch: float = -1, low: float | None = None) -> list[list[dict]]:
     """Ink parts grouped into letters: a letter printed in more than one
     piece (the bar and the stem of a thin 7) is its pieces one above the
     other. touch: also pieces side by side with no more than this gap (an
-    m whose first stem came loose). Stacked 6/9 figures stay alone."""
+    m whose first stem came loose). low: the capital height; two pieces
+    both lower than a capital, side by side within an eighth of it, are
+    one lower-case letter. Stacked 6/9 figures stay alone."""
     glyphs: list[list[dict]] = []
     for p in tok:
         if glyphs and "stacked" not in p and "stacked" not in glyphs[-1][-1]:
@@ -396,7 +465,10 @@ def _glyphs(tok: list[dict], touch: float = -1) -> list[list[dict]]:
             gy1 = max(q["y"] + q["h"] for q in glyphs[-1])
             over = min(gx1, p["x"] + p["w"]) - max(gx0, p["x"])
             same_rows = min(gy1, p["y"] + p["h"]) - max(gy0, p["y"]) > 0.8 * min(p["h"], gy1 - gy0)
-            if over > 0.5 * min(p["w"], gx1 - gx0) or (touch >= 0 and -2 <= p["x"] - gx1 <= touch and same_rows):
+            lower = low is not None and max(p["h"], gy1 - gy0) < 0.8 * low \
+                and p["x"] - gx1 <= 0.125 * low and same_rows
+            if over > 0.5 * min(p["w"], gx1 - gx0) or lower \
+                    or (touch >= 0 and -2 <= p["x"] - gx1 <= touch and same_rows):
                 glyphs[-1].append(p)
                 continue
         glyphs.append([p])
@@ -467,6 +539,13 @@ def read_names(names: Names, used: set[int], cap: float, base: float, verbose: b
     # an ending bracket, a tie, a hairpin: too long or too flat for a letter
     parts = [p for p in parts if p["w"] <= 4.0 * cap and not (p["w"] > cap and p["w"] > 2.5 * p["h"])]
     parts = [p for p in parts if abs(p["y"] + p["h"] / 2 - (base - cap / 2)) < 0.9 * cap]
+    # a raised figure in a name stands with its foot less than three
+    # quarters of a capital over the line: ink higher than that, top and
+    # foot, is a line of text over the names (a "Fine" set above the last
+    # name), or names on a line of their own (over an ending bracket),
+    # read with that line. The dot of an i or a j stands that high.
+    parts = [p for p in parts if p["y"] > base - 1.75 * cap and (
+        p["y"] + p["h"] > base - 0.75 * cap or (p["h"] < 0.3 * cap and p["w"] < 0.3 * cap))]
     parts.sort(key=lambda p: p["x"])
     tokens: list[list[dict]] = []
     for p in parts:
@@ -489,6 +568,17 @@ def read_names(names: Names, used: set[int], cap: float, base: float, verbose: b
         several = None
         if chord is None:
             several = _split_names(names, tok, cap, base)
+        if chord is None and several is None:
+            # a figure before a name: no name starts with one, so it is the
+            # number of the ending bracket the name stands in
+            lead = re.match(r"^(\d+)\.?(?=[A-G])", name)
+            glyphs = _glyphs(tok)
+            if lead and len(glyphs) > len(lead.group(1)):
+                rest = [p for g in glyphs[len(lead.group(1)):] for p in g]
+                rest = [p for p in rest if p["h"] > 0.3 * cap or p["w"] > 0.3 * cap]   # its full stop
+                again = parse_chord(tidy(_read_token(names, rest, cap, base))) if rest else None
+                if again is not None:
+                    chord, tok = again, rest
         if chord is None and several is None:
             # one more look at the whole name in one piece
             whole = tidy(ocr(names.image(tok), False, WHITE + "#b"))
@@ -545,3 +635,77 @@ def harmony_xml(c: dict, offset: int) -> str:
         out.append(f"        <offset>{offset}</offset>")
     out.append("      </harmony>")
     return "\n".join(out)
+
+
+def page_names(ink: np.ndarray, systems: list[System], verbose: bool = False) -> list[tuple[list[dict], list[dict]]]:
+    """(chord names, boxed rehearsal marks) above each staff of one page.
+    The names of a page share one size of capital and stand on one line
+    above their staff; a system with a name or two takes that line from
+    the systems around it."""
+    all_names = [Names(ink, s.x0, s.x1, 0, 0, s.il, strip=s.band(-s.up, -0.15 * s.il)) for s in systems]
+    for s, names in zip(systems, all_names):
+        names.oy = -s.up                         # rows of the strip count from the top line
+    cap = letter_height(systems, all_names)
+    found = [read_marks(names) for names in all_names]
+    rows = []
+    for names, (_marks, used) in zip(all_names, found):
+        parts = [p for p in names.parts if p["i"] not in used and p["y"] + p["h"] < names.box.shape[0] - 1]
+        rows.append(_row(parts, cap, None) if cap else (None, 0))
+    sure = [names.box.shape[0] - base for names, (base, n) in zip(all_names, rows) if base is not None and n >= 3]
+    usual = statistics.median(sure) if sure else None
+    out = []
+    for k, (s, names, (marks, used)) in enumerate(zip(systems, all_names, found)):
+        il = s.il
+        base = rows[k][0]
+        if cap and usual is not None and rows[k][1] <= 2:
+            parts = [p for p in names.parts if p["i"] not in used and p["y"] + p["h"] < names.box.shape[0] - 1]
+            base = _row(parts, cap, names.box.shape[0] - usual)[0]
+        if verbose:
+            print(f"  system {k + 1}: il {il:.1f}, capital {cap}, names stand {None if base is None else names.box.shape[0] - base:.0f} px above the strip's foot")
+        chords = read_names(names, used, cap, base, verbose) if cap and base is not None else []
+        if cap and base is not None and any("unread" in c for c in chords):
+            # the line with the most capital feet can be a line of other
+            # text (a dedication over a lead sheet's first staff): the names
+            # stand on whichever line reads as the most names
+            parts = [p for p in names.parts if p["i"] not in used and p["y"] + p["h"] < names.box.shape[0] - 1]
+            for line in _lines(parts, cap):
+                if abs(line - base) < 0.5 * cap:
+                    continue
+                other = read_names(names, used, cap, line, False)
+                if _worth(other) > _worth(chords):
+                    if verbose:
+                        print(f"    names stand on the line {names.box.shape[0] - line:.0f} px up instead")
+                    chords, base = other, line
+        if cap and base is not None:
+            # names over an ending bracket stand a little higher than those
+            # beside it, on a line of their own less than a capital and a
+            # quarter away: add the chords read there where the row has none
+            parts = [p for p in names.parts if p["i"] not in used and p["y"] + p["h"] < names.box.shape[0] - 1]
+            for line in _lines(parts, cap):
+                if not 0.5 * cap <= abs(line - base) <= 1.25 * cap:
+                    continue
+                for c in read_names(names, used, cap, line, False):
+                    if "unread" not in c and not any(c["x"] < o["x1"] and o["x"] < c["x1"] for o in chords):
+                        if verbose:
+                            print(f"    and {c['text']} at x={c['x']} on the line {names.box.shape[0] - line:.0f} px up")
+                        chords.append(c)
+            chords.sort(key=lambda c: c["x"])
+        out.append((chords, marks))
+    return out
+
+
+def _lines(parts: list[dict], cap: float) -> list[float]:
+    """Every line at least two capitals stand on, lowest first."""
+    feet = sorted(p["y"] + p["h"] for p in parts if 0.8 * cap < p["h"] < 1.25 * cap)
+    lines: list[list[int]] = []
+    for f in feet:
+        if lines and f - lines[-1][-1] < 0.25 * cap:
+            lines[-1].append(f)
+        else:
+            lines.append([f])
+    return sorted((float(statistics.median(m)) for m in lines if len(m) >= 2), reverse=True)
+
+
+def _worth(chords: list[dict]) -> int:
+    """Names read minus text that is no name."""
+    return sum(-1 if "unread" in c else 1 for c in chords)

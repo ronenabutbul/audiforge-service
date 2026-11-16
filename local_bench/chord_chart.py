@@ -54,48 +54,9 @@ if str(BENCH_DIR.parent) not in sys.path:
 # (ocr, Names and parse_chord are imported from here by drum_ink, partitura
 # and test_chord_chart)
 from app.chord_names import (  # noqa: E402,F401
-    FLATS, Names, _row, harmony_xml, letter_height, ocr, parse_chord, read_marks,
-    read_names)
+    FLATS, Names, System, harmony_xml, ocr, page_names, parse_chord)
 
 # ------------------------------------------------------------ one system
-
-class System:
-    """One staff of the page: where it is, and its strip made level."""
-
-    def __init__(self, ink: np.ndarray, el: ET.Element, ceiling: float):
-        staff = el.find(".//staff")
-        self.lines = staff.findall("lines/line")
-        self.stacks = [(float(s.get("left")), float(s.get("right"))) for s in el.findall("stack")]
-        self.x0 = int(float(staff.get("left", self.stacks[0][0])))
-        self.x1 = int(min(max(float(staff.get("right", 0)), self.stacks[-1][1]), ink.shape[1] - 1))
-        pts = [sorted((float(p.get("x")), float(p.get("y"))) for p in ln.findall("point"))
-               for ln in (self.lines[0], self.lines[-1])]
-        self._top, self._bottom = pts
-        mid = (self.x0 + self.x1) / 2
-        self.il = float(self.bottom(mid) - self.top(mid)) / 4
-        self.thick = max(int(round(float(self.lines[0].get("thickness", "2")))), 1)
-        il = self.il
-        # room above: as far as the staff before, but never past twelve spaces
-        # high enough for a rehearsal box set over an ending bracket
-        self.up = int(max(min(12.0 * il, self.top(mid) - ceiling), 2.5 * il))
-        self.down = int(6.0 * il)
-        xs = np.arange(self.x0, self.x1)
-        tops = np.round(np.interp(xs, [p[0] for p in self._top], [p[1] for p in self._top])).astype(int)
-        rows = tops[None, :] + np.arange(-self.up, self.down)[:, None]
-        ok = (rows >= 0) & (rows < ink.shape[0])
-        self.strip = ink[rows.clip(0, ink.shape[0] - 1), xs[None, :]] & ok
-        self.el = el
-
-    def top(self, x: float) -> float:
-        return float(np.interp(x, [p[0] for p in self._top], [p[1] for p in self._top]))
-
-    def bottom(self, x: float) -> float:
-        return float(np.interp(x, [p[0] for p in self._bottom], [p[1] for p in self._bottom]))
-
-    def band(self, ya: float, yb: float) -> np.ndarray:
-        """Rows ya..yb of the strip, counted in pixels from the top line."""
-        return self.strip[max(int(self.up + ya), 0):int(self.up + yb)]
-
 
 def _bounds(el: ET.Element) -> tuple[float, float, float, float] | None:
     b = el.find("bounds")
@@ -410,27 +371,9 @@ def read_sheet(ink: np.ndarray, root: ET.Element, verbose: bool, stack0: int = 0
         s = System(ink, el, previous_bottom)
         previous_bottom = s.bottom((s.x0 + s.x1) / 2) + 1.5 * s.il
         systems.append(s)
-    all_names = [Names(ink, s.x0, s.x1, 0, 0, s.il, strip=s.band(-s.up, -0.15 * s.il)) for s in systems]
-    for s, names in zip(systems, all_names):
-        names.oy = -s.up                         # rows of the strip count from the top line
-    cap = letter_height(systems, all_names)
-    found = [read_marks(names) for names in all_names]
-    rows = []
-    for names, (_marks, used) in zip(all_names, found):
-        parts = [p for p in names.parts if p["i"] not in used and p["y"] + p["h"] < names.box.shape[0] - 1]
-        rows.append(_row(parts, cap, None) if cap else (None, 0))
-    sure = [names.box.shape[0] - base for names, (base, n) in zip(all_names, rows) if base is not None and n >= 3]
-    usual = statistics.median(sure) if sure else None
     out = []
-    for k, (s, names, (marks, used)) in enumerate(zip(systems, all_names, found)):
+    for s, (chords, marks) in zip(systems, page_names(ink, systems, verbose)):
         il = s.il
-        base = rows[k][0]
-        if cap and usual is not None and rows[k][1] <= 2:
-            parts = [p for p in names.parts if p["i"] not in used and p["y"] + p["h"] < names.box.shape[0] - 1]
-            base = _row(parts, cap, names.box.shape[0] - usual)[0]
-        if verbose:
-            print(f"  system {k + 1}: il {il:.1f}, capital {cap}, names stand {None if base is None else names.box.shape[0] - base:.0f} px above the strip's foot")
-        chords = read_names(names, used, cap, base, verbose) if cap and base is not None else []
         sig = _signatures(s)
         head = s.el.find(".//staff/header")
         header = float(head.get("stop")) if head is not None and head.get("stop") else float(s.x0)
