@@ -244,8 +244,15 @@ def _value_at(sheet: Sheet, sx: float, tip: float, toward: int, length: float, i
 
 
 def _is_barline(system: System, sx: float, sy0: float, sy1: float) -> bool:
-    top = system.top(sx)
-    return abs(sy0 - top) < 0.4 * system.il and abs(sy1 - top - 4 * system.il) < 0.4 * system.il
+    """A line from the top staff line to the bottom one, where the system
+    has a barline. (A stem from a head on the top line down to a beam
+    under the staff spans the same rows, but stands inside a bar.)"""
+    top, il = system.top(sx), system.il
+    if not (abs(sy0 - top) < 0.4 * il and abs(sy1 - top - 4 * il) < 0.4 * il):
+        return False
+    edges = [x for st in system.stacks for x in st]
+    edges += [b[0] + b[2] / 2 for b in (_bounds(e) for e in system.el.iter("barline")) if b]
+    return any(abs(sx - x) < 0.6 * il for x in edges)
 
 
 def read_items(sheet: Sheet, system: System, header: float, blocked: list[tuple[float, float]],
@@ -294,6 +301,16 @@ def read_items(sheet: Sheet, system: System, header: float, blocked: list[tuple[
         if b and h.get("shape") in ("NOTEHEAD_VOID", "WHOLE_NOTE") and free(b[0] + b[2] / 2, b[1] + b[3] / 2):
             heads.append((b[0] + b[2] / 2, b[1] + b[3] / 2,
                           "void" if h.get("shape") == "NOTEHEAD_VOID" else "whole"))
+        # a filled head Audiveris saw that the ink finder missed (a head
+        # crossed by a ledger line), outside the staff, on a stem
+        elif b and h.get("shape") == "NOTEHEAD_BLACK":
+            hx, hy = b[0] + b[2] / 2, b[1] + b[3] / 2
+            rel = hy - system.top(hx)
+            if free(hx, hy) and not -0.3 * il <= rel <= 4.3 * il \
+                    and not any(abs(hx - fx) < 0.6 * il and abs(hy - fy) < 0.6 * il for fx, fy, _k in heads) \
+                    and any(abs(sx - hx) < 0.9 * il and sy0 - 0.6 * il <= hy <= sy1 + 0.6 * il
+                            for sx, sy0, sy1 in sheet.stems):
+                heads.append((hx, hy, "filled"))
     heads.sort()
     counts = [b for b in (_bounds(e) for e in el.iter("measure-count")) if b]
     for hx, hy, kind in heads:
