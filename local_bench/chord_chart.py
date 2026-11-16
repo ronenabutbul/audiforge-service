@@ -147,12 +147,35 @@ def _tied(system: System, a: dict, b: dict) -> bool:
     # bridge the arc where it ran along the blanked line
     box = cv2.morphologyEx(box, cv2.MORPH_CLOSE, np.ones((2 * t + 3, 1), np.uint8))
     n, lab, stats, _c = cv2.connectedComponentsWithStats(box, connectivity=8)
+    thin = []
     for i in range(1, n):
         x, y, w, h, _area = (int(v) for v in stats[i])
-        if w < 0.6 * span or h > 1.2 * il or y == 0:
+        if h > 1.2 * il or y == 0:
             continue
         g = lab[y:y + h, x:x + w] == i
         if g.sum(axis=0).max() <= 0.45 * il:
+            thin.append((x, y, w, h))
+    # A tie into the next bar crosses the line at a shallow slope, and
+    # blanking the line cuts it into pieces where the vertical bridge
+    # cannot reach. Pieces whose facing ends both meet the blanked rows,
+    # less than an interline apart, are one arc crossing the line.
+    band = (line - t - 1, line + t + 1)
+
+    def meets(y, h):
+        return y <= band[1] and y + h - 1 >= band[0]
+    thin.sort()
+    chains: list[list[tuple[int, int, int, int]]] = []
+    for piece in thin:
+        last = chains[-1][-1] if chains else None
+        if last and 0 <= piece[0] - (last[0] + last[2]) <= il \
+                and meets(last[1], last[3]) and meets(piece[1], piece[3]):
+            chains[-1].append(piece)
+        else:
+            chains.append([piece])
+    for chain in chains:
+        x0, x1 = chain[0][0], max(p[0] + p[2] for p in chain)
+        y0, y1 = min(p[1] for p in chain), max(p[1] + p[3] for p in chain)
+        if x1 - x0 >= 0.6 * span and y1 - y0 <= 1.2 * il:
             return True
     return False
 
