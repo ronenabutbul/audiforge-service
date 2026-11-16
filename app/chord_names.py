@@ -364,25 +364,30 @@ def read_marks(names: Names) -> tuple[list[dict], set[int]]:
 
 
 def _read_run(names: Names, parts: list[dict], cap: float, alone: bool = False,
-              mend: bool = False) -> str:
+              mend: bool = False, suffix: bool = False) -> str:
     """Text of one stretch of a name: signs by shape, the rest by tesseract.
     alone: every letter read by itself (a second try when the line reading
     made no chord: tesseract reads the 6 of a lone "m6" as an o).
     mend: letters read alone, with a lower-case letter that came apart
-    (an m whose last stem came loose) put back together first."""
+    (an m whose last stem came loose) put back together first.
+    suffix: the stretch holds no root (it follows one, raised)."""
     text, chunk = "", []
+    # A sign after the root's own (past the root, or in a raised stretch)
+    # alters a degree: what follows it is the degree's number (b5, #9, b13)
+    degree = False
 
     def flush():
         nonlocal text, chunk
         if chunk:
+            white = DIGITS if degree else WHITE
             if alone:
                 # overlapping, not merely near (the 1s of 11)
-                for g in _glyphs(chunk, touch=0, low=cap if mend else None):
+                for g in _glyphs(chunk, touch=0, low=cap if mend else None, cap=cap):
                     gap = int(round(0.15 * cap)) if mend and len(g) > 1 else 0
-                    text += ocr(names.image(g, close=True, bridge=gap), True, WHITE)
+                    text += ocr(names.image(g, close=True, bridge=gap), True, white)
             else:
                 broken = any(len(g) > 1 for g in _glyphs(chunk))
-                text += ocr(names.image(chunk, close=broken), len(chunk) == 1, WHITE)
+                text += ocr(names.image(chunk, close=broken), len(chunk) == 1, white)
             chunk = []
 
     for p in parts:
@@ -393,8 +398,12 @@ def _read_run(names: Names, parts: list[dict], cap: float, alone: bool = False,
         acc = names.accidental(p, cap)
         if acc:
             flush()
+            degree = suffix or len(text) > 1
             text += acc
         else:
+            if degree and chunk:
+                flush()                 # the degree is one figure or two, read alone
+                degree = False
             chunk.append(p)
     flush()
     return text
@@ -418,7 +427,7 @@ def _read_token(names: Names, tok: list[dict], cap: float, base: float) -> str:
             runs[-1][1].extend(g)
         else:
             runs.append((raised, list(g)))
-    texts = [_read_run(names, parts, cap) for _up, parts in runs]
+    texts = [_read_run(names, parts, cap, suffix=k > 0) for k, (_up, parts) in enumerate(runs)]
     text = "".join(texts)
     if text[:1] in ("E", "F") and glyphs:
         text = _e_or_f(names, glyphs[0]) + text[1:]
@@ -430,7 +439,8 @@ def _read_token(names: Names, tok: list[dict], cap: float, base: float) -> str:
     if parse_chord(tidy(text)) is not None and any(
             not up and re.search(r"\d", t) and not any(_height(g) >= 0.8 * cap for g in _glyphs(parts)[1:])
             for (up, parts), t in zip(runs, texts)):
-        mended = "".join(_read_run(names, parts, cap, alone=True, mend=True) for _up, parts in runs)
+        mended = "".join(_read_run(names, parts, cap, alone=True, mend=True, suffix=k > 0)
+                         for k, (_up, parts) in enumerate(runs))
         if mended[:1] in ("E", "F") and glyphs:
             mended = _e_or_f(names, glyphs[0]) + mended[1:]
         if parse_chord(tidy(mended)) is not None and len(tidy(mended)) < len(tidy(text)):
@@ -441,7 +451,8 @@ def _read_token(names: Names, tok: list[dict], cap: float, base: float) -> str:
     letters = sum(len(_glyphs(parts, low=None if up else cap)) for up, parts in runs)
     short = len(re.sub(r"[^A-Za-z0-9#+/()]", "", text)) < letters
     if parse_chord(tidy(text)) is None or short:
-        again = "".join(_read_run(names, parts, cap, alone=True) for _up, parts in runs)
+        again = "".join(_read_run(names, parts, cap, alone=True, suffix=k > 0)
+                        for k, (_up, parts) in enumerate(runs))
         if again[:1] in ("E", "F") and glyphs:
             again = _e_or_f(names, glyphs[0]) + again[1:]
         if parse_chord(tidy(again)) is not None and (parse_chord(tidy(text)) is None or len(again) > len(text)):
@@ -465,13 +476,16 @@ def _height(g: list[dict]) -> int:
     return max(q["y"] + q["h"] for q in g) - min(q["y"] for q in g)
 
 
-def _glyphs(tok: list[dict], touch: float = -1, low: float | None = None) -> list[list[dict]]:
+def _glyphs(tok: list[dict], touch: float = -1, low: float | None = None,
+            cap: float | None = None) -> list[list[dict]]:
     """Ink parts grouped into letters: a letter printed in more than one
     piece (the bar and the stem of a thin 7) is its pieces one above the
     other. touch: also pieces side by side with no more than this gap (an
     m whose first stem came loose). low: the capital height; two pieces
     both lower than a capital, side by side within an eighth of it, are
-    one lower-case letter. Stacked 6/9 figures stay alone."""
+    one lower-case letter. cap: the capital height; two capitals or
+    figures that touch are two letters (an A against its 7), never a
+    letter come apart. Stacked 6/9 figures stay alone."""
     glyphs: list[list[dict]] = []
     for p in tok:
         if glyphs and "stacked" not in p and "stacked" not in glyphs[-1][-1]:
@@ -483,8 +497,9 @@ def _glyphs(tok: list[dict], touch: float = -1, low: float | None = None) -> lis
             same_rows = min(gy1, p["y"] + p["h"]) - max(gy0, p["y"]) > 0.8 * min(p["h"], gy1 - gy0)
             lower = low is not None and max(p["h"], gy1 - gy0) < 0.8 * low \
                 and p["x"] - gx1 <= 0.125 * low and same_rows
+            short = cap is None or min(p["h"], gy1 - gy0) < 0.8 * cap
             if over > 0.5 * min(p["w"], gx1 - gx0) or lower \
-                    or (touch >= 0 and -2 <= p["x"] - gx1 <= touch and same_rows):
+                    or (touch >= 0 and -2 <= p["x"] - gx1 <= touch and same_rows and short):
                 glyphs[-1].append(p)
                 continue
         glyphs.append([p])
