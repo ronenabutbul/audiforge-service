@@ -28,14 +28,11 @@ converted chart opens there as an editable chart.
 """
 from __future__ import annotations
 
-import hashlib
 import io
 import os
 import re
 import statistics
-import subprocess
 import sys
-import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
 from fractions import Fraction
@@ -46,267 +43,20 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from drum_ink import REST_SLOTS, Sheet, _runs, _sheets
+from drum_ink import REST_SLOTS, Sheet, _sheets  # noqa: F401
 
 BENCH_DIR = Path(__file__).resolve().parent
 TESSDATA = BENCH_DIR / "tools" / "tessdata"
 APP_DIR = BENCH_DIR.parent / "app"
-
-# chord_symbol.dart `_qualities`: what may stand between root and bass
-QUALITIES = {
-    "": "major", "maj": "major", "M": "major", "m": "minor", "min": "minor",
-    "-": "minor", "aug": "augmented", "+": "augmented", "dim": "diminished",
-    "o": "diminished", "7": "dominant", "maj7": "major-seventh",
-    "Maj7": "major-seventh", "M7": "major-seventh", "m7": "minor-seventh",
-    "min7": "minor-seventh", "-7": "minor-seventh", "o7": "diminished-seventh",
-    "dim7": "diminished-seventh", "m7b5": "half-diminished",
-    "-7b5": "half-diminished", "+7": "augmented-seventh",
-    "aug7": "augmented-seventh", "7#5": "augmented-seventh",
-    "mMaj7": "major-minor", "mmaj7": "major-minor", "6": "major-sixth",
-    "m6": "minor-sixth", "9": "dominant-ninth", "maj9": "major-ninth",
-    "m9": "minor-ninth", "11": "dominant-11th", "maj11": "major-11th",
-    "m11": "minor-11th", "13": "dominant-13th", "maj13": "major-13th",
-    "m13": "minor-13th", "sus2": "suspended-second", "sus4": "suspended-fourth",
-    "sus": "suspended-fourth", "7sus4": "suspended-fourth",
-    "7sus": "suspended-fourth", "5": "power", "6/9": "major-sixth",
-    "69": "major-sixth", "°": "diminished", "°7": "diminished-seventh",
-    "Δ": "major-seventh", "Δ7": "major-seventh", "ø": "half-diminished",
-    "ø7": "half-diminished", "m(maj7)": "major-minor",
-}
-ALTER = {None: 0, "": 0, "b": -1, "bb": -2, "#": 1, "##": 2}
-FLATS = ["B", "E", "A", "D", "G", "C", "F"]
-
-
-def parse_chord(text: str) -> dict | None:
-    """The chord a name spells, or None when it is not a chord name."""
-    s = text.strip()
-    if re.fullmatch(r"n\.?\s*c\.?", s, re.I):
-        return {"step": None, "alter": 0, "degrees": [], "bass": None, "bass_alter": 0,
-                "text": "N.C.", "kind": "none", "kind_text": "N.C."}
-    head = re.match(r"^([A-G])(bb|b|##|#)?", s)
-    if not head:
-        return None
-    chord = {"step": head.group(1), "alter": ALTER[head.group(2)], "degrees": [],
-             "bass": None, "bass_alter": 0, "text": s}
-    s = s[head.end():]
-    bass = re.search(r"/([A-G])(bb|b|##|#)?$", s)
-    if bass:
-        chord["bass"], chord["bass_alter"] = bass.group(1), ALTER[bass.group(2)]
-        s = s[:bass.start()]
-    paren = re.search(r"\(([^)]*)\)$", s)
-    # "m(maj7)" is a quality written with a bracket, not an alteration
-    if paren and s in QUALITIES:
-        paren = None
-    if paren:
-        for part in re.split(r"[,\s]+", paren.group(1)):
-            if not part:
-                continue
-            m = re.match(r"^(add|no|omit)?(bb|b|##|#)?(\d{1,2})$", part)
-            if not m or not 2 <= int(m.group(3)) <= 13:
-                return None
-            chord["degrees"].append((int(m.group(3)), ALTER[m.group(2)],
-                                     "subtract" if m.group(1) in ("no", "omit") else "add"))
-        s = s[:paren.start()]
-    while True:
-        # "Gadd9": an added note straight after the root, with no quality
-        tail = re.search(r"(?:(?<=\d)(b|#|add)|^(add))(\d{1,2})$", s)
-        if not tail:
-            break
-        sign, degree = tail.group(1) or tail.group(2), int(tail.group(3))
-        if not 2 <= degree <= 13:                          # b51: no such degree
-            return None
-        if sign in ("b", "#") and degree not in (5, 6, 9, 11, 13):
-            return None                                    # a #3 is a misread #5
-        acc = sign if sign != "add" else ""
-        chord["degrees"].insert(0, (degree, ALTER[acc], "add"))
-        s = s[:tail.start()]
-    kind = QUALITIES.get(s) or QUALITIES.get(s.lower())
-    if kind is None:
-        return None
-    chord["kind"], chord["kind_text"] = kind, s
-    return chord
-
-
-def tidy(raw: str) -> str:
-    """What tesseract commonly gets wrong inside a chord name. Every rule
-    here answers a misreading that was seen on a page."""
-    s = raw.replace(" ", "").replace("|", "").replace("°", "o").replace("O", "o")
-    if re.fullmatch(r"N\.?[CG6]\.?", s):
-        return "N.C."
-    s = s.replace(".", "").replace("N", "M")
-    s = re.sub(r"^([A-G](?:bb|b|##|#)?)0", r"\1o", s)     # A07 -> Ao7
-    s = s.replace("rn", "m").replace("rnaj", "maj")
-    s = re.sub(r"(?<=[A-G#b])[Mm]aj", "maj", s)
-    s = s.replace("acld", "add").replace("aclcl", "add")
-    s = re.sub(r"m[io](?=\d)", "m", s)                    # Cmi11, Dbmo6: a letter that is not there
-    s = re.sub(r"(?<=\d)i", "1", s)                       # F#m1i -> F#m11
-    # "sus" in a bold scanned face: the s's bowls fill in (saus, sas, 8us)
-    s = re.sub(r"(?<=[A-G#b\d])(?:sa|8)us|(?<=[A-G#b\d])sas(?=[24]|$)", "sus", s)
-    s = re.sub(r"sus[d8a]$", "sus4", s)                   # the 4 of sus4 read as a d
-    s = re.sub(r"(?<=[A-G#b])[85]/9", "6/9", s)            # the stacked 6 of 6/9 (no 8/9 or 5/9 chord)
-    s = re.sub(r"m\(maj7?\)?|mi\(?maj", lambda m: m.group(0).replace("i", ""), s)   # Bm(maj7) Bmimaj7
-    if s.count("(") > s.count(")"):
-        s += ")"
-    if s.count(")") > s.count("("):                       # F7b5) -> F7b5
-        s = s.replace(")", "", s.count(")") - s.count("("))
-    return s
-
-
-class Names:
-    """The row of chord names above one staff."""
-
-    def __init__(self, ink: np.ndarray, x0: int, x1: int, y0: int, y1: int, il: float,
-                 strip: np.ndarray | None = None):
-        self.il, self.ox, self.oy = il, x0, y0
-        self.box = (ink[y0:y1, x0:x1] if strip is None else strip).astype(np.uint8)
-        n, lab, stats, _ = cv2.connectedComponentsWithStats(self.box, connectivity=8)
-        self.lab = lab
-        self.parts = []
-        for i in range(1, n):
-            x, y, w, h, area = (int(v) for v in stats[i])
-            if area < 0.02 * il * il:
-                continue
-            self.parts.append({"i": i, "x": x, "y": y, "w": w, "h": h})
-
-    def boxes(self) -> list[dict]:
-        """Rehearsal boxes: a frame, with whatever sits inside it."""
-        il = self.il
-        frames = []
-        for p in self.parts:
-            if p["w"] < 1.6 * il or p["h"] < 1.6 * il:
-                continue
-            g = self.lab[p["y"]:p["y"] + p["h"], p["x"]:p["x"] + p["w"]] == p["i"]
-            edge = max(int(0.2 * il), 2)
-            sides = (g[:edge].any(axis=0).mean(), g[-edge:].any(axis=0).mean(),
-                     g[:, :edge].any(axis=1).mean(), g[:, -edge:].any(axis=1).mean())
-            if min(sides) > 0.85:
-                frames.append(p)
-        out = []
-        for f in frames:
-            inside = [p for p in self.parts if p is not f
-                      and p["x"] >= f["x"] and p["x"] + p["w"] <= f["x"] + f["w"]
-                      and p["y"] >= f["y"] and p["y"] + p["h"] <= f["y"] + f["h"]]
-            out.append({"frame": f, "inside": inside})
-        return out
-
-    def image(self, parts: list[dict], close: bool = False) -> Image.Image:
-        """close: bridge one-pixel gaps, for small print whose hairlines
-        Audiveris's binary image lost (the join of an m, the neck of a 7)."""
-        xa = min(p["x"] for p in parts)
-        xb = max(p["x"] + p["w"] for p in parts)
-        ya = min(p["y"] for p in parts)
-        yb = max(p["y"] + p["h"] for p in parts)
-        keep = np.isin(self.lab[ya:yb, xa:xb], [p["i"] for p in parts])
-        pad = int(self.il)
-        canvas = np.full((yb - ya + 2 * pad, xb - xa + 2 * pad), 255, np.uint8)
-        canvas[pad:pad + yb - ya, pad:pad + xb - xa][keep] = 0
-        if close:
-            canvas = 255 - cv2.morphologyEx(255 - canvas, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
-        img = Image.fromarray(canvas)
-        scale = max(1.0, 64 / max(yb - ya, 1))
-        return img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
-
-    def accidental(self, p: dict, cap: float) -> str | None:
-        """'#', 'b' or None, by the shape of one piece of ink.
-
-        The tests are in the sign's own proportions, so they hold for a
-        small raised sign as well as a full-size one, and for any font
-        that draws a sharp as two uprights crossed by two bars and a
-        flat as an upright with a bowl at its foot."""
-        h, w = p["h"], p["w"]
-        if h < 0.4 * cap or h > 1.5 * cap or w > 0.8 * h or w < 0.25 * h or w > 0.75 * cap:
-            return None
-        g = self.lab[p["y"]:p["y"] + h, p["x"]:p["x"] + w] == p["i"]
-        # holes: paper enclosed by ink
-        padded = np.pad((~g).astype(np.uint8), 1, constant_values=1)
-        cv2.floodFill(padded, None, (0, 0), 0)
-        hole = padded[1:-1, 1:-1].astype(bool)
-        if hole.sum() < 0.01 * h * w:
-            return None
-        hy = np.nonzero(hole.any(axis=1))[0]
-        hx = np.nonzero(hole.any(axis=0))[0]
-        tall = np.array([max((b - a for a, b in _runs(g[:, x])), default=0) for x in range(w)])
-        left, right = tall[:max(int(0.45 * w), 1)].max(), tall[int(0.55 * w):].max()
-        k = max(int(round(0.14 * h)), 1)
-        # a sharp: two long uprights with a small window between them, in
-        # the middle; the right one stands out at the top, the left one at
-        # the foot. (A bold d also has a window and a tall right stroke, but
-        # its left side is only the bowl, and its window sits low.)
-        if left >= 0.75 * h and right >= 0.75 * h and hy.min() >= 0.15 * h \
-                and hy.max() <= 0.75 * h and np.ptp(hy) <= 0.5 * h \
-                and hx.min() >= 0.1 * w and hx.max() <= 0.9 * w \
-                and g[:k, int(0.5 * w):].any() and g[-k:, :int(0.5 * w) + 1].any():
-            return "#"
-        # a flat: one long upright on the left, the bowl at its foot, and
-        # nothing to the right of the upright's head
-        if tall[:max(int(0.4 * w), 1)].max() >= 0.75 * h and hy.min() >= 0.25 * h \
-                and hy.mean() > 0.5 * h and not g[:k, int(0.55 * w):].any() and right < 0.75 * h:
-            return "b"
-        return None
-
-
-_OCR_SEEN: dict[tuple, str] = {}
-
-
-def ocr(img: Image.Image, single: bool, white: str) -> str:
-    key = (hashlib.md5(img.tobytes()).hexdigest(), img.size, single, white)
-    if key in _OCR_SEEN:
-        return _OCR_SEEN[key]
-    env = dict(os.environ, TESSDATA_PREFIX=str(TESSDATA))
-    with tempfile.TemporaryDirectory() as tmp:
-        path = f"{tmp}/c.png"
-        img.save(path)
-        r = subprocess.run(
-            ["tesseract", path, "-", "--psm", "10" if single else "7", "-l", "eng",
-             "-c", f"tessedit_char_whitelist={white}"],
-            capture_output=True, text=True, env=env)
-    _OCR_SEEN[key] = r.stdout.strip()
-    return _OCR_SEEN[key]
-
-
-WHITE = "ABCDEFGMNadgijmnosu0123456789()/+-."
-DIGITS = "0123456789"
-
+if str(BENCH_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(BENCH_DIR.parent))
+# the name reading is shared with the melodic pipeline's lead-sheet step
+# (ocr, Names and parse_chord are imported from here by drum_ink, partitura
+# and test_chord_chart)
+from app.chord_names import (  # noqa: E402,F401
+    FLATS, Names, System, harmony_xml, ocr, page_names, parse_chord)
 
 # ------------------------------------------------------------ one system
-
-class System:
-    """One staff of the page: where it is, and its strip made level."""
-
-    def __init__(self, ink: np.ndarray, el: ET.Element, ceiling: float):
-        staff = el.find(".//staff")
-        self.lines = staff.findall("lines/line")
-        self.stacks = [(float(s.get("left")), float(s.get("right"))) for s in el.findall("stack")]
-        self.x0 = int(float(staff.get("left", self.stacks[0][0])))
-        self.x1 = int(min(max(float(staff.get("right", 0)), self.stacks[-1][1]), ink.shape[1] - 1))
-        pts = [sorted((float(p.get("x")), float(p.get("y"))) for p in ln.findall("point"))
-               for ln in (self.lines[0], self.lines[-1])]
-        self._top, self._bottom = pts
-        mid = (self.x0 + self.x1) / 2
-        self.il = float(self.bottom(mid) - self.top(mid)) / 4
-        self.thick = max(int(round(float(self.lines[0].get("thickness", "2")))), 1)
-        il = self.il
-        # room above: as far as the staff before, but never past twelve spaces
-        # high enough for a rehearsal box set over an ending bracket
-        self.up = int(max(min(12.0 * il, self.top(mid) - ceiling), 2.5 * il))
-        self.down = int(6.0 * il)
-        xs = np.arange(self.x0, self.x1)
-        tops = np.round(np.interp(xs, [p[0] for p in self._top], [p[1] for p in self._top])).astype(int)
-        rows = tops[None, :] + np.arange(-self.up, self.down)[:, None]
-        ok = (rows >= 0) & (rows < ink.shape[0])
-        self.strip = ink[rows.clip(0, ink.shape[0] - 1), xs[None, :]] & ok
-        self.el = el
-
-    def top(self, x: float) -> float:
-        return float(np.interp(x, [p[0] for p in self._top], [p[1] for p in self._top]))
-
-    def bottom(self, x: float) -> float:
-        return float(np.interp(x, [p[0] for p in self._bottom], [p[1] for p in self._bottom]))
-
-    def band(self, ya: float, yb: float) -> np.ndarray:
-        """Rows ya..yb of the strip, counted in pixels from the top line."""
-        return self.strip[max(int(self.up + ya), 0):int(self.up + yb)]
-
 
 def _bounds(el: ET.Element) -> tuple[float, float, float, float] | None:
     b = el.find("bounds")
@@ -314,253 +64,6 @@ def _bounds(el: ET.Element) -> tuple[float, float, float, float] | None:
         return None
     return float(b.get("x")), float(b.get("y")), float(b.get("w")), float(b.get("h"))
 
-
-def letter_height(systems: list[System], all_names: list[Names]) -> float | None:
-    """The height of a capital in the chord names of a page: the height
-    most pieces of ink above the staves share."""
-    hs = []
-    for s, names in zip(systems, all_names):
-        floor = names.box.shape[0]
-        hs += [p["h"] for p in names.parts
-               if 0.8 * s.il < p["h"] < 3.0 * s.il and p["w"] < 3.0 * s.il
-               and p["y"] + p["h"] < floor - 1 and p["y"] > floor - 6.0 * s.il]
-    if not hs:
-        return None
-    hs.sort()
-    best = max(hs, key=lambda h: (sum(abs(o - h) <= 0.08 * h for o in hs), h))
-    return float(statistics.median([o for o in hs if abs(o - best) <= 0.08 * best]))
-
-
-def _row(parts: list[dict], cap: float, prior: float | None) -> tuple[float | None, int]:
-    """The line the names stand on: where most capitals have their feet.
-    A system with only a letter or two takes the row the page uses."""
-    feet = sorted(p["y"] + p["h"] for p in parts if 0.8 * cap < p["h"] < 1.25 * cap)
-    if not feet:
-        return prior, 0
-    best = max(feet, key=lambda f: (sum(abs(o - f) < 0.25 * cap for o in feet), f))
-    members = [o for o in feet if abs(o - best) < 0.25 * cap]
-    if prior is not None and len(members) <= 2:
-        near = [o for o in feet if abs(o - prior) < 0.6 * cap]
-        return (float(statistics.median(near)) if near else prior), len(near)
-    return float(statistics.median(members)), len(members)
-
-
-def read_marks(names: Names) -> tuple[list[dict], set[int]]:
-    """Boxed rehearsal letters of one system, and the ink they use."""
-    used, marks = set(), []
-    for b in names.boxes():
-        used.add(b["frame"]["i"])
-        used.update(p["i"] for p in b["inside"])
-        if b["inside"]:
-            text = ocr(names.image(b["inside"]), len(b["inside"]) == 1,
-                       "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-            if text:
-                f = b["frame"]
-                marks.append({"x": names.ox + f["x"] + f["w"] / 2, "text": text})
-    return marks, used
-
-
-def _read_run(names: Names, parts: list[dict], cap: float, alone: bool = False) -> str:
-    """Text of one stretch of a name: signs by shape, the rest by tesseract.
-    alone: every letter read by itself (a second try when the line reading
-    made no chord: tesseract reads the 6 of a lone "m6" as an o)."""
-    text, chunk = "", []
-
-    def flush():
-        nonlocal text, chunk
-        if chunk:
-            if alone:
-                for g in _glyphs(chunk, touch=0):    # overlapping, not merely near (the 1s of 11)
-                    text += ocr(names.image(g, close=True), True, WHITE)
-            else:
-                broken = any(len(g) > 1 for g in _glyphs(chunk))
-                text += ocr(names.image(chunk, close=broken), len(chunk) == 1, WHITE)
-            chunk = []
-
-    for p in parts:
-        if "stacked" in p:
-            flush()
-            text += p["stacked"]
-            continue
-        acc = names.accidental(p, cap)
-        if acc:
-            flush()
-            text += acc
-        else:
-            chunk.append(p)
-    flush()
-    return text
-
-
-def _read_token(names: Names, tok: list[dict], cap: float, base: float) -> str:
-    """One name. Small raised print (the b5 of a jazz font) is read apart
-    from the letters on the line: tesseract reads one size at a time."""
-    tok = _stacked(names, tok, cap)
-    glyphs = _glyphs(tok)
-    runs: list[tuple[bool, list[dict]]] = []
-    for g in glyphs:
-        top = min(q["y"] for q in g)
-        foot = max(q["y"] + q["h"] for q in g)
-        h, w = foot - top, max(q["x"] + q["w"] for q in g) - min(q["x"] for q in g)
-        speck = h < 0.3 * cap and w < 0.3 * cap     # the dot of an i or a j
-        raised = h < 0.8 * cap and foot < base - 0.3 * cap and not speck
-        if speck and runs:
-            runs[-1][1].extend(g)
-        elif runs and runs[-1][0] == raised:
-            runs[-1][1].extend(g)
-        else:
-            runs.append((raised, list(g)))
-    text = "".join(_read_run(names, parts, cap) for _up, parts in runs)
-    if text[:1] in ("E", "F") and glyphs:
-        text = _e_or_f(names, glyphs[0]) + text[1:]
-    # read again letter by letter when the reading is no chord, or when it
-    # has fewer characters than the name has letters (ink went unread)
-    short = len(re.sub(r"[^A-Za-z0-9#+/()]", "", text)) < len(glyphs)
-    if parse_chord(tidy(text)) is None or short:
-        again = "".join(_read_run(names, parts, cap, alone=True) for _up, parts in runs)
-        if again[:1] in ("E", "F") and glyphs:
-            again = _e_or_f(names, glyphs[0]) + again[1:]
-        if parse_chord(tidy(again)) is not None and (parse_chord(tidy(text)) is None or len(again) > len(text)):
-            return again
-    return text
-
-
-def _e_or_f(names: Names, g: list[dict]) -> str:
-    """E and F differ by the bar along the foot: under an E the ink runs
-    the whole width, under an F only the stem and its serif."""
-    x0 = min(p["x"] for p in g)
-    x1 = max(p["x"] + p["w"] for p in g)
-    y0 = min(p["y"] for p in g)
-    y1 = max(p["y"] + p["h"] for p in g)
-    m = np.isin(names.lab[y0:y1, x0:x1], [p["i"] for p in g])
-    foot = m[-max(int(0.2 * (y1 - y0)), 1):].any(axis=0).mean()
-    return "E" if foot > 0.8 else "F"
-
-
-def _glyphs(tok: list[dict], touch: float = -1) -> list[list[dict]]:
-    """Ink parts grouped into letters: a letter printed in more than one
-    piece (the bar and the stem of a thin 7) is its pieces one above the
-    other. touch: also pieces side by side with no more than this gap (an
-    m whose first stem came loose). Stacked 6/9 figures stay alone."""
-    glyphs: list[list[dict]] = []
-    for p in tok:
-        if glyphs and "stacked" not in p and "stacked" not in glyphs[-1][-1]:
-            gx0 = min(q["x"] for q in glyphs[-1])
-            gx1 = max(q["x"] + q["w"] for q in glyphs[-1])
-            gy0 = min(q["y"] for q in glyphs[-1])
-            gy1 = max(q["y"] + q["h"] for q in glyphs[-1])
-            over = min(gx1, p["x"] + p["w"]) - max(gx0, p["x"])
-            same_rows = min(gy1, p["y"] + p["h"]) - max(gy0, p["y"]) > 0.8 * min(p["h"], gy1 - gy0)
-            if over > 0.5 * min(p["w"], gx1 - gx0) or (touch >= 0 and -2 <= p["x"] - gx1 <= touch and same_rows):
-                glyphs[-1].append(p)
-                continue
-        glyphs.append([p])
-    return glyphs
-
-
-def _stacked(names: Names, tok: list[dict], cap: float) -> list[dict]:
-    """A six over a nine, set one above the other, is "6/9"."""
-    out, skip = [], set()
-    for k, p in enumerate(tok):
-        if k in skip:
-            continue
-        for j in range(k + 1, min(k + 3, len(tok))):
-            q = tok[j]
-            over = min(p["x"] + p["w"], q["x"] + q["w"]) - max(p["x"], q["x"])
-            hi, lo = (p, q) if p["y"] < q["y"] else (q, p)
-            if j not in skip and over > 0.5 * min(p["w"], q["w"]) \
-                    and hi["y"] + hi["h"] <= lo["y"] + 0.1 * cap \
-                    and all(0.3 * cap < r["h"] < 0.8 * cap for r in (p, q)):
-                a = ocr(names.image([hi]), True, DIGITS)
-                b = ocr(names.image([lo]), True, DIGITS)
-                if a and b:
-                    p = dict(p, stacked=f"{a}/{b}")
-                    skip.add(j)
-                break
-        out.append(p)
-    return out
-
-
-def _split_names(names: Names, tok: list[dict], cap: float, base: float) -> list[tuple[list[dict], dict]] | None:
-    """Names printed so close that they read as one: cut the ink at its
-    wider gaps, and start a new name at each capital A to G that follows a
-    whole chord. None when that does not make chords of all of it."""
-    # a gap between names is wide next to this print's own letter spacing
-    gaps = [p["x"] - max(q["x"] + q["w"] for q in tok[:i]) for i, p in enumerate(tok) if i]
-    spacing = statistics.median([g for g in gaps if g > 0] or [0])
-    cut = min(0.3 * cap, max(2.5 * spacing, 0.15 * cap))
-    pieces: list[list[dict]] = []
-    for p in tok:
-        if pieces and p["x"] - max(q["x"] + q["w"] for q in pieces[-1]) < cut:
-            pieces[-1].append(p)
-        else:
-            pieces.append([p])
-    if len(pieces) < 2:
-        return None
-    texts = [tidy(_read_token(names, piece, cap, base)) for piece in pieces]
-    out: list[tuple[list[dict], str]] = []
-    for piece, text in zip(pieces, texts):
-        if out and not (re.match(r"[A-G]", text) and not out[-1][1].endswith("/")
-                        and parse_chord(tidy(out[-1][1]))):
-            out[-1] = (out[-1][0] + piece, out[-1][1] + text)
-        else:
-            out.append((piece, text))
-    chords = [(parts, parse_chord(tidy(text))) for parts, text in out]
-    if len(chords) < 2 or any(c is None for _p, c in chords):
-        return None
-    return chords
-
-
-def read_names(names: Names, used: set[int], cap: float, base: float, verbose: bool) -> list[dict]:
-    """Chord names of one system: each {x, x1, ...}."""
-    il, floor = names.il, names.box.shape[0]
-    parts = [p for p in names.parts if p["i"] not in used]
-    # ink that runs into the staff (the clef, a stem) is not text; a
-    # bracket's tail may come that low
-    parts = [p for p in parts if p["y"] + p["h"] < floor - 1
-             or (0.15 * cap < p["w"] < 0.5 * cap and p["h"] < 1.6 * cap)]
-    # an ending bracket, a tie, a hairpin: too long or too flat for a letter
-    parts = [p for p in parts if p["w"] <= 4.0 * cap and not (p["w"] > cap and p["w"] > 2.5 * p["h"])]
-    parts = [p for p in parts if abs(p["y"] + p["h"] / 2 - (base - cap / 2)) < 0.9 * cap]
-    parts.sort(key=lambda p: p["x"])
-    tokens: list[list[dict]] = []
-    for p in parts:
-        if tokens and p["x"] - max(q["x"] + q["w"] for q in tokens[-1]) < 0.75 * il:
-            tokens[-1].append(p)
-        else:
-            tokens.append([p])
-    chords = []
-
-    def keep(tok_parts, chord):
-        chord = dict(chord)
-        chord["x"] = names.ox + tok_parts[0]["x"]
-        chord["x1"] = names.ox + max(q["x"] + q["w"] for q in tok_parts)
-        chords.append(chord)
-
-    for tok in tokens:
-        text = _read_token(names, tok, cap, base)
-        name = tidy(text)
-        chord = parse_chord(name)
-        several = None
-        if chord is None:
-            several = _split_names(names, tok, cap, base)
-        if chord is None and several is None:
-            # one more look at the whole name in one piece
-            whole = tidy(ocr(names.image(tok), False, WHITE + "#b"))
-            chord = parse_chord(whole)
-        if verbose:
-            got = chord["text"] if chord else " ".join(c["text"] for _p, c in several) if several \
-                else "NOT A CHORD"
-            print(f"    name at x={names.ox + tok[0]['x']:5d}: {text!r} -> {got}")
-        if several:
-            for tok_parts, c in several:
-                keep(tok_parts, c)
-        elif chord is not None:
-            keep(tok, chord)
-        elif not re.fullmatch(r"\d{0,3}", name):       # a bar number, a count over a rest
-            chords.append({"x": names.ox + tok[0]["x"], "unread": name,
-                           "x1": names.ox + max(q["x"] + q["w"] for q in tok)})
-    return chords
 
 
 # ---------------------------------------------------------------- slashes
@@ -611,7 +114,9 @@ def _dot_after(system: System, edge: float, repeat_dots: list[tuple[float, float
     n, _lab, stats, _c = cv2.connectedComponentsWithStats(box)
     for i in range(1, n):
         x, y, w, h, a = (int(v) for v in stats[i])
-        if 0.14 * il <= w <= 0.55 * il and 0.14 * il <= h <= 0.55 * il and a >= 0.6 * w * h \
+        # a round dot fills about four fifths of its box; a scan leaves it
+        # ragged at the edges (one measured at half)
+        if 0.14 * il <= w <= 0.55 * il and 0.14 * il <= h <= 0.55 * il and a >= 0.45 * w * h \
                 and x > 0 and x + w < box.shape[1] and y > 0 and y + h < box.shape[0]:
             px = system.x0 + xa + x + w / 2
             if not any(abs(px - rx) < 0.5 * il for rx, _ry in repeat_dots):
@@ -644,12 +149,35 @@ def _tied(system: System, a: dict, b: dict) -> bool:
     # bridge the arc where it ran along the blanked line
     box = cv2.morphologyEx(box, cv2.MORPH_CLOSE, np.ones((2 * t + 3, 1), np.uint8))
     n, lab, stats, _c = cv2.connectedComponentsWithStats(box, connectivity=8)
+    thin = []
     for i in range(1, n):
         x, y, w, h, _area = (int(v) for v in stats[i])
-        if w < 0.6 * span or h > 1.2 * il or y == 0:
+        if h > 1.2 * il or y == 0:
             continue
         g = lab[y:y + h, x:x + w] == i
         if g.sum(axis=0).max() <= 0.45 * il:
+            thin.append((x, y, w, h))
+    # A tie into the next bar crosses the line at a shallow slope, and
+    # blanking the line cuts it into pieces where the vertical bridge
+    # cannot reach. Pieces whose facing ends both meet the blanked rows,
+    # less than an interline apart, are one arc crossing the line.
+    band = (line - t - 1, line + t + 1)
+
+    def meets(y, h):
+        return y <= band[1] and y + h - 1 >= band[0]
+    thin.sort()
+    chains: list[list[tuple[int, int, int, int]]] = []
+    for piece in thin:
+        last = chains[-1][-1] if chains else None
+        if last and 0 <= piece[0] - (last[0] + last[2]) <= il \
+                and meets(last[1], last[3]) and meets(piece[1], piece[3]):
+            chains[-1].append(piece)
+        else:
+            chains.append([piece])
+    for chain in chains:
+        x0, x1 = chain[0][0], max(p[0] + p[2] for p in chain)
+        y0, y1 = min(p[1] for p in chain), max(p[1] + p[3] for p in chain)
+        if x1 - x0 >= 0.6 * span and y1 - y0 <= 1.2 * il:
             return True
     return False
 
@@ -670,7 +198,7 @@ def _stem_of(sheet: Sheet, system: System, s: dict) -> tuple[float, float, int] 
 def _stem_in_ink(sheet: Sheet, system: System, s: dict, foot: float, top: float):
     """A stem the stem finder missed because a scan broke it into dashes:
     a column of ink beside the slash's foot (down) or top (up) that is
-    at least half ink for a stem's length (a scan leaves it dotted)."""
+    at least a quarter ink for a stem's length (a scan leaves it dotted)."""
     il = system.il
     ink = sheet.nolines             # staff lines would read as ink beside the stem
     H, W = ink.shape
@@ -690,7 +218,9 @@ def _stem_in_ink(sheet: Sheet, system: System, s: dict, foot: float, top: float)
             sa, sb = (a, (a + b) // 2) if near_top else ((a + b) // 2, b)
             side = ink[sa:sb, max(x - 4, 0):x - 2].any(axis=1).mean() if x >= 4 else 0
             side = max(side, ink[sa:sb, x + 3:x + 5].any(axis=1).mean() if x + 5 <= W else 0)
-            if col.mean() > 0.45 and side < 0.3 and (best is None or col.mean() > best[1]):
+            # (measured on the scans of the test set: under a plain slash at
+            # most 0.07 of the column is ink, under a dotted stem 0.34 or more)
+            if col.mean() > 0.25 and side < 0.3 and (best is None or col.mean() > best[1]):
                 best = (x, col.mean())
         return best
 
@@ -718,8 +248,15 @@ def _value_at(sheet: Sheet, sx: float, tip: float, toward: int, length: float, i
 
 
 def _is_barline(system: System, sx: float, sy0: float, sy1: float) -> bool:
-    top = system.top(sx)
-    return abs(sy0 - top) < 0.4 * system.il and abs(sy1 - top - 4 * system.il) < 0.4 * system.il
+    """A line from the top staff line to the bottom one, where the system
+    has a barline. (A stem from a head on the top line down to a beam
+    under the staff spans the same rows, but stands inside a bar.)"""
+    top, il = system.top(sx), system.il
+    if not (abs(sy0 - top) < 0.4 * il and abs(sy1 - top - 4 * il) < 0.4 * il):
+        return False
+    edges = [x for st in system.stacks for x in st]
+    edges += [b[0] + b[2] / 2 for b in (_bounds(e) for e in system.el.iter("barline")) if b]
+    return any(abs(sx - x) < 0.6 * il for x in edges)
 
 
 def read_items(sheet: Sheet, system: System, header: float, blocked: list[tuple[float, float]],
@@ -768,6 +305,16 @@ def read_items(sheet: Sheet, system: System, header: float, blocked: list[tuple[
         if b and h.get("shape") in ("NOTEHEAD_VOID", "WHOLE_NOTE") and free(b[0] + b[2] / 2, b[1] + b[3] / 2):
             heads.append((b[0] + b[2] / 2, b[1] + b[3] / 2,
                           "void" if h.get("shape") == "NOTEHEAD_VOID" else "whole"))
+        # a filled head Audiveris saw that the ink finder missed (a head
+        # crossed by a ledger line), outside the staff, on a stem
+        elif b and h.get("shape") == "NOTEHEAD_BLACK":
+            hx, hy = b[0] + b[2] / 2, b[1] + b[3] / 2
+            rel = hy - system.top(hx)
+            if free(hx, hy) and not -0.3 * il <= rel <= 4.3 * il \
+                    and not any(abs(hx - fx) < 0.6 * il and abs(hy - fy) < 0.6 * il for fx, fy, _k in heads) \
+                    and any(abs(sx - hx) < 0.9 * il and sy0 - 0.6 * il <= hy <= sy1 + 0.6 * il
+                            for sx, sy0, sy1 in sheet.stems):
+                heads.append((hx, hy, "filled"))
     heads.sort()
     counts = [b for b in (_bounds(e) for e in el.iter("measure-count")) if b]
     for hx, hy, kind in heads:
@@ -868,27 +415,9 @@ def read_sheet(ink: np.ndarray, root: ET.Element, verbose: bool, stack0: int = 0
         s = System(ink, el, previous_bottom)
         previous_bottom = s.bottom((s.x0 + s.x1) / 2) + 1.5 * s.il
         systems.append(s)
-    all_names = [Names(ink, s.x0, s.x1, 0, 0, s.il, strip=s.band(-s.up, -0.15 * s.il)) for s in systems]
-    for s, names in zip(systems, all_names):
-        names.oy = -s.up                         # rows of the strip count from the top line
-    cap = letter_height(systems, all_names)
-    found = [read_marks(names) for names in all_names]
-    rows = []
-    for names, (_marks, used) in zip(all_names, found):
-        parts = [p for p in names.parts if p["i"] not in used and p["y"] + p["h"] < names.box.shape[0] - 1]
-        rows.append(_row(parts, cap, None) if cap else (None, 0))
-    sure = [names.box.shape[0] - base for names, (base, n) in zip(all_names, rows) if base is not None and n >= 3]
-    usual = statistics.median(sure) if sure else None
     out = []
-    for k, (s, names, (marks, used)) in enumerate(zip(systems, all_names, found)):
+    for s, (chords, marks) in zip(systems, page_names(ink, systems, verbose)):
         il = s.il
-        base = rows[k][0]
-        if cap and usual is not None and rows[k][1] <= 2:
-            parts = [p for p in names.parts if p["i"] not in used and p["y"] + p["h"] < names.box.shape[0] - 1]
-            base = _row(parts, cap, names.box.shape[0] - usual)[0]
-        if verbose:
-            print(f"  system {k + 1}: il {il:.1f}, capital {cap}, names stand {None if base is None else names.box.shape[0] - base:.0f} px above the strip's foot")
-        chords = read_names(names, used, cap, base, verbose) if cap and base is not None else []
         sig = _signatures(s)
         head = s.el.find(".//staff/header")
         header = float(head.get("stop")) if head is not None and head.get("stop") else float(s.x0)
@@ -1100,44 +629,6 @@ def key_alter(step: str, fifths: int) -> int:
     sharps = FLATS[::-1]
     return 1 if sharps.index(step) < fifths else 0
 
-
-def harmony_xml(c: dict, offset: int) -> str:
-    if c["kind"] == "none":
-        # chord_symbol.dart: a root is required; "no chord" prints only its kind text
-        out = ["      <harmony>", '        <root><root-step text="">C</root-step></root>',
-               '        <kind text="N.C.">none</kind>']
-        if offset:
-            out.append(f"        <offset>{offset}</offset>")
-        return "\n".join(out + ["      </harmony>"])
-    out = ["      <harmony>", "        <root>", f"          <root-step>{c['step']}</root-step>"]
-    if c["alter"]:
-        out.append(f"          <root-alter>{c['alter']}</root-alter>")
-    out.append("        </root>")
-    out.append(f"        <kind text=\"{escape(c['kind_text'])}\">{c['kind']}</kind>")
-    if c["bass"]:
-        out.append("        <bass>")
-        out.append(f"          <bass-step>{c['bass']}</bass-step>")
-        if c["bass_alter"]:
-            out.append(f"          <bass-alter>{c['bass_alter']}</bass-alter>")
-        out.append("        </bass>")
-    # notes the kind's name implies but the kind value does not carry:
-    # readers (MuseScore) spell the symbol from kind + degrees, not the text
-    implied = []
-    m = re.match(r"(7|9|11|13)sus", c["kind_text"])
-    if m and c["kind"].startswith("suspended"):
-        implied.append((7, 0, "add"))
-        implied += [(d, 0, "add") for d in (9, 11, 13) if d <= int(m.group(1))]
-    if c["kind_text"] == "6/9":
-        implied.append((9, 0, "add"))
-    have = {v for v, _a, _k in c["degrees"]}
-    for value, alter, kind in [d for d in implied if d[0] not in have] + c["degrees"]:
-        out += ["        <degree>", f"          <degree-value>{value}</degree-value>",
-                f"          <degree-alter>{alter}</degree-alter>",
-                f"          <degree-type>{kind}</degree-type>", "        </degree>"]
-    if offset:
-        out.append(f"        <offset>{offset}</offset>")
-    out.append("      </harmony>")
-    return "\n".join(out)
 
 
 CLEFS = {"BASS": ("F", 4, "D", 3, ("A", 3))}

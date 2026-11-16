@@ -694,6 +694,9 @@ def _repair_structure(steps: _Steps, work: Path, result: Path, aud: Path) -> Non
                          default=None)
     if road_map is not None:
         steps.note("road_map", road_map, f"{road_map} road-map marks placed")
+    from app import lead_chords
+    chords = steps.run("chord names", lead_chords.place, omr, result, hbars, default=0)
+    steps.note("chord_names", chords, f"{chords} chord names placed from the page")
 
 
 def finish(work: Path, homr: Path | None, audiveris: Path | None, result: Path,
