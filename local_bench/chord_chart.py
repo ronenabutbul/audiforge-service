@@ -114,7 +114,9 @@ def _dot_after(system: System, edge: float, repeat_dots: list[tuple[float, float
     n, _lab, stats, _c = cv2.connectedComponentsWithStats(box)
     for i in range(1, n):
         x, y, w, h, a = (int(v) for v in stats[i])
-        if 0.14 * il <= w <= 0.55 * il and 0.14 * il <= h <= 0.55 * il and a >= 0.6 * w * h \
+        # a round dot fills about four fifths of its box; a scan leaves it
+        # ragged at the edges (one measured at half)
+        if 0.14 * il <= w <= 0.55 * il and 0.14 * il <= h <= 0.55 * il and a >= 0.45 * w * h \
                 and x > 0 and x + w < box.shape[1] and y > 0 and y + h < box.shape[0]:
             px = system.x0 + xa + x + w / 2
             if not any(abs(px - rx) < 0.5 * il for rx, _ry in repeat_dots):
