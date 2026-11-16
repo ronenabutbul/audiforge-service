@@ -48,12 +48,16 @@ from drum_ink import REST_SLOTS, Sheet, _sheets  # noqa: F401
 BENCH_DIR = Path(__file__).resolve().parent
 TESSDATA = BENCH_DIR / "tools" / "tessdata"
 APP_DIR = BENCH_DIR.parent / "app"
-if str(BENCH_DIR.parent) not in sys.path:
-    sys.path.insert(0, str(BENCH_DIR.parent))
+# app/ itself goes on the path, never its parent: with the parent there,
+# `app.fix_hbars` loads as a second copy of `fix_hbars`, and a switch the
+# drum reader sets on one (VOLTA_HOOK_BARLINES) is not seen by the other,
+# so the two count a different number of bars under an ending bracket
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
 # the name reading is shared with the melodic pipeline's lead-sheet step
 # (ocr, Names and parse_chord are imported from here by drum_ink, partitura
 # and test_chord_chart)
-from app.chord_names import (  # noqa: E402,F401
+from chord_names import (  # noqa: E402,F401
     FLATS, Names, System, harmony_xml, ocr, page_names, parse_chord)
 
 # ------------------------------------------------------------ one system
