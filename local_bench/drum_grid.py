@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import io
 import math
+import re
 from fractions import Fraction
 import sys
 import xml.etree.ElementTree as ET
@@ -380,6 +381,22 @@ def _signature_only(image, x0: float, x1: float, top: float, bottom: float,
     return float(band.mean()) < 0.10
 
 
+def _cut_stroke(image, bounds) -> bool:
+    """A C time signature with an upright stroke through it, reaching
+    well above and below the C (cut time, alla breve). A plain C is no
+    taller than its own box in any column."""
+    import numpy as np
+    x, y, w, h = (int(float(bounds.get(k))) for k in ("x", "y", "w", "h"))
+    ink = np.asarray(image.crop((x, max(y - h, 0), x + w, y + 2 * h))) < 128
+    longest = 0
+    for c in range(w // 4, 3 * w // 4 + 1):
+        run = 0
+        for v in ink[:, c]:
+            run = run + 1 if v else 0
+            longest = max(longest, run)
+    return longest >= 1.3 * h
+
+
 def bar_crops(omr_path: Path) -> list[dict]:
     """Per printed bar: PNG crop + time signature context."""
     from PIL import Image
@@ -387,6 +404,7 @@ def bar_crops(omr_path: Path) -> list[dict]:
     crops = []
     stack_ordinal = -1
     meter = (4, 4)
+    symbol = None       # "common" / "cut" when the page prints a C
     pending_sig = None  # courtesy signature at line end governs the NEXT bar
     with zipfile.ZipFile(omr_path) as z:
         sheets = sorted(
@@ -407,11 +425,19 @@ def bar_crops(omr_path: Path) -> list[dict]:
                     b = el.find("bounds")
                     if rational and b is not None and "/" in rational:
                         num, den = rational.split("/")
+                        sym = None
+                        if el.get("shape") in ("COMMON_TIME", "CUT_TIME"):
+                            sym = "common"
+                            if _cut_stroke(image, b):
+                                # Audiveris reads a struck-through C as
+                                # common time; the stroke makes it cut time
+                                num, den, sym = "2", "2", "cut"
                         sigs.append({
                             "x": float(b.get("x")) + float(b.get("w")) / 2,
                             "right": float(b.get("x")) + float(b.get("w")),
                             "y": float(b.get("y")) + float(b.get("h")) / 2,
                             "meter": (int(num), int(den)),
+                            "symbol": sym,
                         })
             for system in root.iter("system"):
                 staff = system.find(".//staff")
@@ -427,7 +453,7 @@ def bar_crops(omr_path: Path) -> list[dict]:
                     x0 = int(float(stack.get("left")))
                     x1 = int(float(stack.get("right")))
                     if pending_sig is not None:
-                        meter = pending_sig
+                        meter, symbol = pending_sig
                         pending_sig = None
                     fragment = False
                     printed = [s for s in sigs
@@ -442,7 +468,7 @@ def bar_crops(omr_path: Path) -> list[dict]:
                         seen = ink_time_signature(ink, top, interline, x0)
                         if seen:
                             print(f"  time signature read from the ink: stack {stack_ordinal} {seen[0]}/{seen[1]}", file=sys.stderr)
-                            meter = seen
+                            meter, symbol = seen, None
                     for sig in sigs:
                         if not (top - 2 * interline <= sig["y"]
                                 <= bottom + 2 * interline):
@@ -460,15 +486,15 @@ def bar_crops(omr_path: Path) -> list[dict]:
                                 continue
                             if (si == len(stacks) - 1
                                     and sig["x"] > x0 + 0.85 * (x1 - x0)):
-                                pending_sig = sig["meter"]
+                                pending_sig = sig["meter"], sig["symbol"]
                             elif _signature_only(image, x0, x1, top, bottom,
                                                  sig["right"]):
                                 # a courtesy signature standing alone: its
                                 # meter belongs to the next real bar
-                                pending_sig = sig["meter"]
+                                pending_sig = sig["meter"], sig["symbol"]
                                 fragment = True
                             else:
-                                meter = sig["meter"]
+                                meter, symbol = sig["meter"], sig["symbol"]
                     if fragment:
                         continue
                     # Tight vertical framing: the staff should dominate the
@@ -492,6 +518,7 @@ def bar_crops(omr_path: Path) -> list[dict]:
                                   "height": crop.height,
                                   "stack": stack_ordinal,
                                   "meter": meter,
+                                  "time_symbol": symbol,
                                   "pickup": stack.get("special") == "PICKUP"})
     return crops
 
@@ -1388,7 +1415,8 @@ def write_musicxml(grids: list[BarGrid], out: Path,
                    meters: list[tuple[int, int]] | None = None,
                    tempos: dict[int, int] | None = None,
                    printed: dict[int, list[int]] | None = None,
-                   pickups: set[int] | None = None):
+                   pickups: set[int] | None = None,
+                   symbols: list[str | None] | None = None):
     """rest_bars maps a grid index to how many MEASURES that printed bar
     stands for — a multirest bar is one bar on the page but N measures of
     music, which is why counting printed bars undercounts a piece.
@@ -1451,18 +1479,21 @@ def write_musicxml(grids: list[BarGrid], out: Path,
             num += 1
             measure = ET.SubElement(part, "measure", number=str(num))
         bar_meter = meter_of(gi)
-        if gi == 0 or bar_meter != emitted_meter:
+        symbol = symbols[gi] if symbols and gi < len(symbols) else None
+        if gi == 0 or (bar_meter, symbol) != emitted_meter:
             attrs = ET.SubElement(measure, "attributes")
             if gi == 0:
                 ET.SubElement(attrs, "divisions").text = str(divisions)
             time = ET.SubElement(attrs, "time")
+            if symbol:
+                time.set("symbol", symbol)
             ET.SubElement(time, "beats").text = str(bar_meter[0])
             ET.SubElement(time, "beat-type").text = str(bar_meter[1])
             if gi == 0:
                 clef = ET.SubElement(attrs, "clef")
                 ET.SubElement(clef, "sign").text = "percussion"
                 ET.SubElement(clef, "line").text = "2"
-            emitted_meter = bar_meter
+            emitted_meter = (bar_meter, symbol)
         bpm = tempos.pop(gi, None)
         if bpm:
             direction = ET.SubElement(measure, "direction",
@@ -1926,6 +1957,9 @@ _TERMS = [
     # kit words one letter away from a tempo word: "rim." (rim click) must
     # match itself before the one-letter rule makes it "rit."
     "rim.", "Rim shot", "Cross stick", "t.t.", "Molto rit.",
+    # tempo words of light-music and medley charts
+    "Medium", "Medium Swing", "Slow", "Ballad", "Poco rit.",
+    "Accelerando", "Accelerando poco a poco",
 ]
 
 
@@ -1978,6 +2012,497 @@ def _place_rehearsals_by(omr: Path, out: Path, hbars: list[dict],
         placed += 1
     tree.write(out, encoding="UTF-8", xml_declaration=True)
     return placed
+
+
+def _staves(omr: Path) -> dict[int, list[tuple[list, float, float]]]:
+    """{sheet ordinal: [(staff lines, top, bottom)]} for every system."""
+    from fix_hbars import _sheet_roots, _staff_at
+    out: dict[int, list] = {}
+    for si, root in _sheet_roots(omr):
+        for system in root.iter("system"):
+            staff = system.find(".//staff")
+            lines = staff.findall("lines/line") if staff is not None else []
+            if len(lines) >= 5:
+                top, bottom = _staff_at(lines, 0)
+                out.setdefault(si, []).append((lines, top, bottom))
+    return out
+
+
+def _side_of_nearest_staff(staves: dict, sheet: int, x: float, y: float
+                           ) -> tuple[str, float]:
+    """("above" | "below" | "staff", interline) of the staff nearest to
+    the point. A mark between two systems belongs to the nearer one:
+    the band above one staff and the band below the one before overlap,
+    so a mark tried in both is found twice."""
+    from fix_hbars import _staff_at
+    seen = []
+    for lines, _t, _b in staves.get(sheet, []):
+        top, bottom = _staff_at(lines, x)
+        gap = top - y if y < top else y - bottom if y > bottom else 0.0
+        side = "above" if y < top else "below" if y > bottom else "staff"
+        seen.append((gap, side, (bottom - top) / 4))
+    if not seen:
+        return "staff", 20.0
+    gap, side, il = min(seen)   # an exact tie goes to the staff below
+    return side, il
+
+
+def place_hairpins_once(omr: Path, out: Path, hbars: list[dict],
+                        numbers: list[int] | None = None) -> int:
+    """Every hairpin Audiveris recognised, written once: on the bars of
+    the staff it is printed nearest to, above or below that staff. A
+    hairpin tried against the band above every staff and the band below
+    every staff landed twice when it stood between two systems: once on
+    the bars below it and once on the bars of the system above."""
+    from fix_hbars import _locate_marks, _omr_hairpins
+    wedges = _omr_hairpins(omr)
+    if not wedges:
+        return 0
+    staves = _staves(omr)
+    tree = ET.parse(out)
+    measures = tree.getroot().find("part").findall("measure")
+    index = {m.get("number"): i for i, m in enumerate(measures)}
+    placed = 0
+    for band in ("above", "below"):
+        mine = [(i, w) for i, w in enumerate(wedges)
+                if _side_of_nearest_staff(staves, w[0], (w[1] + w[2]) / 2,
+                                          w[3])[0] == band]
+        if not mine:
+            continue
+        start_of, stop_of = {}, {}
+        for n, i in _locate_marks(omr, hbars, [(w[0], w[1], w[3], i) for i, w in mine],
+                                  band=band, containing=True, slack_il=0.5,
+                                  numbers=numbers):
+            start_of.setdefault(i, n)
+        for n, i in _locate_marks(omr, hbars, [(w[0], w[2], w[3], i) for i, w in mine],
+                                  band=band, containing=True, slack_il=-0.5,
+                                  numbers=numbers):
+            stop_of.setdefault(i, n)
+        for i, (_s, _x0, _x1, _y, kind) in mine:
+            bs, be = index.get(str(start_of.get(i))), index.get(str(stop_of.get(i)))
+            if bs is None or be is None:
+                continue
+            be = max(be, bs)
+            d = ET.Element("direction", placement=band)
+            ET.SubElement(ET.SubElement(d, "direction-type"), "wedge", type=kind)
+            measures[bs].insert(0, d)
+            d = ET.Element("direction", placement=band)
+            ET.SubElement(ET.SubElement(d, "direction-type"), "wedge", type="stop")
+            measures[be].append(d)
+            placed += 1
+    if placed:
+        tree.write(out, encoding="UTF-8", xml_declaration=True)
+    return placed
+
+
+_DYNAMIC_TEXT = re.compile(r"(?:p{1,3}|f{1,3}|m[pf]|s?fz|sf|fp|sfp|rfz?)")
+
+
+def _m_before(ink, x: int, y: int, w: int, h: int, il: float) -> bool:
+    """An italic m printed just left of (or inside the left of) a dynamic
+    glyph box: one stroke of letter height (about an interline), two
+    interlines wide, whose middle row crosses three uprights, its right
+    edge touching the next letter. Audiveris often keeps only the f of
+    an "mf" (or reads the pair as "sf"); the three arches are what an m
+    has and no s, z, f or p has."""
+    import cv2
+    import numpy as np
+    xa, ya = max(int(x - 3 * il), 0), max(y - 2, 0)
+    box = ink[ya:y + h + 2, xa:x + w + 2].astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(box)
+    comps = [tuple(int(v) for v in stats[i]) + (i,) for i in range(1, n)
+             if stats[i][4] >= 0.1 * il * il]
+    tall = [c for c in comps if c[3] >= 2.0 * il]
+    for cx, cy, cw, ch, _a, i in comps:
+        if not (0.8 * il <= ch <= 1.5 * il and 1.5 * il <= cw <= 2.6 * il):
+            continue
+        if cy + ya < y + 0.4 * il:          # an m sits at letter height,
+            continue                        # below the f's ascender
+        row = lab[cy + ch // 2, cx:cx + cw] == i
+        if int(np.sum(np.diff(np.concatenate([[0], row.astype(int), [0]])) == 1)) != 3:
+            continue
+        right = cx + cw
+        if any(-0.8 * il <= t[0] - right <= 0.6 * il for t in tall if t[0] > cx):
+            return True
+    return False
+
+
+def page_dynamics(omr: Path) -> list[tuple[int, int, int, str]]:
+    """(sheet, x, y, "mf"|...) for every dynamic printed under a staff:
+    the ones Audiveris recognised as dynamics (an "f" or "p" with an m
+    printed before it is an "mf" or "mp"), the ones its OCR filed as
+    lyrics or words (a drum chart has no lyrics; "mf" set in a text font
+    reads as a word), and the ones it missed that are the same glyph as
+    one it recognised surely elsewhere in the chart (`_same_glyph`). A
+    glyph above its staff, smaller than a letter or taller than a
+    dynamic is something else (a tempo note's stem, a "+" or "o" over a
+    hi-hat, a boxed number). x is where the dynamic acts (`_onset_x`)."""
+    import io as _io
+    import zipfile as _zipfile
+    import numpy as np
+    from PIL import Image
+    from fix_hbars import DYNAMICS_GRADE_MIN
+    staves = _staves(omr)
+    seen: list[tuple[int, int, int, str, int, int, int, int]] = []
+    with _zipfile.ZipFile(omr) as z:
+        sheets = sorted({n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+                        key=lambda s: int(s.split("#")[1]))
+        roots, inks = {}, {}
+        for si, sheet in enumerate(sheets):
+            roots[si] = ET.fromstring(z.read(f"{sheet}/{sheet}.xml").decode("utf-8", "replace"))
+            inks[si] = np.asarray(Image.open(_io.BytesIO(
+                z.read(f"{sheet}/BINARY.png"))).convert("L")) < 128
+    templates: dict[str, np.ndarray] = {}
+    for si, root in roots.items():
+        ink = inks[si]
+        for el in root.iter():
+            b = el.find("bounds")
+            if b is None:
+                continue
+            x, y, w, h = (int(b.get(k)) for k in ("x", "y", "w", "h"))
+            cx, cy = x + w // 2, y + h // 2
+            if el.tag == "dynamics":
+                shape = el.get("shape") or ""
+                grade = float(el.get("grade") or 0)
+                if not shape.startswith("DYNAMICS_") or grade < DYNAMICS_GRADE_MIN:
+                    continue
+                value = shape[len("DYNAMICS_"):].lower()
+                min_h = 1.4
+            elif el.tag in ("lyric-item", "word"):
+                value = (el.get("value") or "").strip()
+                if not _DYNAMIC_TEXT.fullmatch(value):
+                    continue
+                grade, min_h = 0.0, 0.8
+            else:
+                continue
+            side, il = _side_of_nearest_staff(staves, si, cx, cy)
+            if side != "below" or not (min_h * il <= h <= 3.5 * il):
+                continue
+            if el.tag == "dynamics" and value in ("f", "p", "sf") \
+                    and _m_before(ink, x, y, w, h, il):
+                value = "m" + value[-1]
+            elif el.tag == "dynamics" and grade >= _SURE_GRADE:
+                templates.setdefault(value, ink[y:y + h, x:x + w])
+            if any(f[0] == si and abs(f[1] - cx) < 2 * il and abs(f[2] - cy) < 2 * il
+                   for f in seen):
+                continue
+            seen.append((si, cx, cy, value, x, y, w, h))
+    for si, x, y, w, h, value in _same_glyph(inks, staves, templates, seen):
+        cx, cy = x + w // 2, y + h // 2
+        _side, il = _side_of_nearest_staff(staves, si, cx, cy)
+        if value in ("f", "p") and _m_before(inks[si], x, y, w, h, il):
+            value = "m" + value
+        seen.append((si, cx, cy, value, x, y, w, h))
+    return [(si, _onset_x(roots[si], x, w, cy, _side_of_nearest_staff(staves, si, cx, cy)[1]),
+             cy, value) for si, cx, cy, value, x, y, w, h in seen]
+
+
+# a dynamic Audiveris graded this sure of is a template for its twins
+_SURE_GRADE = 0.75
+# normalised correlation at which a glyph is the template's twin
+_TWIN_MATCH = 0.7
+
+
+def _same_glyph(inks: dict, staves: dict, templates: dict, seen: list
+                ) -> list[tuple[int, int, int, int, int, str]]:
+    """Dynamics Audiveris missed: places under a staff where the ink
+    matches (normalised correlation at least `_TWIN_MATCH`) a dynamic it
+    recognised surely in the same chart, so in the same font and size.
+    Longer marks are matched first (ff before f, mf before f), and a
+    place already taken is skipped. (sheet, x, y, w, h, value)."""
+    import cv2
+    import numpy as np
+    out = []
+    taken = [(si, x, y, w, h) for si, _cx, _cy, _v, x, y, w, h in seen]
+    for value in sorted(templates, key=lambda v: (-len(v), v)):
+        t = templates[value].astype(np.uint8) * 255
+        th, tw = t.shape
+        if th < 8 or tw < 8:
+            continue
+        for si, ink in inks.items():
+            res = cv2.matchTemplate(ink.astype(np.uint8) * 255, t, cv2.TM_CCOEFF_NORMED)
+            ys, xs = np.where(res >= _TWIN_MATCH)
+            for y, x in sorted(zip(ys.tolist(), xs.tolist()), key=lambda p: -res[p[0], p[1]]):
+                cx, cy = x + tw // 2, y + th // 2
+                side, il = _side_of_nearest_staff(staves, si, cx, cy)
+                if side != "below":
+                    continue
+                if any(s == si and x < ox + ow + 0.5 * il and ox < x + tw + 0.5 * il
+                       and y < oy + oh and oy < y + th for s, ox, oy, ow, oh in taken):
+                    continue
+                taken.append((si, x, y, tw, th))
+                out.append((si, x, y, tw, th, value))
+    return out
+
+
+def _onset_x(root: ET.Element, x: int, w: int, y: float, il: float) -> int:
+    """The x a dynamic printed at x..x+w acts from. One printed under a
+    bar's last stretch with no note between it and the barline (under a
+    repeat sign or a rest, just before the next bar's downbeat) belongs
+    to the next bar; any other is read where it stands."""
+    from fix_hbars import _staff_at
+    cx = x + w // 2
+    right, gap = None, None
+    for system in root.iter("system"):
+        staff = system.find(".//staff")
+        lines = staff.findall("lines/line") if staff is not None else []
+        if len(lines) < 5:
+            continue
+        top, bottom = _staff_at(lines, cx)
+        g = top - y if y < top else max(y - bottom, 0)
+        if gap is not None and g >= gap:
+            continue
+        gap, right = g, None
+        for stack in system.findall("stack"):
+            sx1 = float(stack.get("right"))
+            if float(stack.get("left")) <= cx <= sx1:
+                right = sx1
+    if right is None or right - (x + w) > 2 * il:
+        return cx
+    for head in root.iter("head"):
+        b = head.find("bounds")
+        if b is None:
+            continue
+        hx, hy = float(b.get("x")) + float(b.get("w")) / 2, float(b.get("y"))
+        if x - il <= hx < right and abs(hy - y) < 10 * il:
+            return cx
+    return int(right + il)
+
+
+def place_dynamics_once(omr: Path, out: Path, hbars: list[dict],
+                        numbers: list[int] | None = None) -> int:
+    """The page's dynamics (`page_dynamics`) on the bars they are printed
+    under, at the start of the bar. A bar that already has that dynamic
+    keeps one."""
+    from fix_hbars import _locate_marks
+    marks = page_dynamics(omr)
+    if not marks:
+        return 0
+    at = _locate_marks(omr, hbars, marks, band="below", containing=True,
+                       numbers=numbers)
+    tree = ET.parse(out)
+    by_number = {m.get("number"): m for m in tree.getroot().find("part").findall("measure")}
+    placed = 0
+    for number, value in at:
+        m = by_number.get(str(number))
+        if m is None or any(c.tag == value for d in m.iter("dynamics") for c in d):
+            continue
+        direction = ET.Element("direction", placement="below")
+        ET.SubElement(ET.SubElement(ET.SubElement(direction, "direction-type"),
+                                    "dynamics"), value)
+        m.insert(0, direction)
+        placed += 1
+    if placed:
+        tree.write(out, encoding="UTF-8", xml_declaration=True)
+    return placed
+
+
+def _read_number(image, il: float) -> int | None:
+    """The 2-3 digit number printed in `image` (a strip cut just right of
+    an equals sign), read by Tesseract as one line of digits; None when
+    two readings disagree or nothing number-like is there."""
+    import os
+    import subprocess
+    import tempfile
+    import numpy as np
+    from PIL import Image
+    ink = np.asarray(image) < 128
+    cols = np.flatnonzero(ink.any(axis=0))
+    if not len(cols):
+        return None
+    # the number runs on from the sign; a gap wider than a letter ends it
+    end = cols[0]
+    for c in cols:
+        if c - end > 0.9 * il:
+            break
+        end = c
+    rows = np.flatnonzero(ink[:, cols[0]:end + 1].any(axis=1))
+    if not len(rows):
+        return None
+    crop = image.crop((max(cols[0] - 2, 0), max(rows[0] - 2, 0), end + 3, rows[-1] + 3))
+    f = 48 / max(crop.height, 1)
+    crop = crop.resize((max(int(crop.width * f), 1), 48))
+    page = Image.new("L", (crop.width + 40, crop.height + 40), 255)
+    page.paste(crop, (20, 20))
+    env = dict(os.environ, TESSDATA_PREFIX=str(BENCH_DIR / "tools" / "tessdata"))
+    reads = []
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/n.png"
+        page.save(path)
+        for psm in ("7", "8"):
+            r = subprocess.run(["/opt/homebrew/bin/tesseract", path, "-", "--psm", psm,
+                                "-c", "tessedit_char_whitelist=0123456789"],
+                               capture_output=True, text=True, env=env)
+            reads.append(r.stdout.strip())
+    if reads[0] != reads[1] or not re.fullmatch(r"\d{2,3}", reads[0]):
+        return None
+    return int(reads[0])
+
+
+def _beat_note(ink, x: int, y: int, il: float) -> tuple[str, bool] | None:
+    """(unit, dotted) of the little note printed just left of a metronome
+    mark's equals sign at (x, y): a stem with a head at its foot, the
+    head filled (quarter) or open (half), a flag (eighth), and a dot
+    beside it. None when no such note stands there."""
+    import cv2
+    import numpy as np
+    xa, xb = max(int(x - 3.2 * il), 0), int(x - 0.1 * il)
+    ya, yb = max(int(y - 3.5 * il), 0), int(y + 1.5 * il)
+    box = ink[ya:yb, xa:xb].astype(np.uint8)
+    n, lab, stats, _c = cv2.connectedComponentsWithStats(box)
+    best = None
+    for i in range(1, n):
+        cx, cy, w, h, _a = stats[i]
+        if 1.8 * il <= h <= 4.5 * il and 0.8 * il <= w <= 2.6 * il \
+                and (best is None or cx > stats[best][0]):
+            best = i
+    if best is None:
+        return None
+    cx, cy, w, h, _a = stats[best]
+    comp = lab[cy:cy + h, cx:cx + w] == best
+    head = comp[int(h - 1.2 * il):, :]
+    # an open head encloses white: a hole inside the head's outline
+    holes = cv2.connectedComponentsWithStats((1 - np.pad(head, 1)).astype(np.uint8))[2]
+    hollow = any(st[4] > 0.05 * il * il and st[0] > 0 and st[1] > 0
+                 and st[0] + st[2] < head.shape[1] + 2 and st[1] + st[3] < head.shape[0] + 2
+                 for st in holes[2:])
+    # a flag: ink right of the stem near its top
+    cols = comp.sum(axis=0)
+    stem = int(np.argmax(cols))
+    # (a note run into the word above it is cut off at the box's top:
+    # what lies right of its stem there is the word, not a flag)
+    flag = cy > 0 and comp[:int(1.2 * il), min(stem + 3, w):].sum() > 0.3 * il * il
+    dotted = any(0.15 * il <= stats[j][2] <= 0.6 * il and 0.15 * il <= stats[j][3] <= 0.6 * il
+                 and stats[j][0] > cx + w and cy + h - 1.2 * il <= stats[j][1] <= cy + h
+                 for j in range(1, n) if j != best)
+    unit = "half" if hollow else "eighth" if flag else "quarter"
+    return unit, dotted
+
+
+def page_tempo_marks(omr: Path) -> list[tuple[int, int, int, tuple[str, bool, int]]]:
+    """(sheet, x, y, (beat unit, dotted, per minute)) for every metronome
+    mark printed over a staff: a little note, an equals sign (two short
+    dashes one over the other) and a number of 2-3 digits. An equals
+    sign between two notes (a swing or a metric modulation) has no
+    number after it and is not a tempo."""
+    import io as _io
+    import zipfile as _zipfile
+    import cv2
+    import numpy as np
+    from PIL import Image
+    from fix_hbars import _staff_at
+    staves = _staves(omr)
+    found = []
+    with _zipfile.ZipFile(omr) as z:
+        sheets = sorted({n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+                        key=lambda s: int(s.split("#")[1]))
+        for si, sheet in enumerate(sheets):
+            if si not in staves:
+                continue
+            image = Image.open(_io.BytesIO(z.read(f"{sheet}/BINARY.png"))).convert("L")
+            ink = np.asarray(image) < 128
+            il = float(np.median([(b - t) / 4 for _l, t, b in staves[si]]))
+            n, _lab, st, _c = cv2.connectedComponentsWithStats(ink.astype(np.uint8))
+            dashes = [i for i in range(1, n)
+                      if 0.4 * il <= st[i][2] <= 1.6 * il and st[i][3] <= 0.35 * il
+                      and st[i][4] >= 0.6 * st[i][2] * st[i][3]]
+            for i in dashes:
+                x, y, w, h = (int(v) for v in st[i][:4])
+                if not any(j != i and abs(st[j][0] - x) < 0.4 * il
+                           and abs(st[j][2] - w) < 0.4 * il
+                           and 0.15 * il < st[j][1] - y < 0.8 * il for j in dashes):
+                    continue
+                cy = y + 0.25 * il
+                # printed over the staff it governs, within the band a
+                # tempo mark stands in (closer to the staff above, often)
+                if not any(0 < _staff_at(ls, x)[0] - cy <= 8 * il for ls, _t, _b in staves[si]):
+                    continue
+                bpm = _read_number(image.crop((x + w + 1, int(cy - 1.2 * il),
+                                               int(x + w + 5 * il), int(cy + 1.4 * il))), il)
+                if bpm is None or not 30 <= bpm <= 300:
+                    continue
+                note = _beat_note(ink, x, int(cy), il)
+                if note is None:
+                    continue
+                found.append((si, x, int(cy), (note[0], note[1], bpm)))
+    return found
+
+
+def place_tempo_marks_ink(omr: Path, out: Path, hbars: list[dict],
+                          numbers: list[int] | None = None) -> int:
+    """Every metronome mark the page prints (`page_tempo_marks`), on the
+    bar under its equals sign, with the playback tempo in quarter notes.
+    A bar that already carries the same mark keeps it."""
+    from fix_hbars import _locate_marks
+    marks = page_tempo_marks(omr)
+    if not marks:
+        return 0
+    at = _locate_marks(omr, hbars, marks, band="above", containing=True,
+                       numbers=numbers)
+    tree = ET.parse(out)
+    by_number = {m.get("number"): m for m in tree.getroot().find("part").findall("measure")}
+    quarters = {"eighth": 0.5, "quarter": 1.0, "half": 2.0, "whole": 4.0}
+    placed = 0
+    for number, (unit, dotted, bpm) in at:
+        m = by_number.get(str(number))
+        if m is None:
+            continue
+        old = [d for d in m.findall("direction") if d.find("direction-type/metronome") is not None]
+        if any(d.findtext("direction-type/metronome/per-minute") == str(bpm) for d in old):
+            continue
+        for d in old:
+            m.remove(d)
+        d = ET.Element("direction", placement="above")
+        metro = ET.SubElement(ET.SubElement(d, "direction-type"), "metronome")
+        ET.SubElement(metro, "beat-unit").text = unit
+        if dotted:
+            ET.SubElement(metro, "beat-unit-dot")
+        ET.SubElement(metro, "per-minute").text = str(bpm)
+        q = bpm * quarters[unit] * (1.5 if dotted else 1.0)
+        ET.SubElement(d, "sound", tempo=f"{q:g}")
+        m.insert(0, d)
+        placed += 1
+    if placed:
+        tree.write(out, encoding="UTF-8", xml_declaration=True)
+    return placed
+
+
+def segno_coda_on_barlines(out: Path) -> int:
+    """A Segno or Coda sign that opens a bar is also written on the
+    bar's left barline (`<barline location="left"><segno/>`), keeping
+    its direction. Both are standard MusicXML; MuseScore imports a
+    direction-only sign as small staff text (a quarter of the printed
+    size) and the barline one as a full-size repeat marker, while
+    Verovio reads the direction, and neither writes the sign twice.
+    Returns signs written."""
+    tree = ET.parse(out)
+    order = ["bar-style", "footnote", "level", "wavy-line", "segno", "coda",
+             "fermata", "ending", "repeat"]
+    written = 0
+    for m in tree.getroot().iter("measure"):
+        signs = []
+        for child in m:
+            if child.tag in ("note", "backup", "forward"):
+                break
+            if child.tag == "direction":
+                for dt in child.findall("direction-type"):
+                    signs += [c.tag for c in dt if c.tag in ("segno", "coda")]
+        if not signs:
+            continue
+        bar = next((b for b in m.findall("barline") if b.get("location") == "left"), None)
+        if bar is None:
+            bar = ET.Element("barline", location="left")
+            m.insert(0, bar)
+        for tag in dict.fromkeys(signs):
+            if bar.find(tag) is not None:
+                continue
+            at = len([c for c in bar if order.index(c.tag) < order.index(tag)]) \
+                if all(c.tag in order for c in bar) else len(bar)
+            bar.insert(at, ET.Element(tag))
+            written += 1
+    if written:
+        tree.write(out, encoding="UTF-8", xml_declaration=True)
+    return written
 
 
 def _known_term(text: str) -> str | None:
@@ -2071,12 +2596,28 @@ def place_words(omr_path: Path, out: Path, crops: list[dict],
                     key=lambda w: w["x"])
                 # A printed bar number often shares a sentence with the
                 # instruction beside it ("42 Allegretto").
-                tokens = [w["value"] for w in inside
+                tokens = [w for w in inside
                           if not w["value"].strip(".").isdigit()]
-                text = _known_term(" ".join(tokens).strip())
-                if not text:
+                text = _known_term(" ".join(w["value"] for w in tokens).strip())
+                if text:
+                    sentences.append((sx + sw / 2, sy, text))
                     continue
-                sentences.append((sx + sw / 2, sy, text))
+                # two instructions printed in one line ("Cym. cup ad lib.
+                # Poco rit."): each run of words that names a term is
+                # placed by its own position, longest runs first
+                taken: set[int] = set()
+                for size in range(len(tokens) - 1, 0, -1):
+                    for a in range(len(tokens) - size + 1):
+                        run = range(a, a + size)
+                        if taken & set(run):
+                            continue
+                        term = _known_term(" ".join(tokens[i]["value"] for i in run))
+                        if not term:
+                            continue
+                        taken |= set(run)
+                        left = tokens[a]["x"]
+                        right = tokens[a + size - 1]["x"] + tokens[a + size - 1]["w"]
+                        sentences.append(((left + right) / 2, sy, term))
 
             for system in root.iter("system"):
                 staff = system.find(".//staff")
@@ -2239,12 +2780,85 @@ def _page_defaults(score: ET.Element, width: float, height: float, il: float,
     score.insert(at, d)
 
 
+def ink_fermatas(omr: Path) -> dict[int, list[float]]:
+    """{stack ordinal: [x]} of the fermatas printed over a staff that
+    Audiveris did not report: an arch about two interlines wide and one
+    high, open underneath, with a dot under its crown, standing over the
+    staff it is nearest to (up to eight interlines above it, as high as
+    a fermata over a stem tip stands)."""
+    import io as _io
+    import zipfile as _zipfile
+    import cv2
+    import numpy as np
+    from PIL import Image
+    from fix_hbars import _staff_at
+    out: dict[int, list[float]] = {}
+    ordinal = -1
+    with _zipfile.ZipFile(omr) as z:
+        sheets = sorted({n.split("/")[0] for n in z.namelist() if n.startswith("sheet#")},
+                        key=lambda s: int(s.split("#")[1]))
+        for sheet in sheets:
+            root = ET.fromstring(z.read(f"{sheet}/{sheet}.xml").decode("utf-8", "replace"))
+            systems = []
+            for system in root.iter("system"):
+                staff = system.find(".//staff")
+                lines = staff.findall("lines/line") if staff is not None else []
+                if len(lines) < 5:
+                    continue
+                stacks = []
+                for st in system.findall("stack"):
+                    ordinal += 1
+                    stacks.append((ordinal, float(st.get("left")), float(st.get("right"))))
+                systems.append((lines, stacks))
+            if not systems:
+                continue
+            ink = (np.asarray(Image.open(_io.BytesIO(z.read(f"{sheet}/BINARY.png")))
+                              .convert("L")) < 128).astype(np.uint8)
+            n, lab, stats, _c = cv2.connectedComponentsWithStats(ink)
+            il = float(np.median([(_staff_at(ls, 0)[1] - _staff_at(ls, 0)[0]) / 4
+                                  for ls, _ in systems]))
+            small = [j for j in range(1, n)
+                     if 0.15 * il <= stats[j][2] <= 0.6 * il
+                     and 0.15 * il <= stats[j][3] <= 0.6 * il]
+            for i in range(1, n):
+                x, y, w, h, _a = (int(v) for v in stats[i])
+                if not (1.2 * il <= w <= 3.0 * il and 0.5 * il <= h <= 1.6 * il):
+                    continue
+                comp = lab[y:y + h, x:x + w] == i
+                crown = comp[:max(2, h // 3), w // 3:2 * w // 3].any(axis=0).mean()
+                hollow = not comp[int(h * 0.75):, int(w * 0.4):int(w * 0.6)].any()
+                legs = comp[int(h * 0.7):, :w // 4].any() and comp[int(h * 0.7):, 3 * w // 4:].any()
+                if crown < 0.9 or not hollow or not legs:
+                    continue
+                if not any(x + 0.25 * w <= stats[j][0] + stats[j][2] / 2 <= x + 0.75 * w
+                           and y + 0.2 * h <= stats[j][1] + stats[j][3] / 2 <= y + h + 0.6 * il
+                           for j in small):
+                    continue
+                cx, cy = x + w / 2, y + h
+                best = None
+                for lines, stacks in systems:
+                    top, _bottom = _staff_at(lines, cx)
+                    if 0 <= top - cy <= 8 * il and (best is None or top - cy < best[0]):
+                        best = (top - cy, stacks)
+                if best is None:
+                    continue
+                for k, x0, x1 in best[1]:
+                    if x0 <= cx < x1:
+                        out.setdefault(k, []).append(cx)
+    return out
+
+
 def place_fermatas(omr_path: Path, out: Path, crops: list[dict],
                    rest_bars: dict[int, int]) -> int:
     """A fermata over a rest or note, where the page prints one."""
     from drum_overlay import bar_objects
 
     objects = bar_objects(omr_path)
+    for stack, xs in ink_fermatas(omr_path).items():
+        if stack in objects:
+            have = objects[stack]["fermatas"]
+            have += [x for x in xs if all(abs(x - h) > 30 for h in have)]
+            have.sort()
     measure_of: dict[int, int] = {}
     measure = 0 if crops and crops[0].get("pickup") else 1
     for i, crop in enumerate(crops):
@@ -2295,7 +2909,7 @@ def apply_structure(work_dir: Path, out: Path, omr: Path,
     printed tempo, repeat barlines and voltas, and rehearsal letters placed
     by their pixel position."""
     sys.path.insert(0, str(BENCH_DIR.parent / "app"))
-    from fix_hbars import place_hairpins, place_rehearsals
+    from fix_hbars import place_rehearsals
     from fix_tempo import fix as fix_tempo
     from postprocess import graft_barlines, measure_signature  # noqa: F401
 
@@ -2306,6 +2920,7 @@ def apply_structure(work_dir: Path, out: Path, omr: Path,
             print(f"  tempo recovered: {bpm} BPM", flush=True)
 
     engine = work_dir / "audiveris.musicxml"
+    numbers = None
     if ink_marks is not None:
         # The ink path: repeats, voltas, Segno, Coda and the jump texts
         # are read off the page and placed by their pixel position, so
@@ -2358,10 +2973,21 @@ def apply_structure(work_dir: Path, out: Path, omr: Path,
         _mend_boxed_numbers(out)
     else:
         placed = place_rehearsals(omr, out, hbars)
-    # Drum charts engrave hairpins above the staff, under the dynamics
-    # line; a part below. Both bands are tried, duplicates are skipped.
-    wedges = place_hairpins(omr, out, hbars, band="above") \
-        + place_hairpins(omr, out, hbars)
+    # Drum charts engrave hairpins above the staff or below it; each one
+    # goes to the staff it is printed nearest to, once.
+    # `numbers_for_bars` counts the first stack as bar 1; after a pickup
+    # (measure 0) every stack's measure is one lower
+    marks_numbers = numbers
+    first = ET.parse(out).getroot().find("part").find("measure")
+    if numbers is not None and first is not None and first.get("number") == "0":
+        marks_numbers = [n - 1 for n in numbers]
+    wedges = place_hairpins_once(omr, out, hbars, marks_numbers)
+    tempo_marks = place_tempo_marks_ink(omr, out, hbars, marks_numbers)
+    if tempo_marks:
+        print(f"  {tempo_marks} metronome marks placed", flush=True)
+    dynamics = place_dynamics_once(omr, out, hbars, marks_numbers)
+    if dynamics:
+        print(f"  {dynamics} dynamics placed", flush=True)
     if wedges:
         print(f"  {wedges} hairpins placed", flush=True)
     if placed:
@@ -2561,10 +3187,12 @@ def main():
     pickups = {gi for gi, c in enumerate(crops) if c.get("pickup")}
     write_musicxml(grids, out, title=out.stem, rest_bars=rest_bars,
                    meters=meters, tempos=tempos, printed=printed,
+                   symbols=[c.get("time_symbol") for c in crops],
                    pickups=pickups)
     apply_structure(work_dir, out, omr, hbars,
                     ink_marks if "--ink" in sys.argv else None)
     words = place_words(omr, out, crops, rest_bars)
+    segno_coda_on_barlines(out)
     fermatas = place_fermatas(omr, out, crops, rest_bars)
     breaks = place_breaks(omr, out, crops, rest_bars)
     print(f"  line breaks as printed: {breaks[0]} systems, {breaks[1]} pages", flush=True)
