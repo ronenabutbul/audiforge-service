@@ -101,6 +101,7 @@ QUALITIES = {
     "69": "major-sixth", "°": "diminished", "°7": "diminished-seventh",
     "Δ": "major-seventh", "Δ7": "major-seventh", "ø": "half-diminished",
     "ø7": "half-diminished", "m(maj7)": "major-minor",
+    "ma7": "major-seventh", "ma9": "major-ninth", "ma13": "major-13th",
 }
 ALTER = {None: 0, "": 0, "b": -1, "bb": -2, "#": 1, "##": 2}
 FLATS = ["B", "E", "A", "D", "G", "C", "F"]
@@ -198,6 +199,9 @@ class Names:
             self.parts.append({"i": i, "x": x, "y": y, "w": w, "h": h})
 
     def boxes(self) -> list[dict]:
+        def edge_of(il):
+            return max(int(0.2 * il), 2)
+
         """Rehearsal boxes: a frame, with whatever sits inside it."""
         il = self.il
         frames = []
@@ -205,14 +209,26 @@ class Names:
             if p["w"] < 1.6 * il or p["h"] < 1.6 * il:
                 continue
             g = self.lab[p["y"]:p["y"] + p["h"], p["x"]:p["x"] + p["w"]] == p["i"]
-            edge = max(int(0.2 * il), 2)
+            # a stem, a barline or an accent may touch the frame: the frame
+            # is the longest run of ink along its top row, down to the
+            # longest run along its left side
+            row = next((r for r in range(min(len(g), int(0.5 * il) + 1))
+                        if max((b - a for a, b in _runs(g[r])), default=0) >= 1.6 * il), None)
+            if row is not None:
+                a0, b0 = max(_runs(g[row]), key=lambda r: r[1] - r[0])
+                col = g[row:, a0:a0 + edge_of(il)].any(axis=1)
+                down = next((b for a, b in _runs(col) if a == 0), 0)
+                if down >= 1.6 * il:
+                    g = g[row:row + down, a0:b0]
+                    p = dict(p, x=p["x"] + a0, y=p["y"] + row, w=b0 - a0, h=down)
+            edge = edge_of(il)
             sides = (g[:edge].any(axis=0).mean(), g[-edge:].any(axis=0).mean(),
                      g[:, :edge].any(axis=1).mean(), g[:, -edge:].any(axis=1).mean())
             if min(sides) > 0.85:
                 frames.append(p)
         out = []
         for f in frames:
-            inside = [p for p in self.parts if p is not f
+            inside = [p for p in self.parts if p["i"] != f["i"]
                       and p["x"] >= f["x"] and p["x"] + p["w"] <= f["x"] + f["w"]
                       and p["y"] >= f["y"] and p["y"] + p["h"] <= f["y"] + f["h"]]
             out.append({"frame": f, "inside": inside})
