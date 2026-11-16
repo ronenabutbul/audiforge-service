@@ -593,6 +593,17 @@ def read_names(names: Names, used: set[int], cap: float, base: float, verbose: b
         chords.append(chord)
 
     for tok in tokens:
+        # a name starts with a capital: as tall as the row's capitals, never
+        # a sign (a flat before a note) or a speck (a staccato dot)
+        first = _glyphs(tok)[0]
+        h = _height(first)
+        w = max(q["x"] + q["w"] for q in first) - min(q["x"] for q in first)
+        if h < 0.75 * cap or w < 0.3 * cap or (len(first) == 1 and names.accidental(first[0], cap)):
+            if verbose:
+                print(f"    ink at x={names.ox + tok[0]['x']:5d}: starts with no capital")
+            chords.append({"x": names.ox + tok[0]["x"], "unread": "",
+                           "x1": names.ox + max(q["x"] + q["w"] for q in tok)})
+            continue
         text = _read_token(names, tok, cap, base)
         name = tidy(text)
         chord = parse_chord(name)
@@ -668,14 +679,24 @@ def harmony_xml(c: dict, offset: int) -> str:
     return "\n".join(out)
 
 
-def page_names(ink: np.ndarray, systems: list[System], verbose: bool = False) -> list[tuple[list[dict], list[dict]]]:
+def page_names(ink: np.ndarray, systems: list[System], verbose: bool = False,
+               notes: list[tuple[float, float, float, float]] | None = None
+               ) -> list[tuple[list[dict], list[dict]]]:
     """(chord names, boxed rehearsal marks) above each staff of one page.
     The names of a page share one size of capital and stand on one line
     above their staff; a system with a name or two takes that line from
-    the systems around it."""
+    the systems around it. notes: boxes (x, y, w, h on the page) of what
+    is played (heads, stems, ledger lines): ink centred in one is not
+    text (a high note on its ledger lines is the size of a capital)."""
     all_names = [Names(ink, s.x0, s.x1, 0, 0, s.il, strip=s.band(-s.up, -0.15 * s.il)) for s in systems]
     for s, names in zip(systems, all_names):
         names.oy = -s.up                         # rows of the strip count from the top line
+        if notes:
+            def played(p, s=s):
+                cx = s.x0 + p["x"] + p["w"] / 2
+                cy = s.top(cx) - s.up + p["y"] + p["h"] / 2
+                return any(x <= cx <= x + w and y <= cy <= y + h for x, y, w, h in notes)
+            names.parts = [p for p in names.parts if not played(p)]
     cap = letter_height(systems, all_names)
     found = [read_marks(names) for names in all_names]
     rows = []

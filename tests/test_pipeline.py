@@ -32,6 +32,7 @@ import replay  # noqa: E402
 from app import audiveris_local, pipeline, postprocess  # noqa: E402
 
 _SCRATCH = Path(tempfile.mkdtemp(prefix="omr-pipeline-tests-"))
+RESULTS_CONVERT = REPO / "local_bench" / "results" / "convert"
 _loaded: dict = {}
 
 
@@ -940,6 +941,93 @@ def test_rest_expanded_from_a_misread_count_is_cut_to_the_page():
 
 
 # --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# Chord names printed above a melody (lead sheets).
+# --------------------------------------------------------------------------- #
+
+def _harmony_by_bar(path: Path) -> dict[str, list[str]]:
+    """Chord names as written, measure number -> names in order."""
+    def alter(text):
+        return {"1": "#", "-1": "b"}.get(text or "", "")
+    out = {}
+    for m in ET.parse(path).getroot().find("part").findall("measure"):
+        names = []
+        for h in m.findall("harmony"):
+            name = h.findtext("root/root-step") + alter(h.findtext("root/root-alter")) \
+                + (h.find("kind").get("text") or "")
+            if h.find("bass") is not None:
+                name += "/" + h.findtext("bass/bass-step") + alter(h.findtext("bass/bass-alter"))
+            names.append(name)
+        if names:
+            out[m.get("number")] = names
+    return out
+
+
+def test_lead_sheet_chord_names_land_on_their_bars_and_notes():
+    """Nigunim 74 page 4 prints a chord name over nearly every bar of the
+    melody (two or three in a bar, over first and second endings, one
+    under a Fine). Each is written as <harmony> before the note it is
+    printed over; nothing else in the score changes."""
+    from app import lead_chords
+    piece = RESULTS_CONVERT / "Nigunim 74"
+    result = scratch("lead") / "Nigunim 74.musicxml"
+    shutil.copy(piece / "Nigunim 74.musicxml", result)
+    written = quiet(lead_chords.place, piece / "Nigunim 74.omr", result)
+    got = _harmony_by_bar(result)
+    # page 4 as printed, bar by bar (bar 4 is the first ending, 5 the second)
+    page4 = {"1": ["Bm", "Dm/A"], "2": ["G", "F#"], "3": ["Bm", "D"],
+             "4": ["Bm", "Am", "Bm"], "5": ["Bm", "Am", "Bm"], "6": ["D", "A", "D"],
+             "7": ["D", "G", "D"], "8": ["D", "A", "D"], "9": ["D", "A", "D"],
+             "10": ["D", "A", "D"], "11": ["D", "G", "D", "A"], "12": ["D", "A", "D"],
+             "13": ["D", "Am", "Bm"], "14": ["Bm"], "15": ["Bm", "Em", "F#"],
+             "16": ["Bm"], "17": ["Bm", "A7", "D", "F#"], "18": ["Bm", "Am", "Bm"]}
+    wrong = {n: got.get(n) for n, want in page4.items() if got.get(n) != want}
+    assert not wrong, f"page 4 bars read differently: {wrong}"
+    # bar 1: Bm on the first note; Dm/A is printed over the fourth note
+    # (the eighth B), with the F of beat 3 a name's width to its right
+    first = ET.parse(result).getroot().find("part").find("measure")
+    kids = [e for e in first if e.tag in ("harmony", "note")]
+    assert kids[0].tag == "harmony" and kids[1].tag == "note"
+    assert kids.index(first.findall("harmony")[1]) == 4, "Dm/A is not before the fourth note"
+    # pages 5 to 8 print no chord names: no harmony in their bars
+    stray = [n for n in got if 19 <= int(n) <= 131]
+    assert not stray, f"chord names written where none are printed: bars {stray}"
+    assert written >= 66, written
+    # nothing else changes, but for the engine's plain-text copy of the
+    # names ("D A D" over bar 10), which the harmony replaces
+    def words(path):
+        return [w.text for w in ET.parse(path).getroot().iter("words")]
+    gone = [w for w in words(piece / "Nigunim 74.musicxml") if w not in words(result)]
+    assert gone == ["D A D"], gone
+    before, after = (ET.parse(p).getroot() for p in (piece / "Nigunim 74.musicxml", result))
+    assert len(before.find("part").findall("measure")) == len(after.find("part").findall("measure"))
+    assert [ET.tostring(n) for n in before.iter("note")] == [ET.tostring(n) for n in after.iter("note")]
+    return f"{written} chord names"
+
+
+def test_melodic_part_without_chord_names_gains_none():
+    """A melodic part whose text above the staff is tempo words,
+    dynamics, rehearsal marks and high notes on ledger lines (Gladiator
+    flute, Harry Potter tenor sax): no page counts as printing chord
+    names, and the score is left byte for byte as it was."""
+    from app import lead_chords
+    for name in ("Gladiator-flute 1+2", "Harry Potter - Tenor Sax"):
+        piece = RESULTS_CONVERT / name
+        result = scratch("lead-none") / f"{name}.musicxml"
+        shutil.copy(piece / f"{name}.musicxml", result)
+        before = result.read_bytes()
+        omr = next(piece.glob("*.omr"))
+        assert quiet(lead_chords.place, omr, result) == 0, name
+        assert result.read_bytes() == before, name
+
+
+def test_finish_places_chord_names_from_the_page():
+    """The chord-name step is one of the marks placed from the page, so
+    the server and the bench both run it."""
+    import inspect
+    assert "lead_chords.place" in inspect.getsource(pipeline._repair_structure)
+
 
 def main() -> int:
     wanted = sys.argv[1:]
