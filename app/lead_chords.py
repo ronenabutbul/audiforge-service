@@ -11,20 +11,31 @@ Which text is a chord name is a rule of notation, not of one page:
     flat, a quality from the chord vocabulary, a bass after a slash.
     A tempo word, a dynamic, a fingering, Hebrew text, a title or a
     lyric does not (lyrics stand under the staff and are not read);
+  - a chord name starts with a capital as tall as the row's capitals:
+    not a sign (a flat before a note reads as "b" or "B"), not a speck
+    (a staccato dot);
+  - chord names stand above the notes: ink beside a head, a stem or a
+    ledger line Audiveris read, and level with it, is that note's (a
+    high note on ledger lines is the size of a capital and reads as
+    "A"), so it is not read;
   - chord names come as a row: they stand on one line above the staff,
-    one or more over most bars, line after line. A word that happens to
-    spell a chord ("A", "Bb", "D5") stands alone among text that does
-    not. So a page counts as printing chord names only when its names
-    outnumber the other text on their line three to one and come to at
-    least one per staff (and four in all); on any other page nothing is
-    written, whatever single words read as chords;
+    one or more over most bars, line after line, and the harmony moves.
+    A word that happens to spell a chord ("A", "Bb", "D5") stands alone
+    among text that does not. So a page counts as printing chord names
+    only when its names outnumber the other text on their line three to
+    one, come to at least one per staff (and four in all), and are at
+    least three different names; on any other page nothing is written,
+    whatever single words read as chords;
   - boxed letters are rehearsal marks, and ending numbers set against
     the first name in a bracket ("1Bm") are the bracket's, not the
     name's: the reader takes both out.
 
-Audiveris has its own ChordName inters. On the lead sheets measured
-(Nigunim 74 pages 4 and 9) it found 21 of 68 names and spelt some of
-those wrong, so the ink is read instead.
+Audiveris has its own ChordName inters. On Nigunim 74 pages 4 and 9 (68
+names printed) it made 21, of which 19 are spelt right (two Bm read as
+Em); the other 47 names it left out or read as plain words ("D A D",
+"1Bm", "D H", "13m" for 2Bm), and it read no A7 or F# at all. The ink
+reader finds all 68 spelt right, so the ink is read and Audiveris's
+inters are not used.
 
 Each name is placed on the note it is printed over: the nearest chord
 or rest Audiveris found on that staff, lining names up by their left
@@ -59,8 +70,13 @@ except ImportError:  # local_bench puts app/ itself on sys.path
 # A page prints chord names when its names outnumber the other text on
 # their line by this much ...
 NAMES_PER_OTHER = 3
-# ... and come to at least one per staff, and this many in all.
+# ... and come to at least one per staff, and this many in all ...
 MIN_NAMES = 4
+# ... and are not all the same: names mark the harmony, and it moves. (A
+# page where one letter repeats is note ink read as text: a stack of
+# heads on ledger lines reads as "A". Measured: 4 to 21 different names
+# on the lead-sheet pages, 1 on that flute part.)
+MIN_DISTINCT = 3
 # A name points at a note within this many interlines of its anchor; a
 # name farther from every note stands over an empty bar or a long one.
 NEAR_NOTE_IL = 3.0
@@ -143,9 +159,11 @@ def read_pages(omr: Path, verbose: bool = False) -> list[dict]:
                      for c in chords]
             good = [n for n in names if "unread" not in n[2]]
             other = len(names) - len(good)
-            prints = len(good) >= max(MIN_NAMES, len(systems)) and len(good) >= NAMES_PER_OTHER * other
+            distinct = len({n[2]["text"] for n in good})
+            prints = len(good) >= max(MIN_NAMES, len(systems)) and len(good) >= NAMES_PER_OTHER * other \
+                and distinct >= MIN_DISTINCT
             if verbose:
-                print(f"  {name}: {len(good)} names, {other} other words on their line, "
+                print(f"  {name}: {len(good)} names ({distinct} different), {other} other words on their line, "
                       f"{len(systems)} staves -> {'chord names' if prints else 'none'}")
             if not prints:
                 continue
@@ -281,6 +299,8 @@ def place(omr_path: Path, result_path: Path, hbars: list[dict] | None = None,
                        row[0] if x < row[0]["x0"] else row[-1])
             m = measure_of(bar["number"])
             if m is None:
+                if verbose:
+                    print(f"  {page['sheet']}: no measure for printed bar {bar['number']} ({n['chord']['text']})")
                 continue
             inside = [o for o in n["onsets"] if bar["x0"] <= o[k] < bar["x1"]]
             if near is not None and near in inside and x == near[k]:
@@ -306,12 +326,18 @@ def place(omr_path: Path, result_path: Path, hbars: list[dict] | None = None,
         print(f"  {dropped} text direction(s) that only repeat chord names taken out")
     for i, measure in enumerate(measures):
         d = measure.find("attributes/divisions")
-        if d is not None and d.text:
+        if d is not None and d.text and int(d.text) > 0:
             divisions = int(d.text)
         if i not in placed:
             continue
         moments = _score_onsets(measure)
         if not moments:
+            # a bar the engines left with nothing in it (a chord chart's
+            # slashes neither engine reads): the names go in, in order,
+            # with nothing to hang on
+            if verbose:
+                print(f"  measure {measure.get('number')}: empty in the score; "
+                      + " ".join(c["text"] for *_r, c in sorted(placed[i], key=lambda p: p[2])) + " not written")
             continue
         taken = -1
         for where, of, _order, chord in sorted(placed[i], key=lambda p: p[2]):
