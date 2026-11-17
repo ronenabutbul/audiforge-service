@@ -1029,6 +1029,176 @@ def test_finish_places_chord_names_from_the_page():
     assert "lead_chords.place" in inspect.getsource(pipeline._repair_structure)
 
 
+# --------------------------------------------------------------------------- #
+# Marks checked against the page, and a booklet of tunes (Nigunim 74).
+# --------------------------------------------------------------------------- #
+
+def _nigunim_with_page_starts(name: str) -> tuple[Path, Path]:
+    from app import page_ink
+    piece = RESULTS_CONVERT / "Nigunim 74"
+    result = scratch(name) / "merged.musicxml"
+    shutil.copy(piece / "merged.musicxml", result)
+    assert page_ink.mark_page_starts(result) == 6
+    return piece / "Nigunim 74.omr", result
+
+
+def _by_page(result: Path, find) -> list[list[int]]:
+    """Per engine page, the page-relative measure indexes `find(measure)`
+    is true for."""
+    from app import page_ink
+    measures = ET.parse(result).getroot().find("part").findall("measure")
+    starts = page_ink.page_starts(measures) + [len(measures)]
+    return [[i - a for i in range(a, b) if find(measures[i])]
+            for a, b in zip(starts, starts[1:])]
+
+
+def test_fermatas_stay_only_where_the_page_prints_them():
+    """homr reads the chord names over Nigunim 74's first tune ("D A D")
+    as fermatas: 13 in bars where the page prints none. The page prints
+    two, both in the third tune (page 6), over the whole notes of its
+    first and second endings, and those two stay."""
+    from app import page_ink
+    omr, result = _nigunim_with_page_starts("fermata")
+    kept, removed = page_ink.check_fermatas(omr, result, [])
+    assert (kept, removed) == (2, 11), (kept, removed)
+    on = _by_page(result, lambda m: m.find(".//fermata") is not None)
+    assert on == [[], [], [7, 8], [], [], []], on
+
+
+def test_dynamics_read_off_words_are_not_printed():
+    """Audiveris reads the "F" of "F#", the "F" of "Fine" and letters of a
+    Hebrew dedication as p, sf and pp. A dynamic standing on its own keeps
+    its place: page 6's p, f, sf, sf, and a page full of real dynamics
+    (Gladiator flute) loses none of its p / f / ff / mp to the rule."""
+    from app import page_ink
+    omr = RESULTS_CONVERT / "Nigunim 74" / "Nigunim 74.omr"
+    own = [(d[4], d[3]) for d in page_ink.omr_dynamics(omr, text=False)]
+    assert own == [("sheet#6", "p"), ("sheet#6", "f"), ("sheet#6", "sf"), ("sheet#6", "sf")], own
+    words = sorted(d[4] for d in page_ink.omr_dynamics(omr, text=True))
+    assert words == ["sheet#4", "sheet#7", "sheet#7", "sheet#9"], words
+    flute = next((RESULTS_CONVERT / "Gladiator-flute 1+2").glob("*.omr"))
+    kept = [d[3] for d in page_ink.omr_dynamics(flute, text=False)]
+    assert len(kept) >= 24 and {"p", "f", "ff", "mp"} <= set(kept), kept
+
+
+def test_dynamics_in_the_score_must_be_printed_on_their_bar():
+    """Every dynamic of the fused Nigunim score that the page does not
+    print goes (the engine's p over "F#", sf over "Fine"); the third
+    tune's p, f, sf, sf are there, on bars 1 and 10 of its page."""
+    from app import page_ink
+    omr, result = _nigunim_with_page_starts("dynamics")
+    shutil.copy(RESULTS_CONVERT / "Nigunim 74" / "audiveris.musicxml", scratch("dynamics") / "a.xml")
+    # the fusion graft is what brings the engine's dynamics over
+    quiet(postprocess.graft_features, result, scratch("dynamics") / "a.xml")
+    quiet(page_ink.check_dynamics, omr, result, [])
+    found = _by_page(result, lambda m: m.find(".//dynamics") is not None)
+    assert found == [[], [], [0, 9], [], [], []], found
+    kinds = sorted(c.tag for d in ET.parse(result).getroot().iter("dynamics") for c in d)
+    assert kinds == ["f", "p", "sf", "sf"], kinds
+
+
+def test_meter_change_with_no_signature_printed_is_dropped():
+    """homr reads the heavy bar and dots of a repeat sign that opens a
+    system as 8/8 or 16/16: five such changes in Nigunim 74, none printed.
+    Each page's own 4/4 and the last tune's 6/8 stay."""
+    from app import page_ink
+    omr, result = _nigunim_with_page_starts("time")
+    kept, removed = page_ink.check_time_changes(omr, result, [])
+    assert removed == 5, (kept, removed)
+    times = [(t.findtext("beats"), t.findtext("beat-type"))
+             for t in ET.parse(result).getroot().iter("time")]
+    assert times == [("4", "4")] * 5 + [("6", "8")], times
+
+
+def test_booklet_pages_are_tunes_and_one_piece_stays_one():
+    """Nigunim 74 prints a tune per page: each first system opens with a
+    time signature under a title block. A piece over several pages is one
+    tune however its pages begin: a meter change at a page turn (Harry
+    Potter p3), a running header, a page of a conductor score."""
+    from app import tunes
+    omr = RESULTS_CONVERT / "Nigunim 74" / "Nigunim 74.omr"
+    assert tunes.detect(omr, []) == [0, 1, 2, 3, 4, 5]
+    for name in ("Harry Potter - Tenor Sax", "Shem Tov Levi - Electric Piano",
+                 "Avihu Medina - Drum Set", "Gladiator-flute 1+2",
+                 "Heal the World - Conductor", "Danzón Nº 2 - Piano"):
+        omr = next((RESULTS_CONVERT / name).glob("*.omr"))
+        assert tunes.detect(omr, []) == [0], name
+
+
+def test_tunes_are_laid_out_and_split():
+    """Two marked tunes in one score: the second starts a new page at its
+    own bar 0 (a pickup, as printed) with key, time and title, the first
+    ends on a final barline, the second's D.C. goes back to its own start;
+    split writes each as a file of its own with a plain D.C."""
+    from app import tunes
+    bar = note(4) * 4
+    first = [one_attributes(4, 4, 4) + "<attributes><key><fifths>2</fifths></key></attributes>" + bar,
+             bar]
+    second = ['<attributes><divisions>4</divisions></attributes>' + note(4), bar,
+              bar + '<direction><direction-type><words>D.C.</words></direction-type>'
+                    '<sound dacapo="yes"/></direction><barline location="right">'
+                    '<bar-style>light-heavy</bar-style><repeat direction="backward"/></barline>']
+    path = write("tunes.musicxml", score(first + second))
+    tree = ET.parse(path)
+    measures = tree.getroot().find("part").findall("measure")
+    measures[2].set(tunes.TUNE_START, "2")
+    measures[2].set(tunes.TUNE_TITLE, "ניגון • 6")
+    tree.write(path, encoding="UTF-8", xml_declaration=True)
+    assert tunes.write(path) == 2
+    measures = ET.parse(path).getroot().find("part").findall("measure")
+    assert [m.get("number") for m in measures] == ["1", "2", "0", "1", "2"]
+    assert measures[2].get("implicit") == "yes"
+    assert measures[2].find("print").get("new-page") == "yes"
+    assert measures[1].find("barline/bar-style").text == "light-heavy"
+    assert measures[2].find("attributes/key/fifths").text == "2"
+    # its repeat goes back to its own first bar, not into the first tune
+    assert measures[2].find("barline[@location='left']/repeat").get("direction") == "forward"
+    assert measures[2].find("attributes/time/beats").text == "4"
+    assert measures[2].find("direction/direction-type/words").text == "ניגון • 6"
+    assert not any(tunes.TUNE_START in m.attrib for m in measures)
+    assert measures[4].find(".//sound").get("dalsegno") == "start-2"
+    assert measures[2].find("sound").get("segno") == "start-2"
+    files = tunes.split(path, scratch("tunes-split"))
+    assert [f.name for f in files] == ["tunes - 1.musicxml", "tunes - 2.musicxml"]
+    two = ET.parse(files[1]).getroot()
+    assert two.findtext("work/work-title") == "ניגון • 6"
+    ms = two.find("part").findall("measure")
+    assert len(ms) == 3 and ms[0].find("print") is None
+    assert ms[-1].find(".//sound").get("dacapo") == "yes"
+    assert not any(s.get("segno") for s in two.iter("sound"))
+
+
+def test_single_piece_is_left_as_one_by_the_tune_steps():
+    """A score with no tune marks comes out of `write` byte for byte."""
+    from app import tunes
+    path = write("one-tune.musicxml", score([one_attributes(4, 4, 4) + note(16), note(16)]))
+    before = path.read_bytes()
+    assert tunes.write(path) == 0
+    assert path.read_bytes() == before
+    assert tunes.split(path, scratch("one-split")) == []
+
+
+def test_segno_and_coda_go_on_barlines_in_shared_code_once():
+    """MuseScore draws a sign that is only a direction as small text. The
+    helper that also puts it on the bar's left barline lives in
+    structure_marks, the melodic pipeline runs it, and the drum writer
+    calls it instead of keeping a copy."""
+    import inspect
+    from app import structure_marks
+    assert hasattr(structure_marks, "segno_coda_on_barlines")
+    drum = (REPO / "local_bench" / "drum_grid.py").read_text()
+    assert "def segno_coda_on_barlines" not in drum
+    assert "from structure_marks import segno_coda_on_barlines" in drum
+    assert "segno_coda_on_barlines" in inspect.getsource(pipeline._repair_structure)
+    sign = ('<direction placement="above"><direction-type><segno/></direction-type>'
+            '<sound segno="segno"/></direction>')
+    path = write("segno.musicxml", score([one_attributes(4, 4, 4) + note(16), sign + note(16)]))
+    assert structure_marks.segno_coda_on_barlines(path) == 1
+    second = ET.parse(path).getroot().find("part").findall("measure")[1]
+    assert second.find("barline[@location='left']/segno") is not None
+    assert second.find("direction/direction-type/segno") is not None
+
+
 def main() -> int:
     wanted = sys.argv[1:]
     tests = [(name, fn) for name, fn in globals().items()

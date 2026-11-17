@@ -2126,9 +2126,21 @@ def place_signs(omr_path: Path, result_path: Path, hbars: list[dict]) -> int:
 DYNAMICS_GRADE_MIN = 0.5
 
 
-def _omr_dynamics(omr_path: Path, grade_min: float = DYNAMICS_GRADE_MIN):
+def _omr_dynamics(omr_path: Path, grade_min: float = DYNAMICS_GRADE_MIN,
+                  in_words: bool = True):
     """(sheet ordinal, x, y, "mf"|"p"|...) for the dynamics Audiveris
-    recognised in the project file."""
+    recognised in the project file. `in_words` False leaves out the ones
+    it read off the letters of a word (`page_ink.dynamic_is_text`)."""
+    if not in_words:
+        # the sibling module under the name this one was loaded by, so
+        # local_bench never loads a second copy of the app modules
+        if __name__.startswith("app."):
+            from app.page_ink import omr_dynamics
+        else:
+            from page_ink import omr_dynamics
+        own = {(m[0], m[1], m[2]) for m in omr_dynamics(omr_path, text=False)}
+        return [m for m in _omr_dynamics(omr_path, grade_min)
+                if (m[0], m[1], m[2]) in own]
     marks = []
     with zipfile.ZipFile(omr_path) as z:
         sheets = sorted(
@@ -2168,6 +2180,6 @@ def place_dynamics(omr_path: Path, result_path: Path, hbars: list[dict],
                    for d in measures[i].iter("dynamics") for c in d)
 
     return _place_marks(omr_path, result_path, hbars,
-                        _omr_dynamics(omr_path, grade_min), make,
+                        _omr_dynamics(omr_path, grade_min, in_words=False), make,
                         replaces=lambda d: False, band="below", skip_if=skip_if,
                         containing=True)
