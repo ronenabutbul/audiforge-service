@@ -140,16 +140,23 @@ def page_bars(omr_path: Path, hbars: list[dict], measures,
     if not starts or len(starts) != len(sheets):
         return out
     bounds = starts + [len(measures)]
-    for p, printed in enumerate(sheets):
-        # a multirest stands for `count` measures of the score
-        bars = [e for e in printed for _ in range(max(1, e["count"]))]
+    # a multirest stands for `count` measures of the score
+    pages = [[e for e in printed for _ in range(max(1, e["count"]))] for printed in sheets]
+    for p, bars in enumerate(pages):
         first, stop = bounds[p], bounds[p + 1]
         slack = abs((stop - first) - len(bars))
         if slack > max(PAGE_SLACK_MIN, PAGE_SLACK_SHARE * len(bars)):
             continue  # the engines' reading of this page is not the print's
+        # an engine page may hold the next page's first bars or lose its
+        # own last ones to the next: near a page edge the neighbour page's
+        # edge bars are candidates too
+        before = pages[p - 1][-slack:] if p and slack else []
+        after = pages[p + 1][:slack] if p + 1 < len(pages) else []
+        line = before + bars + after
         for k in range(stop - first):
-            lo, hi = max(0, k - slack), min(len(bars), k + slack + 1)
-            window = out.get(first + k, []) + bars[lo:hi]
+            at = k + len(before)
+            lo, hi = max(0, at - slack), min(len(line), at + slack + 1)
+            window = out.get(first + k, []) + line[lo:hi]
             out[first + k] = list({id(e): e for e in window}.values())
     return out
 
