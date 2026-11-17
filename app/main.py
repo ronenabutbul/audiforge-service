@@ -25,7 +25,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pdf2image import convert_from_path
 
-from app import audiveris_local, pipeline, resource_usage
+from app import audiveris_local, chart_routing, pipeline, resource_usage
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("omr-service")
@@ -158,10 +158,8 @@ def title_from_filename(filename: str | None) -> str:
     return without_id or stem or "Untitled"
 
 
-def _run_homr_pipeline(job_id: str, job_dir: Path, source: Path) -> Path:
-    """Render pages, run homr per page, merge to one MusicXML. Raises on failure."""
-    pages = _render_pages(job_dir, source)
-    _update_job(job_id, total_pages=len(pages))
+def _run_homr_pipeline(job_id: str, job_dir: Path, pages: list[Path]) -> Path:
+    """Run homr per rendered page, merge to one MusicXML. Raises on failure."""
     outputs: list[Path] = []
     for i, page in enumerate(pages, start=1):
         logger.info("job %s: homr page %d/%d", job_id, i, len(pages))
@@ -173,7 +171,7 @@ def _run_homr_pipeline(job_id: str, job_dir: Path, source: Path) -> Path:
         except RuntimeError as error:
             unreadable = error
             logger.warning("job %s: homr page %d unreadable, skipped", job_id, i)
-        _update_job(job_id, progress=0.1 + 0.6 * (i / len(pages)))
+        _update_job(job_id, progress=0.35 + 0.45 * (i / len(pages)))
     if not outputs:
         raise unreadable
     result = job_dir / "homr.musicxml"
@@ -206,6 +204,16 @@ def _run_audiveris(job_id: str, job_dir: Path, source: Path) -> tuple[Path | Non
     return outcome.path, outcome.failure
 
 
+def _reader_result_path(job_dir: Path, piece_title: str | None) -> Path:
+    """Where a chart reader writes. The drum reader and partitura title the
+    score after the file they write (as on the bench), so the file carries
+    the piece's name, not "result"."""
+    name = re.sub(r"[/\\:\x00]", "-", piece_title or "").strip(" .") or "result"
+    folder = job_dir / "reader"
+    folder.mkdir(exist_ok=True)
+    return folder / f"{name}.musicxml"
+
+
 def _process_job(job_id: str, source: Path):
     job_dir = source.parent
     # The instruments pipeline is the expensive one - two engines over every
@@ -216,26 +224,68 @@ def _process_job(job_id: str, source: Path):
     meter.__enter__()
     try:
         _update_job(job_id, status="processing", progress=0.05)
+        with jobs_lock:
+            piece_title = jobs[job_id].get("piece_title")
 
-        # Run both engines; neither failure is fatal on its own, but each
-        # is said out loud: `engine_failures` in the status names the
-        # engine and the reason, so a result made by one engine alone is
-        # never mistaken for the full conversion.
+        # Neither engine's failure is fatal on its own, but each is said
+        # out loud: `engine_failures` in the status names the engine and
+        # the reason, so a result made by one engine alone is never
+        # mistaken for the full conversion.
         failures: dict[str, str] = {}
-        homr_path: Path | None = None
+        pages: list[Path] = []
         try:
-            homr_path = _run_homr_pipeline(job_id, job_dir, source)
+            pages = _render_pages(job_dir, source)
+            _update_job(job_id, total_pages=len(pages))
         except Exception as exc:
-            logger.warning("job %s: homr failed (%s)", job_id, exc)
-            failures["homr"] = str(exc)[:500]
+            logger.warning("job %s: page rendering failed (%s)", job_id, exc)
+            failures["homr"] = f"pages could not be rendered: {str(exc)[:400]}"
 
-        _update_job(job_id, progress=0.75)
+        # Audiveris first: its project file says what kind of chart this
+        # is, and a drum chart, a chord chart or a score has a reader of its
+        # own that needs no homr (the slow engine) at all.
+        _update_job(job_id, progress=0.1)
         aud_path, aud_failure = _run_audiveris(job_id, job_dir, source)
+        _update_job(job_id, progress=0.3)
         if aud_path is None:
             logger.warning("job %s: audiveris gave no score (%s); structure "
                            "repair is skipped", job_id, aud_failure)
             failures["audiveris"] = aud_failure or "no MusicXML produced"
+
+        if pipeline.project_file(job_dir) is not None:
+            reader_out = _reader_result_path(job_dir, piece_title)
+            routing = chart_routing.route(
+                job_dir, reader_out,
+                say=lambda line: logger.info("job %s: %s", job_id, line))
+            ok = routing.pop("ok")
+            _update_job(job_id, **routing)
+            if ok:
+                _update_job(
+                    job_id,
+                    engine=f"{routing['kind']} reader",
+                    engine_failures=failures,
+                    warnings=routing.get("reader_warnings", []),
+                    structure_repair="done",
+                    tunes=1,
+                    status="completed",
+                    progress=1.0,
+                    result_path=str(reader_out),
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+                return
         else:
+            _update_job(job_id, kind=None, reader=None,
+                        reader_fallback="no Audiveris project: melodic path")
+
+        # The melodic path: homr over every page, fused with Audiveris.
+        homr_path: Path | None = None
+        if pages:
+            try:
+                homr_path = _run_homr_pipeline(job_id, job_dir, pages)
+            except Exception as exc:
+                logger.warning("job %s: homr failed (%s)", job_id, exc)
+                failures["homr"] = str(exc)[:500]
+        _update_job(job_id, progress=0.85)
+        if aud_path is not None:
             restored = pipeline.prepare_audiveris(aud_path, job_dir)
             if any(restored.values()):
                 logger.info("job %s: audiveris rests put back: %s", job_id, restored)
@@ -245,11 +295,11 @@ def _process_job(job_id: str, source: Path):
             _update_job(job_id, engine="none",
                         engine_scores={"homr": None, "audiveris": None})
 
-        with jobs_lock:
-            piece_title = jobs[job_id].get("piece_title")
         result_path = job_dir / "result.musicxml"
         # Everything from the engine choice to the finished file is the
-        # shared pipeline the Mac bench runs too (app/pipeline.py).
+        # shared pipeline the Mac bench runs too (app/pipeline.py). A
+        # booklet stays one file (tunes laid out one after another); the
+        # tune count is reported so a caller can tell.
         report = pipeline.finish(
             job_dir, homr_path, aud_path, result_path, piece_title,
             say=lambda line: logger.info("job %s: %s", job_id, line))
@@ -261,6 +311,7 @@ def _process_job(job_id: str, source: Path):
             rhythm=report["rhythm"],
             warnings=report["warnings"],
             structure_repair="done" if aud_path is not None else "skipped",
+            tunes=report["counts"].get("tunes") or 1,
         )
         if report["transposed"]:
             _update_job(job_id, transposed=True)
