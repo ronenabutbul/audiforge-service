@@ -815,6 +815,27 @@ def test_beamed_notes_are_not_a_multirest_bar():
     assert counts == [5, 2, 5, 5], counts                    # what the page prints
 
 
+def test_chord_with_a_stem_is_not_a_rest_block():
+    """An old-style multirest is a solid block standing alone on the
+    middle line. Two noteheads a third apart fuse into the same block in
+    a scan, but their stem stands right against it (Abba Gold Drum Set,
+    last bar: the chords were taken for blocks, and where the number
+    reader then found a "15" in the accents above, the bar became a
+    15-bar rest)."""
+    import numpy as np
+    from app import fix_hbars
+
+    il, top = 20, 100
+    mid = top + 2 * il
+    lo, hi = top - il, top + 5 * il
+    rest = np.zeros((300, 300), dtype=bool)
+    rest[mid - il:mid + il + 1, 100:114] = True              # the block
+    assert fix_hbars._is_solid_block(rest, 100, 114, mid, lo, hi, il)
+    chord = rest.copy()
+    chord[mid - il:mid + int(2.5 * il), 115:118] = True      # its stem
+    assert not fix_hbars._is_solid_block(chord, 100, 114, mid, lo, hi, il)
+
+
 def test_rests_printed_side_by_side_are_one_run_counted_once():
     """Page: bar 1 music, then rests of 2, 5 and 5 bars in three stacks,
     then music. The XML holds one run of 12 silent bars. Each rest takes

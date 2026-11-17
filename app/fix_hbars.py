@@ -343,6 +343,15 @@ def _is_solid_block(pixels, x0: int, x1: int, mid: int, lo: int, hi: int,
     for x in range(x0, x1):
         if _ink_through(pixels, x, mid, lo, hi) > height + 0.3 * il:
             return False
+    # Nor does a stem stand against its side. Two noteheads a third apart
+    # with a square scan edge pass every test above, but they are a chord:
+    # the stem runs up or down right beside them, taller than the block.
+    # A rest stands alone, with only staff lines to either side.
+    reach = max(2, int(round(0.3 * il)))
+    width = pixels.shape[1]
+    for x in list(range(max(x0 - reach, 0), x0)) + list(range(x1, min(x1 + reach, width))):
+        if _ink_through(pixels, x, mid, lo, hi) > height + 0.3 * il:
+            return False
     return True
 
 
