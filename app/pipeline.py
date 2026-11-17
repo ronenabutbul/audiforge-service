@@ -694,14 +694,38 @@ def _repair_structure(steps: _Steps, work: Path, result: Path, aud: Path) -> Non
                          default=None)
     if road_map is not None:
         steps.note("road_map", road_map, f"{road_map} road-map marks placed")
+    # MuseScore draws a sign that is only a direction as small text; one on
+    # the bar's left barline it draws full size
+    steps.run("segno/coda on barlines", structure_marks.segno_coda_on_barlines, result,
+              default=0)
     from app import lead_chords
     chords = steps.run("chord names", lead_chords.place, omr, result, hbars, default=0)
     steps.note("chord_names", chords, f"{chords} chord names placed from the page")
+    # homr writes marks with no position and Audiveris reads letters as
+    # dynamics: each fermata, dynamic and same-length meter change in the
+    # score must be printed on its bar of the page.
+    from app import page_ink
+    for label, check in (("fermata", page_ink.check_fermatas),
+                         ("dynamics", page_ink.check_dynamics),
+                         ("time-change", page_ink.check_time_changes)):
+        kept, removed = steps.run(f"{label} check", check, omr, result, hbars,
+                                  default=(0, 0))
+        steps.note(f"{label}_check", [kept, removed],
+                   f"{label} check: {kept} printed, {removed} not on the page"
+                   if removed else None)
+    # a booklet: pages that each start a tune of their own
+    from app import tunes
+    count = steps.run("tune detection", tunes.mark, omr, result, hbars, default=1)
+    if count > 1:
+        steps.note("tunes", count, f"{count} tunes, one per page that starts one")
 
 
 def finish(work: Path, homr: Path | None, audiveris: Path | None, result: Path,
-           piece_title: str | None, say: Callable[[str], None] = print) -> dict:
-    """Build `result` from the engines' prepared outputs. `work` holds the
+           piece_title: str | None, say: Callable[[str], None] = print,
+           split_tunes: bool = False) -> dict:
+    """Build `result` from the engines' prepared outputs. A booklet of
+    tunes is laid out tune by tune in `result`; `split_tunes` also writes
+    each tune as `<result stem> - N.musicxml` beside it. `work` holds the
     Audiveris project file and the page images. Raises when neither engine
     produced a score; every later step is advisory.
 
@@ -716,6 +740,10 @@ def finish(work: Path, homr: Path | None, audiveris: Path | None, result: Path,
     shutil.copy(choice.path, result)
     engine = choice.base
     say(choice.reason)
+    from app import page_ink
+    # each engine page's first measure is marked, so marks can be checked
+    # against their own page; the mark is taken off at the end
+    steps.run("page starts", page_ink.mark_page_starts, result, default=0)
 
     # homr wins on notes; Audiveris reads text, dynamics and volta
     # brackets homr cannot. Graft those in instead of discarding them.
@@ -770,7 +798,14 @@ def finish(work: Path, homr: Path | None, audiveris: Path | None, result: Path,
                         result, default=0)
     beamed = steps.run("beaming", postprocess.beam_by_beat, result, default=0)
     say(f"{beamed} notes beamed, {phantom} phantom clef/key/fermata removed")
+    from app import tunes
+    steps.run("tune layout", tunes.write, result, default=0)
+    steps.run("page starts cleared", page_ink.clear_page_starts, result)
     steps.run("app_compat", postprocess.app_compat, result)
+    if split_tunes:
+        files = steps.run("tune split", tunes.split, result, default=[])
+        steps.note("tune_files", [str(f) for f in files],
+                   f"tunes written as {len(files)} files" if files else None)
 
     return {"engine": engine, "base": choice.base, "scores": choice.scores,
             "reason": choice.reason, "counts": steps.counts,

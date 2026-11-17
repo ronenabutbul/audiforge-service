@@ -1552,6 +1552,44 @@ def page_measure_map(omr_path: Path, hbars: list[dict]) -> list[dict]:
     return out
 
 
+def segno_coda_on_barlines(out: Path) -> int:
+    """A Segno or Coda sign that opens a bar is also written on the
+    bar's left barline (`<barline location="left"><segno/>`), keeping
+    its direction. Both are standard MusicXML; MuseScore imports a
+    direction-only sign as small staff text (a quarter of the printed
+    size) and the barline one as a full-size repeat marker, while
+    Verovio reads the direction, and neither writes the sign twice.
+    Returns signs written."""
+    tree = ET.parse(out)
+    order = ["bar-style", "footnote", "level", "wavy-line", "segno", "coda",
+             "fermata", "ending", "repeat"]
+    written = 0
+    for m in tree.getroot().iter("measure"):
+        signs = []
+        for child in m:
+            if child.tag in ("note", "backup", "forward"):
+                break
+            if child.tag == "direction":
+                for dt in child.findall("direction-type"):
+                    signs += [c.tag for c in dt if c.tag in ("segno", "coda")]
+        if not signs:
+            continue
+        bar = next((b for b in m.findall("barline") if b.get("location") == "left"), None)
+        if bar is None:
+            bar = ET.Element("barline", location="left")
+            m.insert(0, bar)
+        for tag in dict.fromkeys(signs):
+            if bar.find(tag) is not None:
+                continue
+            at = len([c for c in bar if order.index(c.tag) < order.index(tag)]) \
+                if all(c.tag in order for c in bar) else len(bar)
+            bar.insert(at, ET.Element(tag))
+            written += 1
+    if written:
+        tree.write(out, encoding="UTF-8", xml_declaration=True)
+    return written
+
+
 def place_by_page(omr_path: Path, result_path: Path, hbars: list[dict] | None = None,
                   marks: list[Mark] | None = None) -> int:
     """`place` for a single-staff part whose measures are numbered as
