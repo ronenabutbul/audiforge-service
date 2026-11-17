@@ -266,6 +266,22 @@ def _restate(measure, state: dict) -> None:
     attrs.extend(children)
 
 
+def _same(a, b) -> bool:
+    return a is not None and b is not None and ET.tostring(a).strip() == ET.tostring(b).strip()
+
+
+def _drop_same_clef(measure, before) -> None:
+    """A tune that opens in the clef the tune before it ended in does not
+    write that clef again: a clef written on a bar is a clef CHANGE to a
+    renderer, which draws a small warning clef at the end of the bar
+    before - the last bar of the other tune. `split` puts the clef back
+    in a tune's own file, where it opens the piece."""
+    for attrs in measure.findall("attributes"):
+        for clef in attrs.findall("clef"):
+            if _same(clef, before):
+                attrs.remove(clef)
+
+
 def _final_barline(measure) -> None:
     for barline in measure.findall("barline"):
         if barline.get("location", "right") == "right":
@@ -322,6 +338,7 @@ def write(result_path: Path) -> int:
         first = measures[a]
         _restate(first, states[a])
         if a:
+            _drop_same_clef(first, states[a - 1].get("clef"))
             prints = first.findall("print")
             if prints:
                 prints[0].attrib.pop("new-system", None)
@@ -451,6 +468,17 @@ def split(result_path: Path, out_dir: Path | None = None) -> list[Path]:
     bounds = tune_bounds(parts[0].findall("measure"))
     if len(bounds) < 2:
         return []
+    # the clef in force at each tune's first bar, per part: a tune that
+    # kept the clef of the one before it does not carry one (`write`)
+    clefs = []
+    for part in parts:
+        clef, at = None, {}
+        for i, measure in enumerate(part.findall("measure")):
+            found = measure.find("attributes/clef")
+            if found is not None and not at.get(i):
+                clef = found
+            at[i] = clef
+        clefs.append(at)
     out_dir = out_dir or result_path.parent
     paths = []
     for k, (a, b) in enumerate(bounds, start=1):
@@ -462,6 +490,15 @@ def split(result_path: Path, out_dir: Path | None = None) -> list[Path]:
                     part.remove(measure)
             kept = part.findall("measure")
             first = kept[0]
+            opening = clefs[copy_root.findall("part").index(part)].get(a)
+            if first.find("attributes/clef") is None and opening is not None:
+                attrs = _attributes(first)
+                attrs.append(copy.deepcopy(opening))
+                order = {t: i for i, t in enumerate(_ATTR_ORDER)}
+                children = sorted(list(attrs), key=lambda c: order.get(c.tag, len(order)))
+                for c in list(attrs):
+                    attrs.remove(c)
+                attrs.extend(children)
             for p in first.findall("print"):
                 p.attrib.pop("new-page", None)
                 if not p.attrib and len(p) == 0:
