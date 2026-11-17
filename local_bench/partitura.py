@@ -2117,6 +2117,25 @@ def _shape(length: Fraction, tuplet: bool) -> tuple[Fraction, str, int]:
     return Fraction(1, 16) * scale, "64th", 0
 
 
+def _boxes_as_bar_numbers(boxed: list[tuple[int, str]],
+                          numbers: dict[int, str | None]) -> list[tuple[int, str]]:
+    """Boxed marks that are the score's bar numbers, made to say so.
+
+    Many scores box a bar number every five or ten bars instead of
+    lettering their sections. Then each box holds the number of the bar it
+    stands on, and that is stronger evidence than one shaky read: when
+    most boxes already read as their own bar's number, one that reads
+    otherwise ("S50" at bar 50, "35" at bar 55) is a slip of the reader and
+    takes its bar's number. Letters, or numbers that do not follow the
+    bars, are left as read."""
+    if len(boxed) < 3:
+        return boxed
+    agree = sum(1 for i, text in boxed if text == numbers.get(i))
+    if 3 * agree < 2 * len(boxed):
+        return boxed
+    return [(i, numbers.get(i) or text) for i, text in boxed]
+
+
 def _direction(measure_el: ET.Element, placement: str, staff_no: int | None, offset: Fraction,
                at_start: bool = True) -> ET.Element:
     d = ET.Element("direction", placement=placement)
@@ -2667,6 +2686,7 @@ def convert(work: Path, out: Path) -> dict:
     except Exception as exc:
         print(f"  rehearsal marks skipped: {exc}", flush=True)
         marks = []
+    boxed: list[tuple[int, str]] = []
     for sheet, x, y, text in marks:
         system = locator.system_at(sheet, y)
         if system is None or not system.bars or not text:
@@ -2676,6 +2696,9 @@ def convert(work: Path, out: Path) -> dict:
         if abs(system.bars[k]["x0"] - xs) > 4 * system.il:
             k = locator.bar_at(system, x, y)
         i = locator.first[id(system)] + k
+        boxed.append((i, text))
+    for i, text in _boxes_as_bar_numbers(
+            boxed, {i: first[i].get("number") for i, _t in boxed}):
         dtype = _direction(first[i], "above", None, Fraction(0))
         ET.SubElement(dtype, "rehearsal").text = text
         placed["rehearsal"] += 1
