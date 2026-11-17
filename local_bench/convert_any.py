@@ -1,6 +1,7 @@
 """One entry point: pick the reader by chart type and run it.
 
     convert_any.py <work dir with an .omr> <out.musicxml> [--kind X] [--json]
+    convert_any.py <work dir with an .omr> --detect [--json]
 
 Detects the kind with chart_kind.kind() (or takes --kind chord|drum|melodic|score),
 runs that reader as a subprocess and prints a summary: kind, confidence, evidence,
@@ -9,6 +10,10 @@ stdout). Kind confidence below 0.5 is flagged (low_confidence), never silent.
 Melodic never runs an engine: the cached fusion result `<work>/<piece>.musicxml`
 is copied if present, otherwise exit 2 ("needs the engine run (convert.py)").
 Exit code: 0 ok, 1 reader crash or no output, 2 melodic without a cached result.
+`--detect` only decides the kind (no reader runs); the service calls it
+before homr, which a chart with a reader of its own does not need.
+The service (app/chart_routing.py) runs this file as a child process, so
+the readers' modules never load inside the service process itself.
 """
 from __future__ import annotations
 
@@ -68,6 +73,19 @@ def _has_systems(omr: Path) -> bool:
     return bool(chart_kind.features(omr).get("systems"))
 
 
+def detect(work: Path) -> dict:
+    """The kind of the project under `work`, without running a reader."""
+    import chart_kind
+    s: dict = {"work": str(work), "ok": False, "exit": 1}
+    try:
+        k, conf, ev = chart_kind.kind(find_omr(Path(work)))
+        s.update(kind=k, confidence=round(float(conf), 3), evidence=ev,
+                 low_confidence=float(conf) < LOW_CONFIDENCE, ok=True, exit=0)
+    except Exception as e:  # noqa: BLE001 - report, never raise
+        s["error"] = f"{type(e).__name__}: {e}"
+    return s
+
+
 def convert_any(work: Path, out: Path, kind: str | None = None) -> dict:
     t0 = time.time()
     work, out = Path(work), Path(out)
@@ -102,7 +120,12 @@ def convert_any(work: Path, out: Path, kind: str | None = None) -> dict:
             output_text = ""
         else:
             reader, argv = {
-                "drum": ("drum_grid.py --ink", ["drum_grid.py", str(omr.parent), str(out), "--ink"]),
+                # the drum reader takes the folder (page_001.png beside the
+                # project is where it reads the printed tempo); a folder
+                # whose project sits deeper, as the service's does, is
+                # passed as it is
+                "drum": ("drum_grid.py --ink", ["drum_grid.py", str(work if work.is_dir() else omr.parent),
+                                                str(out), "--ink"]),
                 "chord": ("chord_chart.py", ["chord_chart.py", str(omr), str(out)]),
                 "score": ("partitura.py", ["partitura.py", str(omr.parent), str(out)]),
             }[kind]
@@ -137,6 +160,16 @@ def main() -> int:
             sys.exit(f"unknown kind {kind!r}")
     as_json = "--json" in args
     args = [a for a in args if a != "--json"]
+    if "--detect" in args:
+        args.remove("--detect")
+        if len(args) != 1:
+            sys.exit(__doc__)
+        s = detect(Path(args[0]))
+        if as_json:
+            print(json.dumps(s, ensure_ascii=False, indent=2))
+        else:
+            print(f"{s.get('kind')} ({s.get('confidence')}): {s.get('evidence') or s.get('error')}")
+        return s["exit"]
     if len(args) != 2:
         sys.exit(__doc__)
     s = convert_any(Path(args[0]), Path(args[1]), kind)
