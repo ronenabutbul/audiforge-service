@@ -11,3 +11,10 @@ pdf2image>=1.17
 homr @ git+https://github.com/liebharc/homr.git@v0.7.0
 # five app modules import PIL; declare it instead of riding on homr
 pillow>=10.0
+# The chart readers (local_bench/ in the image) and the fix_* modules use
+# these. None is a new package: homr v0.7.0 brings numpy and
+# opencv-python-headless (<5; the Mac bench runs OpenCV 5), fastapi brings
+# pydantic. Declared so a homr bump cannot take them away silently.
+numpy>=2.2
+opencv-python-headless>=4.12,<5
+pydantic>=2
