@@ -130,6 +130,7 @@ def _stub_fastapi() -> None:
     fastapi = types.ModuleType("fastapi")
     fastapi.FastAPI = _App
     fastapi.File = lambda *a, **k: None
+    fastapi.Form = lambda *a, **k: None
     fastapi.HTTPException = _HTTPException
     fastapi.UploadFile = object
     responses = types.ModuleType("fastapi.responses")

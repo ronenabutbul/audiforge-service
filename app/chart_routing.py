@@ -127,8 +127,14 @@ def run_reader(work: Path, out: Path, kind: str) -> dict:
     return summary
 
 
-def route(work: Path, out: Path, say: Callable[[str], None] = print) -> dict:
+def route(work: Path, out: Path, say: Callable[[str], None] = print,
+          chosen: str | None = None) -> dict:
     """Decide the kind and, when a reader should take it, run that reader.
+
+    `chosen` is the kind the person uploading named (drum, chord, score or
+    melodic). They are looking at the page, so it is taken over the
+    detector's guess, and `kind_evidence` says the kind was chosen. A
+    reader that fails still falls back to the melodic path.
 
     Returns what the job status reports: `kind`, `kind_confidence`,
     `kind_evidence`, `reader` (None for the melodic path), `reader_seconds`,
@@ -143,7 +149,11 @@ def route(work: Path, out: Path, say: Callable[[str], None] = print) -> dict:
     if not available():
         report["reader_fallback"] = f"no readers at {READERS_DIR}"
         return report
-    decision = detect(work)
+    if chosen is not None:
+        decision = {"kind": chosen, "confidence": 1.0,
+                    "evidence": "chosen at upload"}
+    else:
+        decision = detect(work)
     if "error" in decision:
         report["reader_fallback"] = decision["error"]
         say(decision["error"])

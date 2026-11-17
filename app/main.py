@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, Thread
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pdf2image import convert_from_path
 
@@ -145,6 +145,10 @@ _STORE_ID_PREFIX = re.compile(
     re.IGNORECASE)
 
 
+# What an upload may name as its kind; "melodic" asks for the fused path.
+CHOSEN_KINDS = ("drum", "chord", "score", "melodic")
+
+
 def title_from_filename(filename: str | None) -> str:
     """The piece title a musician should see, from an uploaded filename.
 
@@ -226,6 +230,7 @@ def _process_job(job_id: str, source: Path):
         _update_job(job_id, status="processing", progress=0.05)
         with jobs_lock:
             piece_title = jobs[job_id].get("piece_title")
+            chosen = jobs[job_id].get("chosen_kind")
 
         # Neither engine's failure is fatal on its own, but each is said
         # out loud: `engine_failures` in the status names the engine and
@@ -255,7 +260,8 @@ def _process_job(job_id: str, source: Path):
             reader_out = _reader_result_path(job_dir, piece_title)
             routing = chart_routing.route(
                 job_dir, reader_out,
-                say=lambda line: logger.info("job %s: %s", job_id, line))
+                say=lambda line: logger.info("job %s: %s", job_id, line),
+                chosen=chosen)
             ok = routing.pop("ok")
             _update_job(job_id, **routing)
             if ok:
@@ -384,10 +390,19 @@ def health():
 
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...)):
+async def upload(file: UploadFile = File(...), kind: str | None = Form(None)):
+    """`kind` is optional: drum, chord, score or melodic, named by the
+    person uploading. Without it the service decides from the page."""
     suffix = Path(file.filename or "score.pdf").suffix.lower()
     if suffix not in {".pdf", ".png", ".jpg", ".jpeg"}:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix}")
+    kind = (kind or "").strip().lower() or None
+    if kind == "auto":
+        kind = None
+    if kind is not None and kind not in CHOSEN_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown kind {kind!r}; one of {', '.join(CHOSEN_KINDS)}")
 
     job_id = uuid.uuid4().hex[:12]
     job_dir = DATA_DIR / job_id
@@ -403,6 +418,7 @@ async def upload(file: UploadFile = File(...)):
             "progress": 0.0,
             "error": None,
             "piece_title": piece_title,
+            "chosen_kind": kind,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 

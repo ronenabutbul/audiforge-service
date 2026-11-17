@@ -66,7 +66,8 @@ def folder_of(piece: str) -> Path:
 
 
 def run_job(piece: str, job_dir: Path, title: str | None = None,
-            routing: bool = True, homr: Path | None = None) -> tuple[Path | None, dict]:
+            routing: bool = True, homr: Path | None = None,
+            chosen: str | None = None) -> tuple[Path | None, dict]:
     """`_process_job` on a cached piece, laid out as the server lays out a
     job: the rendered pages in the job folder, Audiveris' export beside
     them and its project in `audiveris-work/` (where `audiveris_local`
@@ -115,7 +116,8 @@ def run_job(piece: str, job_dir: Path, title: str | None = None,
     job_id = job_dir.name
     with main.jobs_lock:
         main.jobs[job_id] = {"id": job_id, "status": "pending",
-                             "piece_title": title or src.name}
+                             "piece_title": title or src.name,
+                             "chosen_kind": chosen}
     with replay._swapped(swaps):
         main._process_job(job_id, job_dir / "input.pdf")
     status = dict(main.jobs[job_id])
@@ -256,6 +258,61 @@ def test_low_confidence_kind_takes_the_melodic_path():
     assert not (entry.parent / "reader-ran").exists()
     assert "low confidence" in status["reader_fallback"]
     assert status["engine"] in ("homr", "fusion", "audiveris")
+
+
+def test_kind_chosen_at_upload_overrules_the_detector():
+    """The person uploading is looking at the page: the kind they name is
+    taken over the detector's, even one the detector is sure of or would
+    have turned down as a guess."""
+    # the detector would say melodic; the upload says drum: the reader runs
+    entry = fake_entry(
+        _SCRATCH / "fake-chosen",
+        {"ok": True, "kind": "melodic", "confidence": 1.0, "evidence": "e"},
+        """
+        out = Path(sys.argv[2]); kind = sys.argv[sys.argv.index("--kind") + 1]
+        out.write_text("<score-partwise/>")
+        print(json.dumps({"ok": True, "reader": kind + " reader", "measures": 1}))
+        """)
+    _, status = with_entry(entry, lambda: quiet(
+        run_job, "Adele - Drum Set", _SCRATCH / "chosen", chosen="drum"))
+    assert status["kind"] == "drum" and status["engine"] == "drum reader", status
+    assert status["kind_evidence"] == "chosen at upload"
+    assert status["homr_calls"] == 0
+    # the detector would say drum; the upload says melodic: no reader runs
+    entry = fake_entry(
+        _SCRATCH / "fake-chosen-melodic",
+        {"ok": True, "kind": "drum", "confidence": 0.95, "evidence": "e"},
+        "sys.exit(1)")
+    _, status = with_entry(entry, lambda: quiet(
+        run_job, "Adele - Drum Set", _SCRATCH / "chosen-melodic", chosen="melodic"))
+    assert status["kind"] == "melodic" and status["reader"] is None, status
+    assert not (entry.parent / "reader-ran").exists()
+    assert status["engine"] in ("homr", "fusion", "audiveris")
+
+
+def test_upload_takes_only_a_known_kind():
+    import asyncio
+
+    main = server()
+
+    class Upload:
+        filename = "a.pdf"
+
+        async def read(self):
+            return b"%PDF-1.4\n"
+
+    queued = []
+    with replay._swapped([(main.job_queue, "put", queued.append)]):
+        try:
+            asyncio.run(main.upload(Upload(), "tuba"))
+            raise AssertionError("an unknown kind was accepted")
+        except main.HTTPException as refused:
+            assert refused.status_code == 400
+        for sent, kept in (("drum", "drum"), (" Score ", "score"),
+                           ("auto", None), ("", None), (None, None)):
+            reply = asyncio.run(main.upload(Upload(), sent))
+            assert main.jobs[reply["id"]]["chosen_kind"] == kept, (sent, kept)
+    assert len(queued) == 5
 
 
 def test_routing_switched_off_is_todays_path():
