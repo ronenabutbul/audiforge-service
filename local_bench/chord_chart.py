@@ -46,7 +46,10 @@ from PIL import Image
 from drum_ink import REST_SLOTS, Sheet, _sheets  # noqa: F401
 
 BENCH_DIR = Path(__file__).resolve().parent
-TESSDATA = BENCH_DIR / "tools" / "tessdata"
+# Our own OCR (not Audiveris'): the service names its tesseract and the
+# system tessdata in TESSDATA_DIR / TESSERACT_BIN (see the Dockerfile), as
+# the app/ modules read them; the bench falls back to its own copy.
+TESSDATA = Path(os.environ.get("TESSDATA_DIR", BENCH_DIR / "tools" / "tessdata"))
 APP_DIR = BENCH_DIR.parent / "app"
 # app/ itself goes on the path, never its parent: with the parent there,
 # `app.fix_hbars` loads as a second copy of `fix_hbars`, and a switch the

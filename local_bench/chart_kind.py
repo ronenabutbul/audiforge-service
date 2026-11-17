@@ -148,7 +148,11 @@ def _kind_from_ink(omr: Path) -> tuple[str, float, str]:
 # ------------------------------------------------------------------ evaluation
 
 BENCH = Path(__file__).resolve().parent
-SET = BENCH.parents[2] / "out" / "chords" / "set"     # scratchpad/out/chords/set beside the worktree
+# scratchpad/out/chords/set beside the worktree. Only --eval reads it; in
+# the service image the file sits two levels from the root (/srv/local_bench),
+# where parents[2] does not exist and failed the import of every route.
+SCRATCH = BENCH.parents[2] if len(BENCH.parents) > 2 else BENCH
+SET = SCRATCH / "out" / "chords" / "set"
 
 # Truth for the corpus, read off the page images (look/corpus_0..3.png):
 # multi-staff piano and conductor scores are "score"; percussion parts are
@@ -188,7 +192,7 @@ def evaluate() -> None:
             omr = next(d.glob("*.omr"), None)
             if omr is not None:
                 rows.append((d.name, "chord", omr))
-    owner = BENCH.parents[2] / "chord" / "out" / "Chord Chart Test.omr"
+    owner = SCRATCH / "chord" / "out" / "Chord Chart Test.omr"
     if owner.exists():
         rows.append(("Chord Chart Test (owner)", "chord", owner))
     table = Counter()

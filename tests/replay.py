@@ -188,12 +188,14 @@ def _swapped(swaps: list[tuple[object, str, object]]):
 
 
 def replay_server(main, piece: str, work: Path, homr=_UNSET, aud=_UNSET,
-                  project: bool = True) -> tuple[Path | None, dict]:
+                  project: bool = True, routing: bool = False) -> tuple[Path | None, dict]:
     """Run the server's job on cached outputs. Returns (result, status).
 
     Only the two engine launches are replaced; the rest of `_process_job`
     is the code under test. `homr` / `aud` override the cached inputs, and
-    None means that engine failed."""
+    None means that engine failed. The chart-kind routing (a drum chart
+    to the drum reader, and so on) is off unless `routing`: the replay
+    compares the melodic path with the bench's convert.py, which has none."""
     stage(piece, work, project)
     runner = main.audiveris_local
     new_runner = hasattr(runner, "convert")
@@ -228,6 +230,8 @@ def replay_server(main, piece: str, work: Path, homr=_UNSET, aud=_UNSET,
              (runner, "convert_musicxml", fake_convert_musicxml)]
     if new_runner:
         swaps.append((runner, "convert", fake_convert))
+    if hasattr(main, "chart_routing"):
+        swaps.append((main.chart_routing, "enabled", lambda: routing))
     job_id = "replay"
     with main.jobs_lock:
         main.jobs[job_id] = {"id": job_id, "status": "pending",

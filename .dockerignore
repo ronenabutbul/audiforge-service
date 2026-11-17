@@ -1,4 +1,13 @@
-local_bench/
+# The bench stays out (its results/ and corpus/ are large symlinks), except
+# the chart readers the service runs; the list matches the Dockerfile's.
+local_bench/*
+!local_bench/convert_any.py
+!local_bench/chart_kind.py
+!local_bench/drum_grid.py
+!local_bench/drum_ink.py
+!local_bench/drum_overlay.py
+!local_bench/chord_chart.py
+!local_bench/partitura.py
 benchmark/
 __pycache__/
 .git/

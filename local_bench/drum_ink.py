@@ -22,6 +22,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
@@ -33,6 +34,12 @@ import numpy as np
 
 BENCH_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BENCH_DIR))
+
+# Our own OCR (not Audiveris'): the service names its tesseract and the
+# system tessdata in TESSDATA_DIR / TESSERACT_BIN (see the Dockerfile), as
+# the app/ modules read them; the bench falls back to its own copy.
+TESSDATA = Path(os.environ.get("TESSDATA_DIR", BENCH_DIR / "tools" / "tessdata"))
+TESSERACT = os.environ.get("TESSERACT_BIN", "tesseract")
 
 REST_SLOTS = {"WHOLE_REST": 16, "HALF_REST": 8, "QUARTER_REST": 4,
               "EIGHTH_REST": 2, "ONE_16TH_REST": 1, "ONE_32ND_REST": 0.5}
@@ -1125,14 +1132,14 @@ class Sheet:
         img = (np.pad(1 - mask, pad, constant_values=1) * 255).astype(np.uint8)
         f = 64 / img.shape[0]
         img = cv2.resize(img, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
-        env = {"TESSDATA_PREFIX": str(BENCH_DIR / "tools" / "tessdata"),
+        env = {"TESSDATA_PREFIX": str(TESSDATA),
                "PATH": "/opt/homebrew/bin:/usr/bin:/bin" + os.pathsep + os.environ.get("PATH", "")}
         reads = []
         with tempfile.TemporaryDirectory() as tmp:
             path = f"{tmp}/g.png"
             cv2.imwrite(path, img)
             for psm in ("10", "8"):
-                r = subprocess.run(["tesseract", path, "-", "--psm", psm, "-c",
+                r = subprocess.run([TESSERACT, path, "-", "--psm", psm, "-c",
                                     "tessedit_char_whitelist=0123456789"],
                                    capture_output=True, text=True, env=env)
                 reads.append(r.stdout.strip())
@@ -1865,14 +1872,14 @@ def _read_digit(mask: np.ndarray) -> list[str]:
     f = 60 / m.shape[0]
     m = cv2.resize(m, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
     img = 255 - np.pad(m, 30, constant_values=0)
-    env = {"TESSDATA_PREFIX": str(BENCH_DIR / "tools" / "tessdata"),
+    env = {"TESSDATA_PREFIX": str(TESSDATA),
            "PATH": "/opt/homebrew/bin:/usr/bin:/bin" + os.pathsep + os.environ.get("PATH", "")}
     reads = []
     with tempfile.TemporaryDirectory() as tmp:
         path = f"{tmp}/t.png"
         cv2.imwrite(path, img)
         for psm in ("10", "8"):
-            r = subprocess.run(["tesseract", path, "-", "--psm", psm, "-c",
+            r = subprocess.run([TESSERACT, path, "-", "--psm", psm, "-c",
                                 "tessedit_char_whitelist=0123456789"],
                                capture_output=True, text=True, env=env)
             reads.append(r.stdout.strip())
@@ -2931,7 +2938,7 @@ def system_numbers(omr: Path) -> dict[int, int]:
     import subprocess
     import tempfile
     from PIL import Image
-    env = {"TESSDATA_PREFIX": str(BENCH_DIR / "tools" / "tessdata"), "PATH": "/opt/homebrew/bin:/usr/bin:/bin"}
+    env = {"TESSDATA_PREFIX": str(TESSDATA), "PATH": "/opt/homebrew/bin:/usr/bin:/bin"}
     out: dict[int, int] = {}
     ordinal = 0
     with zipfile.ZipFile(omr) as z, tempfile.TemporaryDirectory() as tmp:
@@ -2981,7 +2988,7 @@ def system_numbers(omr: Path) -> dict[int, int]:
                     img.save(path)
                     for psm in ("7", "8", "13"):
                         r = subprocess.run(
-                            ["tesseract", path, "-", "--psm", psm, "-c",
+                            [TESSERACT, path, "-", "--psm", psm, "-c",
                              "tessedit_char_whitelist=0123456789"],
                             capture_output=True, text=True, env=env)
                         digits = "".join(ch for ch in r.stdout if ch.isdigit())

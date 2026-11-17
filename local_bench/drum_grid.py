@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import io
 import math
+import os
 import re
 from fractions import Fraction
 import sys
@@ -34,6 +35,12 @@ from pydantic import BaseModel
 
 BENCH_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BENCH_DIR.parent / "app"))
+
+# Our own OCR (not Audiveris'): the service names its tesseract and the
+# system tessdata in TESSDATA_DIR / TESSERACT_BIN (see the Dockerfile), as
+# the app/ modules read them; the bench falls back to its own copy.
+TESSDATA = Path(os.environ.get("TESSDATA_DIR", BENCH_DIR / "tools" / "tessdata"))
+TESSERACT = os.environ.get("TESSERACT_BIN", "/opt/homebrew/bin/tesseract")
 
 # instrument -> (display-step, display-octave, notehead, midi-unpitched, voice)
 KIT = {
@@ -2324,13 +2331,13 @@ def _read_number(image, il: float) -> int | None:
     crop = crop.resize((max(int(crop.width * f), 1), 48))
     page = Image.new("L", (crop.width + 40, crop.height + 40), 255)
     page.paste(crop, (20, 20))
-    env = dict(os.environ, TESSDATA_PREFIX=str(BENCH_DIR / "tools" / "tessdata"))
+    env = dict(os.environ, TESSDATA_PREFIX=str(TESSDATA))
     reads = []
     with tempfile.TemporaryDirectory() as tmp:
         path = f"{tmp}/n.png"
         page.save(path)
         for psm in ("7", "8"):
-            r = subprocess.run(["/opt/homebrew/bin/tesseract", path, "-", "--psm", psm,
+            r = subprocess.run([TESSERACT, path, "-", "--psm", psm,
                                 "-c", "tessedit_char_whitelist=0123456789"],
                                capture_output=True, text=True, env=env)
             reads.append(r.stdout.strip())
